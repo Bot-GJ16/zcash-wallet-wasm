@@ -36,6 +36,9 @@ pub mod pool;
 #[cfg(all(test, feature = "orchard"))]
 mod account;
 
+#[cfg(all(test, feature = "orchard"))]
+mod subtree_roots;
+
 #[cfg(all(test, feature = "unstable"))]
 mod slack_scan_fixture;
 
