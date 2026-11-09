@@ -232,6 +232,26 @@ pub(crate) mod tests {
         changed.proposals[0].title.push('!');
         assert!(changed.compare_identity(&identity).is_err());
     }
+
+    #[tokio::test]
+    async fn invalid_dynamic_round_does_not_block_authenticated_discovery() {
+        let mut dynamic: Value = serde_json::from_slice(DYNAMIC).unwrap();
+        dynamic["rounds"]["7ce96992c8eb47cf4c75ec40fbc000917ecd35489c048b35b08f15226ee34d47"] =
+            dynamic["rounds"][ID].clone();
+        let transport = fixture(vec![
+            ok(STATIC.to_vec()),
+            ok(serde_json::to_vec(&dynamic).unwrap()),
+            ok(envelope(vec![active()])),
+        ]);
+
+        let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500)
+            .await
+            .unwrap();
+        assert_eq!(discovery.accepted.len(), 1);
+        assert!(discovery.rejected.is_empty());
+        assert!(trusted.contains_key(ID));
+    }
+
     #[tokio::test]
     async fn static_hash_and_dynamic_signatures_fail_closed_with_ordered_failover() {
         let f = fixture(vec![ok(b"{}".to_vec())]);

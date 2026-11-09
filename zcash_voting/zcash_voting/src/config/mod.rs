@@ -100,6 +100,9 @@ impl Default for WalletCapabilities {
     fn default() -> Self {
         Self {
             vote_server: vec![VOTE_SERVER_VERSION_V1.to_string()],
+            // Both protocol generations are accepted so one wallet build
+            // spans the server rollout: every deployed config advertises v0
+            // today, and a config that moves to v1 must not strand it.
             vote_protocol: vec![VERSION_V0.to_string(), VOTE_PROTOCOL_VERSION_V1.to_string()],
             tally: vec![VERSION_V0.to_string()],
             pir: vec![VERSION_V0.to_string()],
@@ -1005,11 +1008,6 @@ fn validate_dynamic_config(
     validate_endpoints(&config.vote_servers, "vote_servers")?;
     validate_endpoints(&config.pir_endpoints, "pir_endpoints")?;
     validate_pir_layout(config.pir_layout)?;
-    for round_id in config.rounds.keys() {
-        validate_vote_round_id_hex(round_id).map_err(|e| VotingConfigError::DecodeFailed {
-            message: format!("invalid rounds key: {e}"),
-        })?;
-    }
     require_supported(
         "vote_server",
         &config.supported_versions.vote_server,
@@ -1109,14 +1107,14 @@ fn verify_round_entry(
     trusted_keys: &[TrustedKey],
     pir_layout: PirLayout,
 ) -> bool {
-    if entry.auth_version != ROUND_AUTH_VERSION_V2
+    if validate_vote_round_id_hex(round_id).is_err()
+        || entry.auth_version != ROUND_AUTH_VERSION_V2
         || entry.ea_pk.len() != 32
         || entry.signatures.is_empty()
     {
         return false;
     }
-    // Round keys are hex-validated during dynamic-config validation, but decode
-    // defensively: an undecodable round id can never authenticate.
+    // An invalid round ID is skipped without invalidating other signed rounds.
     let Ok(round_id_bytes) = hex::decode(round_id) else {
         return false;
     };
@@ -1947,6 +1945,28 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_resolution_skips_invalid_round_ids_without_rejecting_valid_rounds() {
+        const INVALID_FIELD_ID: &str =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&signing_key)).unwrap();
+        let entry = dynamic["rounds"][ROUND_ID].clone();
+        dynamic["rounds"][INVALID_FIELD_ID] = entry.clone();
+        dynamic["rounds"]["malformed"] = entry;
+
+        let resolved =
+            resolve_test_dynamic(&signing_key, &serde_json::to_vec(&dynamic).unwrap()).unwrap();
+
+        assert_eq!(resolved.authenticated_rounds.len(), 1);
+        assert_eq!(resolved.authenticated_rounds[0].round_id, ROUND_ID);
+        assert_eq!(
+            resolved.skipped_round_ids,
+            vec![INVALID_FIELD_ID.to_string(), "malformed".to_string()]
+        );
+    }
+
+    #[test]
     fn summary_fingerprint_ignores_skipped_round_ids() {
         let base = ResolvedVotingConfig {
             source_fingerprint: "src".to_string(),
@@ -2134,6 +2154,58 @@ mod tests {
                 ea_pk: vec![7u8; 32],
             }]
         );
+    }
+
+    #[test]
+    fn resolve_dynamic_voting_config_rejects_unsupported_vote_protocol() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        dynamic["supported_versions"]["vote_protocol"] = serde_json::json!("v2");
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+
+        let error = resolve_dynamic_voting_config(
+            resolved_static,
+            &dynamic.to_string().into_bytes(),
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            VotingConfigError::UnsupportedVersion {
+                component: "vote_protocol".to_string(),
+                advertised: "v2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_dynamic_voting_config_accepts_both_vote_protocol_generations() {
+        // One wallet build has to span the rollout: deployed configs
+        // advertise v0 today and will advertise v1 later, and neither may
+        // strand it.
+        for advertised in ["v0", "v1"] {
+            let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+            let mut dynamic: serde_json::Value =
+                serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+            dynamic["supported_versions"]["vote_protocol"] = serde_json::json!(advertised);
+            let resolved_static =
+                resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+
+            let resolved = resolve_dynamic_voting_config(
+                resolved_static,
+                &dynamic.to_string().into_bytes(),
+                ResolveVotingConfigOptions::default(),
+            );
+
+            assert!(
+                resolved.is_ok(),
+                "vote_protocol {advertised} was rejected: {:?}",
+                resolved.err()
+            );
+        }
     }
 
     #[test]

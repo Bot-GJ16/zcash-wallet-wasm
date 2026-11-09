@@ -1,0 +1,313 @@
+//! What one child run needs to know, as a value rather than an argument list.
+//!
+//! The parent writes this to a file and passes the child a single path. Two
+//! reasons it is not argv: the list had grown past a dozen positional pairs
+//! where a transposed pair silently retargets the run, and argv is world
+//! readable through `ps`. Nothing here is secret — paths, URLs, and a round id
+//! — and the credentials the child needs reach it only through the environment
+//! it inherits, so they are never written to disk or exposed in a process
+//! listing.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::helper_fleet::HelperFleetPlan;
+use crate::stages::CrashStage;
+use crate::stall::StallPlan;
+
+/// Services one run talks to.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Endpoints {
+    /// Tendermint RPC, for reading the round the suite provisioned.
+    pub chain_rpc: String,
+    /// Wallet-facing vote servers, in published order: the submission
+    /// lifecycle cycles them by reservation ordinal, so order is behaviour.
+    pub vote_servers: Vec<String>,
+    pub pir_urls: Vec<String>,
+    pub helper_urls: Vec<String>,
+    pub lightwalletd: String,
+}
+
+/// Which bundle and proposal a run is scoped to.
+///
+/// A crash stage names one bundle. The driver is also pinned to one bundle at a
+/// time for an armed run, because `CrashTransport` sees an HTTP request rather
+/// than a bundle index and cannot tell which bundle is posting.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct Target {
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+}
+
+/// What the child is being asked to do.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum RunMode {
+    /// Drive until `stage` is reached, then abort the process.
+    Armed { stage: CrashStage },
+    /// Drive to quiescence without crashing.
+    ///
+    /// Used both to resume a crashed sidecar and to produce the uncrashed
+    /// control a resumed round is compared against; the two differ only in the
+    /// sidecar they start from, which is what makes them comparable.
+    Unarmed,
+    /// Advance only the persisted target batch without loading any signing key.
+    RecoverCombined,
+    /// Stop through host cancellation after observing one helper delivery result.
+    /// Used to preserve refused delivery work before restoring an unavailable fleet.
+    ObserveHelperOutage,
+}
+
+/// Everything one child run needs.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoundRunConfig {
+    pub sidecar: PathBuf,
+    pub wallet_db: PathBuf,
+    /// A previous sidecar whose cached PIR proofs are copied in first.
+    ///
+    /// Padded-slot secrets are copied from the same template, so the synthetic
+    /// nullifiers they generate are stable across runs and their proofs cache
+    /// like a real note's. A complete template removes the run's live PIR
+    /// entirely; an incomplete one leaves exactly the bundles it is missing to
+    /// fetch live.
+    pub warm_pir_from: Option<PathBuf>,
+    pub round_id: String,
+    pub account_uuid: String,
+    pub endpoints: Endpoints,
+    pub target: Target,
+    /// Matching broadcast POSTs to let through before the armed one fires.
+    ///
+    /// Zero for every ordinary stage. Signer-less target recovery sets it so
+    /// the crash lands on the last bundle's batch, leaving a round whose only
+    /// outstanding work is that batch — the one shape in which a child with no
+    /// signing material can make progress at all.
+    #[serde(default)]
+    pub broadcast_skip: usize,
+    pub mode: RunMode,
+    pub crash_log: PathBuf,
+    /// Where the child writes [`RunOutcome`] before exiting.
+    ///
+    /// An armed run that reaches its stage never writes one: it is killed. Its
+    /// absence is therefore evidence, not an error.
+    pub outcome: PathBuf,
+    /// Upper bound on driver dispatches, so a plan that never shrinks ends the
+    /// run instead of hanging a test.
+    pub max_dispatches: usize,
+    /// Unix vote-end the round was provisioned with.
+    ///
+    /// Share recovery derives its retry and cutoff windows from the distance to
+    /// this time, so background tracking cannot classify a share as overdue
+    /// without it.
+    pub vote_end_time_seconds: u64,
+    /// The network request this run hangs on, if any.
+    ///
+    /// Defaulted on read so a configuration written before stalls existed still
+    /// parses as a run that stalls nothing.
+    #[serde(default)]
+    pub stall: StallPlan,
+    /// The synthetic helper fleet this run drives against, if any.
+    ///
+    /// Empty means the run uses `endpoints.helper_urls` as real endpoints,
+    /// which is what every crash exercise does.
+    #[serde(default)]
+    pub fleet: HelperFleetPlan,
+}
+
+impl RoundRunConfig {
+    /// The stage this run is armed for, if any.
+    pub fn armed_stage(&self) -> Option<CrashStage> {
+        match &self.mode {
+            RunMode::Armed { stage } => Some(*stage),
+            RunMode::Unarmed | RunMode::RecoverCombined | RunMode::ObserveHelperOutage => None,
+        }
+    }
+
+    pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+    }
+
+    pub fn read(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+}
+
+/// One failed obligation, flattened so the parent can report it without
+/// linking the driver's error types.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FailureRecord {
+    pub step: Option<String>,
+    pub bundle_index: Option<u32>,
+    pub kind: String,
+    /// Redacted by construction: the SDK bounds and escapes diagnostics before
+    /// they reach here, and no payload or key material is copied in.
+    pub message: String,
+}
+
+impl FailureRecord {
+    /// Whether this failure is the environment rather than the round.
+    ///
+    /// Transport failures are the ones staging produces on its own — a stalled
+    /// PIR endpoint, an unreachable vote server — and they say nothing about
+    /// recovery. Treating them as conformance failures would blame the suite
+    /// for its surroundings.
+    pub fn is_environmental(&self) -> bool {
+        self.kind == "Transport"
+    }
+
+    /// Whether the SDK repairs this condition itself, so re-driving resolves it.
+    ///
+    /// A crash can leave the cached vote-commitment tree stale relative to a
+    /// delegation that confirmed. The tree sync detects that, **discards the
+    /// cached tree**, and fails the pass — so the next pass re-syncs from
+    /// scratch and succeeds. Failing the stage on the first occurrence reports
+    /// the SDK's own repair mechanism as a defect, which is exactly what an
+    /// earlier version of this matrix did.
+    ///
+    /// Matched on the message because the SDK exposes no typed marker for it.
+    /// Deliberately narrow: a broader rule would retry past real findings.
+    pub fn is_self_healing(&self) -> bool {
+        self.kind == "InvalidInput"
+            && self
+                .message
+                .contains("does not match its synced vote-tree leaf")
+    }
+}
+
+/// One `(share, helper)` pair a tracking run touched.
+///
+/// The share's durable identity plus the helper URL, flattened so the parent
+/// can read it without linking the SDK's types. This is the only record of
+/// *which* helper a resumed run contacted: durable state shows where a share
+/// ended up, never where a run declined to send it again.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShareDeliveryRecord {
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub share_index: u32,
+    /// The URL the wallet believes it contacted, which for a synthetic fleet is
+    /// the synthetic name rather than the endpoint that served it.
+    pub server_url: String,
+}
+
+/// What one run's background share tracking did.
+///
+/// Carried back to the parent because the multi-URL invariants are about
+/// helper *contact*, and a run that correctly sent nothing leaves no durable
+/// trace of having decided that.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ShareTrackingSummary {
+    /// Debug rendering of `ShareTrackingQuiescence`.
+    pub quiescence: String,
+    pub passes: u32,
+    pub confirmed: usize,
+    /// Distinct helpers reached for each share, in the order first reached.
+    pub resubmitted: Vec<ShareDeliveryRecord>,
+    /// `(share, helper)` pairs whose acceptance outcome remains unknown.
+    pub ambiguous: Vec<ShareDeliveryRecord>,
+    pub unrecoverable: usize,
+}
+
+impl ShareTrackingSummary {
+    /// Every helper URL this run POSTed a share to, deduplicated.
+    pub fn contacted_urls(&self) -> std::collections::BTreeSet<String> {
+        self.resubmitted
+            .iter()
+            .chain(self.ambiguous.iter())
+            .map(|record| record.server_url.clone())
+            .collect()
+    }
+}
+
+/// What an unarmed run ended up doing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RunOutcome {
+    /// Debug rendering of `RoundQuiescence`.
+    pub quiescence: String,
+    /// Just the variant name, so the parent can match without parsing.
+    pub quiescence_kind: String,
+    pub failures: Vec<FailureRecord>,
+    pub dispatches: usize,
+    /// What background share tracking did, across every pass this run made.
+    ///
+    /// Defaulted on read: an outcome written before tracking was reported still
+    /// parses, and an armed run never writes one at all.
+    #[serde(default)]
+    pub share_tracking: Vec<ShareTrackingSummary>,
+    /// Chain reads — status polls and exact-tree pages — made while the step
+    /// this run stalled on held the route.
+    ///
+    /// Zero on a run that did not stall, and meaningless there. On a run that
+    /// did, it is the difference between a recovery that looked and found
+    /// nothing and one that returned without asking: see
+    /// [`crate::chain_reads`].
+    ///
+    /// Deliberately scoped to the stalled step rather than to the run. A
+    /// resumed round drives its other bundles to completion and their traffic
+    /// would never be zero.
+    #[serde(default)]
+    pub stalled_step_chain_reads: usize,
+    /// Every chain read the run made, whichever step held the route.
+    ///
+    /// Reported rather than asserted on: it is the denominator that makes a
+    /// zero above legible — "no reads at all" and "plenty of reads, none for
+    /// this step" are different findings.
+    #[serde(default)]
+    pub chain_reads: usize,
+}
+
+impl RunOutcome {
+    pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+    }
+
+    pub fn read(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    /// Whether the run ended somewhere a conformance test may accept.
+    ///
+    /// `NoWorkLeft` and `BackgroundShareWorkOnly` are the round finishing.
+    /// Everything else either needs the host to act or names a fault.
+    pub fn is_terminal_success(&self) -> bool {
+        matches!(
+            self.quiescence_kind.as_str(),
+            "NoWorkLeft" | "BackgroundShareWorkOnly" | "TargetRecovered"
+        )
+    }
+
+    /// Whether only the environment stopped this run.
+    pub fn is_environmental(&self) -> bool {
+        !self.failures.is_empty() && self.failures.iter().all(FailureRecord::is_environmental)
+    }
+
+    /// Whether every failure is one the SDK repairs on the next pass.
+    pub fn is_self_healing(&self) -> bool {
+        !self.failures.is_empty() && self.failures.iter().all(FailureRecord::is_self_healing)
+    }
+
+    /// Whether the foreground finished but the last background tracking run
+    /// exhausted the harness time budget. Reopen only this recoverable pause;
+    /// cancellation, SDK failures, and an earlier expired pass are not evidence.
+    pub fn needs_background_recovery(&self) -> bool {
+        self.failures.is_empty()
+            && matches!(
+                self.quiescence_kind.as_str(),
+                "NoWorkLeft" | "BackgroundShareWorkOnly"
+            )
+            && self.share_tracking.last().is_some_and(|tracking| {
+                tracking.quiescence == "SuiteBudgetExpired" && tracking.unrecoverable == 0
+            })
+    }
+
+    /// Whether incomplete helper delivery is the only reason the drive stopped.
+    /// The host may reopen the same sidecar and resume its remaining obligations;
+    /// this is never terminal success and never masks a different failure kind.
+    pub fn needs_helper_recovery(&self) -> bool {
+        self.quiescence_kind == "Failures"
+            && !self.failures.is_empty()
+            && self
+                .failures
+                .iter()
+                .all(|failure| failure.kind == "HelperDeliveryIncomplete")
+    }
+}

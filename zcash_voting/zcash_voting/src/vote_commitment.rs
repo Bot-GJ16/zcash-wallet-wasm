@@ -145,7 +145,7 @@ pub(crate) fn sign_cast_vote_digest(
         })?;
 
     // Compute rsk_v = ask_v.randomize(alpha_v)
-    let rsk_v = ask.randomize(&alpha_v_scalar);
+    let rsk_v = ask.randomize(&voting_crypto_deps::spend_auth_randomizer(&alpha_v_scalar));
 
     // Sign
     let sig = rsk_v.sign(voting_crypto_deps::rand::rngs::OsRng, digest);
@@ -250,6 +250,7 @@ fn extend_u64_padded32(out: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MAX_PROPOSAL_ID;
     use pasta_curves::{
         group::{Group, GroupEncoding},
         pallas,
@@ -386,7 +387,7 @@ mod tests {
         assert!(build_share_payloads(&mock_enc_shares(), &commitment, 0, 2, 42, false).is_err());
 
         let mut commitment = mock_commitment();
-        commitment.proposal_id = crate::types::MAX_PROPOSAL_ID + 1;
+        commitment.proposal_id = MAX_PROPOSAL_ID + 1;
         assert!(build_share_payloads(&mock_enc_shares(), &commitment, 0, 2, 42, false).is_err());
     }
 

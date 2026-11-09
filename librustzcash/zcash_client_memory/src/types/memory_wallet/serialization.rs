@@ -12,7 +12,9 @@ use shardtree::{
     ShardTree,
     store::{ShardStore, memory::MemoryShardStore},
 };
-use zcash_client_backend::serialization::shardtree::write_shard;
+use zcash_client_backend::{
+    data_api::TransactionDataRequest, serialization::shardtree::write_shard,
+};
 use zcash_protocol::consensus::BlockHeight;
 
 impl<P: Parameters> MemoryWalletDb<P> {
@@ -656,6 +658,34 @@ impl<P: Parameters> MemoryWalletDb<P> {
                 .map(TryInto::try_into)
                 .collect::<Result<_>>()?,
         );
+
+        // Wallets saved before Orchard status queries were queued still have the
+        // locally created transaction bytes needed to recover those requests.
+        let chain_tip = wallet.chain_height()?;
+        let pending_orchard_txids = wallet
+            .tx_table
+            .iter()
+            .filter(|(_, entry)| {
+                entry.created_locally()
+                    && entry.raw().is_some()
+                    && !matches!(entry.status(), TransactionStatus::Mined(_))
+                    && entry
+                        .expiry_height()
+                        .is_none_or(|expiry| chain_tip.is_none_or(|tip| tip <= expiry))
+            })
+            .map(|(txid, _)| *txid)
+            .collect::<Vec<_>>();
+        for txid in pending_orchard_txids {
+            if matches!(wallet.get_transaction(txid), Ok(Some(tx)) if tx.orchard_bundle().is_some())
+                && !wallet.transaction_data_request_queue.iter().any(
+                    |request| matches!(request, TransactionDataRequest::GetStatus(id) if *id == txid),
+                )
+            {
+                wallet
+                    .transaction_data_request_queue
+                    .queue_status_retrieval(&txid);
+            }
+        }
 
         for record in proto_wallet.output_locks {
             let pool = match record.pool {

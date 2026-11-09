@@ -405,6 +405,24 @@ mod tests {
         let locator = db.tx_locator.0.remove(&(spend_height, 1)).unwrap();
         assert_invalid(&db);
         db.tx_locator.0.insert((spend_height, 1), locator);
+        let mut before_rewind = Vec::new();
+        db.encode(&mut before_rewind).unwrap();
+        assert!(matches!(
+            db.truncate_to_height(receipt_height),
+            Err(crate::Error::RequestedRewindInvalid(_, _))
+        ));
+        let mut after_failed_rewind = Vec::new();
+        db.encode(&mut after_failed_rewind).unwrap();
+        assert_eq!(before_rewind, after_failed_rewind);
+
+        // The voting reorg fixture only needs Ironwood history. Empty trees for the
+        // unrelated pools keep their checkpoints rewindable under shardtree 0.8.
+        db.sapling_tree = MemoryWalletDb::new(network, 100).sapling_tree;
+        db.orchard_tree = MemoryWalletDb::new(network, 100).orchard_tree;
+        for height in [receipt_height, spend_height, later_height] {
+            db.sapling_tree.checkpoint(height).unwrap();
+            db.orchard_tree.checkpoint(height).unwrap();
+        }
         assert_eq!(
             db.truncate_to_height(receipt_height).unwrap(),
             receipt_height

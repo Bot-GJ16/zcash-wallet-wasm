@@ -5,9 +5,12 @@
 //! module is the part in between: it asks helpers what they know, decides what
 //! their answers mean, and drives the durable state forward.
 //!
-//! Wallets should call [`track_pending_shares`] on a timer and keep only the
-//! lifecycle concerns — the timer itself, app lock, and round expiry — on their
-//! side, surfaced through the `cancel` callback.
+//! [`track_pending_shares`] performs one pass.
+//! [`share_tracking_drive`](crate::share_tracking_drive) repeats it on the
+//! cadence each pass computes, so a wallet keeps only what it alone can
+//! observe — app lock and account or round identity — surfaced through the
+//! `cancel` callback. Calling this directly is still supported for a single
+//! pass, and makes the caller responsible for the cadence again.
 //!
 //! # Trust model
 //!
@@ -111,22 +114,39 @@ async fn lock_share_operation_or_cancel(
     share_index: u32,
     client: &impl RuntimeClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
+    observations: &crate::ObservationScope,
 ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, VotingError> {
-    let lock = lock_share_operation(scope, round_id, bundle_index, proposal_id, share_index);
-    tokio::pin!(lock);
+    let wait = observations.stage("helper::share_lock_wait");
+    let admission = async {
+        let lock = lock_share_operation(scope, round_id, bundle_index, proposal_id, share_index);
+        tokio::pin!(lock);
 
-    loop {
-        if cancel() {
-            return Ok(None);
-        }
-        tokio::select! {
-            biased;
-            result = &mut lock => return result.map(Some),
-            _ = client.sleep_until(client.now() + Duration::from_millis(
-                SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS,
-            )) => {}
+        loop {
+            if cancel() {
+                return Ok(None);
+            }
+            tokio::select! {
+                biased;
+                result = &mut lock => return result.map(Some),
+                _ = client.sleep_until(client.now() + Duration::from_millis(
+                    SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS,
+                )) => {}
+            }
         }
     }
+    .await;
+    wait.finish(
+        match &admission {
+            Ok(Some(_)) => crate::ObservationOutcome::Succeeded,
+            Ok(None) => crate::ObservationOutcome::Cancelled,
+            Err(_) => crate::ObservationOutcome::Failed,
+        },
+        admission
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    admission
 }
 
 /// Identifies one helper share within a round.
@@ -201,7 +221,7 @@ pub struct ResubmittedShare {
 
 /// Results of an initial fan-out across helper servers.
 ///
-/// [`crate::vote::CommittedVote::submit_prepared_shares`] journals every
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`] journals every
 /// attempt and outcome before this report is returned, so callers must not
 /// treat it as pending persistence.
 /// Outcome-unknown attempts do not count toward `target_count` because the
@@ -271,10 +291,85 @@ pub struct ShareDeliveryOutcome {
 /// Results of one commitment-wide initial-delivery pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareBatchDeliveryReport {
+    /// Processed shares, including those without any definite acceptance.
     pub deliveries: Vec<ShareDeliveryOutcome>,
+    /// Shares without a completed task; this is not a placement-success measure.
     pub pending_share_indices: Vec<u32>,
     pub cancelled: bool,
     pub placement_guarantee: SharePlacementGuarantee,
+}
+
+/// A delivery pass that ended in an error.
+///
+/// Shares are delivered concurrently, so by the time one share's journaling
+/// or storage fails, sibling shares may already have been accepted or
+/// ambiguously dispatched. `partial` is the report over those siblings
+/// (the failed share and any not yet attempted are pending); it is `None`
+/// when the pass failed before any share was attempted.
+#[derive(Debug)]
+pub(crate) struct ShareDeliveryFailure {
+    pub error: VotingError,
+    pub partial: Option<ShareBatchDeliveryReport>,
+}
+
+impl std::fmt::Display for ShareDeliveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ShareDeliveryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Assembles the batch report from per-share results.
+///
+/// `Ok(Some(outcome))` is a processed share, `Ok(None)` a share skipped by
+/// cancellation, and `Err` a share whose delivery could not be journaled.
+/// Every share in `share_indices` without an outcome is reported pending.
+/// The first error, if any, is returned together with the report over the
+/// shares that did complete, so their network effects are not lost.
+pub(crate) fn batch_delivery_report(
+    results: Vec<Result<Option<ShareDeliveryOutcome>, VotingError>>,
+    share_indices: impl IntoIterator<Item = u32>,
+    cancelled: bool,
+    placement_guarantee: SharePlacementGuarantee,
+) -> Result<ShareBatchDeliveryReport, ShareDeliveryFailure> {
+    let mut completed = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(Some(outcome)) => completed.push(outcome),
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    completed.sort_by_key(|delivery| delivery.share_index);
+    let completed_indices = completed
+        .iter()
+        .map(|delivery| delivery.share_index)
+        .collect::<std::collections::HashSet<_>>();
+    let pending_share_indices = share_indices
+        .into_iter()
+        .filter(|share_index| !completed_indices.contains(share_index))
+        .collect();
+    let report = ShareBatchDeliveryReport {
+        deliveries: completed,
+        pending_share_indices,
+        cancelled,
+        placement_guarantee,
+    };
+    match first_error {
+        None => Ok(report),
+        Some(error) => Err(ShareDeliveryFailure {
+            error,
+            partial: Some(report),
+        }),
+    }
 }
 
 /// Crate-internal per-share request used by the commitment-wide executor.
@@ -307,6 +402,20 @@ pub(crate) struct InitialShareSubmissionParams<'a> {
 /// What one tracking pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareTrackingReport {
+    /// Unconfirmed shares the round held when this pass began, once the pass
+    /// got far enough to look.
+    ///
+    /// What the pass set out to track, before it learned anything. `Some(0)`
+    /// means the round owed nothing at that moment — the one thing the other
+    /// fields cannot establish, because a pass that confirms nothing and
+    /// resubmits nothing looks identical whether it had no share to walk or
+    /// walked one another task confirmed underneath it.
+    ///
+    /// `None` means the pass never made the observation: it failed validating
+    /// the helper fleet or reading the round's shares, before it could know
+    /// what was owed. That is not the same as owing nothing, and a caller must
+    /// not read it as such.
+    pub unconfirmed_at_entry: Option<u32>,
     /// Shares durably marked confirmed during this pass.
     pub confirmed: Vec<ShareKey>,
     /// Shares that reached a new helper during this pass.
@@ -322,6 +431,22 @@ pub struct ShareTrackingReport {
     pub cancelled: bool,
     /// Seconds to wait before the next pass, or `None` when nothing is pending.
     pub next_delay_seconds: Option<u64>,
+}
+
+/// A tracking pass that failed, with what it had already done durably.
+///
+/// A pass is not atomic: it walks a round's unconfirmed shares in order and
+/// commits each confirmation and retained recovery attempt as it makes it. An
+/// error therefore means "the walk stopped here", not "nothing happened", and
+/// `partial` is what did.
+#[derive(Debug)]
+pub(crate) struct FailedTrackingPass {
+    pub(crate) error: VotingError,
+    /// Effects committed before the error. Its `unrecoverable` and
+    /// `next_delay_seconds` are meaningless — the walk did not reach every
+    /// share, and the delay is computed only once it does — and its
+    /// `unconfirmed_at_entry` is absent when the pass failed before looking.
+    pub(crate) partial: ShareTrackingReport,
 }
 
 /// Inputs for a focused confirmation check over one durable helper share.
@@ -385,15 +510,49 @@ pub(crate) fn os_random_bytes(len: usize) -> Vec<u8> {
 mod configured_fleet;
 mod confirmation;
 mod delivery_plan;
+mod delivery_progress;
+mod immediate_designation;
 mod initial_delivery;
+mod post_capacity;
 mod recovery;
 
-pub(crate) use delivery_plan::{load_share_delivery_plan, prepare_share_delivery_plan};
+pub(crate) use delivery_plan::{
+    load_delivery_plans, prepare_share_delivery_plan, DeliveryPlanRequest,
+};
+
+pub(crate) fn load_share_delivery_plan(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    generation: &str,
+    current_fleet: &[String],
+    payloads: &[crate::types::SharePayload],
+) -> Result<(ShareDeliveryPlan, String), VotingError> {
+    load_delivery_plans(
+        db,
+        scope,
+        &[DeliveryPlanRequest {
+            round_id,
+            bundle_index,
+            proposal_id,
+            generation,
+            payloads,
+        }],
+        current_fleet,
+        &crate::ObservationScope::disabled(),
+    )
+    .pop()
+    .expect("one delivery-plan request produces one result")
+}
+pub(crate) use delivery_progress::{delivery_progress, DeliveryProgress};
 
 use configured_fleet::ConfiguredHelperFleet;
 #[cfg(test)]
 use confirmation::{finish_expired_polls, poll_share_helpers_with_budget};
 use confirmation::{poll_share_helpers, ShareStatusOutcome};
+pub(crate) use immediate_designation::round_immediate_share;
 pub(crate) use initial_delivery::submit_committed_share_to_helpers;
 #[cfg(test)]
 use initial_delivery::submit_share_to_helpers;
@@ -424,7 +583,43 @@ pub async fn confirm_pending_share(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareConfirmationReport, VotingError> {
-    confirm_pending_share_core(db, params, client, cancel).await
+    observe_confirm_pending_share(db, params, client, cancel).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn observe_confirm_pending_share(
+    db: &VotingDb,
+    params: &ShareConfirmationParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareConfirmationReport, VotingError> {
+    let observations = client.observation_scope();
+    let observations = ConfiguredHelperFleet::new(params.configured_server_urls)
+        .map(|fleet| observations.with_helper_fleet(fleet.urls()))
+        .unwrap_or(observations);
+    observations.bind_round_id(params.round_id);
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(params.share.bundle_index),
+        proposal_id: Some(params.share.proposal_id),
+        share_index: Some(params.share.share_index),
+    });
+    let stage = attributed.stage("helper::confirm_pending_share");
+    let observed_client = client.observing(stage.scope());
+    let operation_result = confirm_pending_share_core(db, params, &observed_client, cancel).await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if !report.confirmed => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
+    };
+    stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 #[cfg(feature = "browser")]
@@ -471,6 +666,7 @@ async fn confirm_pending_share_core(
         params.share.share_index,
         client,
         cancel,
+        &client.observation_scope(),
     )
     .await?
     else {
@@ -504,6 +700,27 @@ async fn confirm_pending_share_core(
     )
     .await
 }
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn confirm_pending_share_with_report(
+    db: &VotingDb,
+    params: &ShareConfirmationParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<ShareConfirmationReport, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let observed_client = client.observing(invocation.scope());
+    let operation_result =
+        observe_confirm_pending_share(db, params, &observed_client, cancel).await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if !report.confirmed => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
+    };
+    invocation.complete("confirm_pending_share", outcome, operation_result)
+}
 
 async fn poll_and_confirm_share(
     db: &VotingDb,
@@ -515,7 +732,11 @@ async fn poll_and_confirm_share(
     now_seconds: u64,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareConfirmationReport, VotingError> {
+    let observations = client.observation_scope();
     if share.confirmed {
+        observations
+            .stage("helper::confirmation_reused")
+            .finish(crate::ObservationOutcome::Reused, None);
         return Ok(ShareConfirmationReport {
             confirmed: true,
             cancelled: false,
@@ -523,7 +744,8 @@ async fn poll_and_confirm_share(
     }
 
     let share_id = hex::encode(&share.nullifier);
-    match poll_share_helpers(
+    let quorum = observations.stage("helper::confirmation_quorum");
+    let polled = poll_share_helpers(
         client,
         round_id,
         &share_id,
@@ -531,8 +753,20 @@ async fn poll_and_confirm_share(
         now_seconds,
         cancel,
     )
-    .await
-    {
+    .await;
+    quorum.finish(
+        match polled {
+            ShareStatusOutcome::ConfiguredHelperQuorumObserved => {
+                crate::ObservationOutcome::Succeeded
+            }
+            ShareStatusOutcome::ConfiguredHelperQuorumNotObserved => {
+                crate::ObservationOutcome::Pending
+            }
+            ShareStatusOutcome::Cancelled => crate::ObservationOutcome::Cancelled,
+        },
+        None,
+    );
+    match polled {
         ShareStatusOutcome::Cancelled => Ok(ShareConfirmationReport {
             confirmed: false,
             cancelled: true,
@@ -542,6 +776,7 @@ async fn poll_and_confirm_share(
         }
         ShareStatusOutcome::ConfiguredHelperQuorumObserved => {
             let generation = share::ShareGeneration::new(scope, &share.nullifier);
+            let persistence = observations.stage("helper::persist_confirmation");
             let confirmed = share::confirm_for_generation(
                 db,
                 round_id,
@@ -549,7 +784,19 @@ async fn poll_and_confirm_share(
                 share.proposal_id,
                 share.share_index,
                 generation,
-            )?;
+            );
+            persistence.finish(
+                match &confirmed {
+                    Ok(true) => crate::ObservationOutcome::Succeeded,
+                    Ok(false) => crate::ObservationOutcome::Pending,
+                    Err(_) => crate::ObservationOutcome::Failed,
+                },
+                confirmed
+                    .as_ref()
+                    .err()
+                    .map(crate::observability::voting_error_kind),
+            );
+            let confirmed = confirmed?;
             client.checkpoint().await?;
             Ok(ShareConfirmationReport {
                 confirmed,
@@ -598,8 +845,94 @@ pub async fn track_pending_shares(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
+    observe_track_pending_shares(db, params, client, cancel).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn observe_track_pending_shares(
+    db: &VotingDb,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareTrackingReport, VotingError> {
+    let observations = client.observation_scope();
+    let observations = ConfiguredHelperFleet::new(params.configured_server_urls)
+        .map(|fleet| observations.with_helper_fleet(fleet.urls()))
+        .unwrap_or(observations);
+    observations.bind_round_id(params.round_id);
+    let stage = observations.stage("helper::track_pending_shares");
+    let observed_client = client.observing(stage.scope());
+    let client = &observed_client;
+    let operation_result: Result<ShareTrackingReport, VotingError> = async {
+        let scope = share::ShareOperationScope::capture(db);
+        track_pending_shares_recording_partial(db, &scope, params, client, cancel)
+            .await
+            .map_err(|failure| failure.error)
+    }
+    .await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if report.next_delay_seconds.is_some() => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
+    };
+    stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn track_pending_shares_with_report(
+    db: &VotingDb,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<ShareTrackingReport, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let observed_client = client.observing(invocation.scope());
+    let operation_result = observe_track_pending_shares(db, params, &observed_client, cancel).await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if report.next_delay_seconds.is_some() => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
+    };
+    invocation.complete("track_pending_shares", outcome, operation_result)
+}
+
+/// [`track_pending_shares`], keeping what a failed pass had already recorded.
+///
+/// A pass writes each confirmation and each retained recovery attempt as it
+/// reaches it, so a storage failure on a later share does not undo what the
+/// earlier ones durably did. This variant hands those effects back with the
+/// error instead of dropping them, which is what a caller composing passes
+/// into a run needs: the run's report would otherwise omit durable progress
+/// that no later pass can rediscover, because a confirmed share is no longer
+/// walked.
+///
+/// `scope` is the wallet identity this pass acts under, supplied rather than
+/// captured. A caller that composes passes has already decided whose shares it
+/// is driving — and been admitted to drive them — so a wallet switch landing
+/// between that decision and this call must not silently redirect the pass to
+/// another wallet's rows. The composing caller notices the switch at its own
+/// boundary and stops; this pass finishes the round it was asked for.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn track_pending_shares_recording_partial(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareTrackingReport, FailedTrackingPass> {
     let started_at = Instant::now();
-    track_pending_shares_with_elapsed(db, params, client, cancel, &|| {
+    track_pending_shares_with_elapsed(db, scope, params, client, cancel, &|| {
         started_at.elapsed().as_secs()
     })
     .await
@@ -607,19 +940,58 @@ pub async fn track_pending_shares(
 
 async fn track_pending_shares_with_elapsed(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &ShareTrackingParams<'_>,
     client: &impl RuntimeClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
-) -> Result<ShareTrackingReport, VotingError> {
-    let scope = share::ShareOperationScope::capture(db);
+) -> Result<ShareTrackingReport, FailedTrackingPass> {
+    let mut report = ShareTrackingReport::default();
+    match walk_pending_shares(
+        db,
+        scope,
+        params,
+        client,
+        cancel,
+        elapsed_seconds,
+        &mut report,
+    )
+    .await
+    {
+        Ok(()) => Ok(report),
+        Err(error) => Err(FailedTrackingPass {
+            error,
+            partial: report,
+        }),
+    }
+}
+
+/// The pass itself, writing into the report as it goes.
+///
+/// Split out so an error carries the durable effects recorded before it: the
+/// caller owns the report, and every `?` here leaves it populated up to the
+/// share that failed. `unrecoverable` and `next_delay_seconds` are the two
+/// observations a partial report cannot be trusted for — the first because the
+/// walk did not reach every share, the second because it is computed last.
+#[allow(clippy::too_many_arguments)]
+async fn walk_pending_shares(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &ShareTrackingParams<'_>,
+    client: &impl RuntimeClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
+    report: &mut ShareTrackingReport,
+) -> Result<(), VotingError> {
     // Validate the complete trust boundary before reading or mutating storage
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
-    let mut report = ShareTrackingReport::default();
 
-    for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
+    let pending_shares = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
+    report.unconfirmed_at_entry = Some(u32::try_from(pending_shares.len()).unwrap_or(u32::MAX));
+
+    for loaded_share in pending_shares {
         if cancel() {
             report.cancelled = true;
             break;
@@ -632,21 +1004,22 @@ async fn track_pending_shares_with_elapsed(
             loaded_share.share_index,
             client,
             cancel,
+            &client.observation_scope(),
         )
         .await?
         else {
             report.cancelled = true;
             break;
         };
-        let Some(share) = share::unconfirmed_for_scope(db, &scope, params.round_id)?
-            .into_iter()
-            .find(|share| {
-                share.bundle_index == loaded_share.bundle_index
-                    && share.proposal_id == loaded_share.proposal_id
-                    && share.share_index == loaded_share.share_index
-                    && share.nullifier == loaded_share.nullifier
-            })
-        else {
+        let Some(share) = share::get_delegation_for_scope(
+            db,
+            &scope,
+            params.round_id,
+            loaded_share.bundle_index,
+            loaded_share.proposal_id,
+            loaded_share.share_index,
+        )?
+        .filter(|share| !share.confirmed && share.nullifier == loaded_share.nullifier) else {
             continue;
         };
 
@@ -771,21 +1144,28 @@ async fn track_pending_shares_with_elapsed(
                     cancel,
                     elapsed_seconds,
                 )
-                .await?;
+                .await;
+                let resubmission = match resubmission {
+                    Ok(resubmission) => resubmission,
+                    Err(failure) => {
+                        record_ambiguous_recovery_effects(
+                            &mut delivery_state,
+                            report,
+                            &share,
+                            failure.outcome_unknown_urls,
+                        )?;
+                        return Err(failure.error);
+                    }
+                };
                 if matches!(resubmission.outcome, ResubmitOutcome::StaleGeneration) {
                     break;
                 }
-                for server_url in resubmission.outcome_unknown_urls {
-                    let newly_outcome_unknown =
-                        !delivery_state.outcome_unknown_urls().contains(&server_url);
-                    delivery_state.mark_outcome_unknown(&server_url)?;
-                    if newly_outcome_unknown {
-                        report.ambiguous.push(ResubmittedShare {
-                            share: ShareKey::of(&share),
-                            server_url,
-                        });
-                    }
-                }
+                record_ambiguous_recovery_effects(
+                    &mut delivery_state,
+                    report,
+                    &share,
+                    resubmission.outcome_unknown_urls,
+                )?;
                 match resubmission.outcome {
                     ResubmitOutcome::DefinitelyAcceptedByHelper(server_url) => {
                         // An overdue re-POST can convert an outcome-unknown
@@ -832,7 +1212,26 @@ async fn track_pending_shares_with_elapsed(
         current_time,
         params.policy,
     );
-    Ok(report)
+    Ok(())
+}
+
+fn record_ambiguous_recovery_effects(
+    delivery_state: &mut share::ShareDeliveryState,
+    report: &mut ShareTrackingReport,
+    recovered_share: &ShareDelegationRecord,
+    outcome_unknown_urls: Vec<String>,
+) -> Result<(), VotingError> {
+    for server_url in outcome_unknown_urls {
+        let newly_outcome_unknown = !delivery_state.outcome_unknown_urls().contains(&server_url);
+        delivery_state.mark_outcome_unknown(&server_url)?;
+        if newly_outcome_unknown {
+            report.ambiguous.push(ResubmittedShare {
+                share: ShareKey::of(recovered_share),
+                server_url,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Runs the same generation-bound tracking pass using caller-local futures.
@@ -845,10 +1244,12 @@ pub async fn track_pending_shares_local(
 ) -> Result<ShareTrackingReport, VotingError> {
     let timer = client.timer;
     let start = timer.now();
-    track_pending_shares_with_elapsed(db, params, client, cancel, &|| {
+    let scope = share::ShareOperationScope::capture(db);
+    track_pending_shares_with_elapsed(db, &scope, params, client, cancel, &|| {
         timer.now().saturating_sub(start).as_secs()
     })
     .await
+    .map_err(|failed| failed.error)
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {
@@ -863,4 +1264,4 @@ fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

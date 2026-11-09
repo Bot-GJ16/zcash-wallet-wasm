@@ -9,6 +9,29 @@ async fn final_quorum_checkpoint_must_be_acknowledged(drop_checkpoint: bool) {
         }
     }
     let (fixture, base) = confirmed_vote_base().await;
+    let baseline = fixture.reopen(&base);
+    let baseline_durable = Arc::new(Mutex::new(base.clone()));
+    let baseline_transport = Helpers::new(&fixture, baseline_durable.clone());
+    let baseline_checkpoints = Cell::new(0);
+    let baseline_result = baseline
+        .submit_ballot_with(
+            ID,
+            None,
+            &baseline_transport,
+            || std::future::ready(Ok(fixture.round.clone())),
+            |_, _, _| async { panic!("helper resume regenerated a vote") },
+            || async {
+                baseline_checkpoints.set(baseline_checkpoints.get() + 1);
+                *baseline_durable.lock().unwrap() = baseline.db.serialize_bytes().unwrap();
+                Ok(())
+            },
+            || Ok(1500),
+        )
+        .await
+        .unwrap();
+    assert_eq!(baseline_result.phase, VotingRoundPhase::SharesConfirmed);
+    let final_checkpoint = baseline_checkpoints.get();
+    assert!(final_checkpoint > 0);
     let session = fixture.reopen(&base);
     let durable = Arc::new(Mutex::new(base));
     let transport = Helpers::new(&fixture, durable.clone());
@@ -23,7 +46,7 @@ async fn final_quorum_checkpoint_must_be_acknowledged(drop_checkpoint: bool) {
         |_, _, _| async { panic!("helper resume regenerated a vote") },
         || async {
             checkpoints.set(checkpoints.get() + 1);
-            if checkpoints.get() == 49 {
+            if checkpoints.get() == final_checkpoint {
                 let _ = reached.borrow_mut().take().unwrap().send(());
                 if drop_checkpoint {
                     pending::<()>().await;
@@ -44,7 +67,7 @@ async fn final_quorum_checkpoint_must_be_acknowledged(drop_checkpoint: bool) {
         assert!(operation.as_mut().await.is_err());
     }
     drop(operation);
-    assert_eq!(checkpoints.get(), 49);
+    assert_eq!(checkpoints.get(), final_checkpoint);
     assert!(
         session
             .db

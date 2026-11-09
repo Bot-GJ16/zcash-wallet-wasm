@@ -13,10 +13,12 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 mod browser_clock {
     pub struct Instant(f64);
+
     impl Instant {
         pub fn now() -> Self {
             Self(js_sys::Date::now())
         }
+
         pub fn elapsed(&self) -> std::time::Duration {
             std::time::Duration::from_secs_f64(((js_sys::Date::now() - self.0) / 1000.0).max(0.0))
         }
@@ -41,7 +43,8 @@ use pir_types::tier1::Tier1Row;
 use pir_types::{serialize_ypir_query, RootInfo, YpirScenario, YPIR_MIN_ITEM_BITS, YPIR_MIN_ROWS};
 
 use ypir::client::YPIRClient;
-use ypir::params::YPIRSPConfig;
+use ypir::modulus_switch::expected_ct_byte_len;
+use ypir::params::{GetQPrime, YPIRSPConfig};
 
 /// Valid row used when Tier 0 cannot safely route a nullifier. The encrypted
 /// query is still sent so a server cannot distinguish routing failures by
@@ -275,33 +278,88 @@ impl PirClient {
             root_info.pir_layout.pir_depth
         );
 
-        let (layout_rows, _layout_leaves, layout_row_bytes) = tier1_geometry(root_info.pir_layout)?;
-        let scenario_item_bits = root_info
-            .tier1_row_bytes
-            .checked_mul(8)
-            .context("server Tier 1 row width overflows bit size")?;
-        anyhow::ensure!(
-            layout_rows == root_info.tier1_rows
-                && layout_row_bytes == root_info.tier1_row_bytes
-                && layout_rows >= YPIR_MIN_ROWS
-                && scenario_item_bits >= YPIR_MIN_ITEM_BITS,
-            "server Tier 1 shape mismatch"
-        );
+        // Wait for both public assets before deciding whether endpoint fallback
+        // is allowed: malformed data must outrank a retryable sibling failure.
+        let (tier0_response, tier1_response) =
+            futures::join!(transport.get(&tier0_url), transport.get(&tier1_url));
+        let tier1_result = (|| -> Result<(YpirScenario, usize)> {
+            let tier1_response = tier1_response.context("connect data fetch failed")?;
+            let tier1_scenario: YpirScenario = serde_json::from_slice(&body_for_status(
+                tier1_response,
+                "GET /params/tier1 failed",
+            )?)
+            .context("parse /params/tier1 response")?;
+            anyhow::ensure!(
+                tier1_scenario.poly_len == expected_layout.poly_len,
+                "PIR poly_len mismatch: expected {}, server advertised {}",
+                expected_layout.poly_len,
+                tier1_scenario.poly_len
+            );
+            let (layout_rows, _layout_leaves, layout_row_bytes) =
+                tier1_geometry(root_info.pir_layout)?;
+            let scenario_item_bits = root_info
+                .tier1_row_bytes
+                .checked_mul(8)
+                .context("server Tier 1 row width overflows bit size")?;
+            anyhow::ensure!(
+                layout_rows == root_info.tier1_rows
+                    && layout_row_bytes == root_info.tier1_row_bytes
+                    && tier1_scenario.num_items == root_info.tier1_rows
+                    && tier1_scenario.item_size_bits == scenario_item_bits
+                    && layout_rows >= YPIR_MIN_ROWS
+                    && scenario_item_bits >= YPIR_MIN_ITEM_BITS,
+                "server Tier 1 shape mismatch: layout implies {}x{} bytes, /root reports {}x{} bytes, and /params reports {} items x {} bits",
+                layout_rows,
+                layout_row_bytes,
+                root_info.tier1_rows,
+                root_info.tier1_row_bytes,
+                tier1_scenario.num_items,
+                tier1_scenario.item_size_bits
+            );
+            Ok((tier1_scenario, layout_row_bytes))
+        })();
+        let tier0_result = (|| -> Result<Tier0Data> {
+            let tier0_response = tier0_response.context("connect data fetch failed")?;
+            let expected_tier0_bytes = root_info
+                .pir_layout
+                .tier0_bytes()
+                .map_err(anyhow::Error::msg)?;
+            let tier0_bytes = body_for_status(tier0_response, "GET /tier0 failed")?;
+            log::debug!(
+                "Downloaded Tier 0: {} bytes in {:.1}s",
+                tier0_bytes.len(),
+                t0.elapsed().as_secs_f64()
+            );
+            anyhow::ensure!(
+                tier0_bytes.len() == expected_tier0_bytes,
+                "Tier 0 size mismatch: got {} bytes, layout expects {}",
+                tier0_bytes.len(),
+                expected_tier0_bytes
+            );
+            let tier0 = Tier0Data::from_layout(tier0_bytes, root_info.pir_layout)?;
+            let pir_root_bytes = hex::decode(&root_info.pir_root)?;
+            anyhow::ensure!(
+                pir_root_bytes.len() == 32,
+                "pir_root hex decoded to {} bytes, expected 32",
+                pir_root_bytes.len()
+            );
+            let mut pir_root_arr = [0u8; 32];
+            pir_root_arr.copy_from_slice(&pir_root_bytes);
+            let pir_root = Option::from(Fp::from_repr(pir_root_arr))
+                .ok_or_else(|| anyhow::anyhow!("invalid pir_root field element"))?;
+            anyhow::ensure!(
+                tier0.root() == pir_root,
+                "Tier 0 root does not match server pir_root"
+            );
+            Ok(tier0)
+        })();
+        let (tier0, (tier1_scenario, layout_row_bytes)) = match (tier0_result, tier1_result) {
+            (Err(error), _) if !error.is::<RetryableTransportError>() => return Err(error),
+            (_, Err(error)) if !error.is::<RetryableTransportError>() => return Err(error),
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+            (Ok(tier0), Ok(tier1)) => (tier0, tier1),
+        };
 
-        let expected_tier0_bytes = root_info
-            .pir_layout
-            .tier0_bytes()
-            .map_err(anyhow::Error::msg)?;
-        let pir_root_bytes = hex::decode(&root_info.pir_root)?;
-        anyhow::ensure!(
-            pir_root_bytes.len() == 32,
-            "pir_root hex decoded to {} bytes, expected 32",
-            pir_root_bytes.len()
-        );
-        let mut pir_root_arr = [0u8; 32];
-        pir_root_arr.copy_from_slice(&pir_root_bytes);
-        let pir_root = Option::from(Fp::from_repr(pir_root_arr))
-            .ok_or_else(|| anyhow::anyhow!("invalid pir_root field element"))?;
         let circuit_root_bytes = hex::decode(&root_info.circuit_root)?;
         anyhow::ensure!(
             circuit_root_bytes.len() == 32,
@@ -312,57 +370,6 @@ impl PirClient {
         circuit_root_arr.copy_from_slice(&circuit_root_bytes);
         let circuit_root = Option::from(Fp::from_repr(circuit_root_arr))
             .ok_or_else(|| anyhow::anyhow!("invalid circuit_root field element"))?;
-
-        // Finish both loads and validate each successful asset before classifying
-        // failures. A retryable sibling cannot hide malformed protocol data.
-        let (tier0_resp, tier1_resp) =
-            futures::join!(transport.get(&tier0_url), transport.get(&tier1_url));
-        let tier0_result = tier0_resp
-            .context("connect data fetch failed")
-            .and_then(|response| {
-                let bytes = body_for_status(response, "GET /tier0 failed")?;
-                log::debug!(
-                    "Downloaded Tier 0: {} bytes in {:.1}s",
-                    bytes.len(),
-                    t0.elapsed().as_secs_f64()
-                );
-                anyhow::ensure!(
-                    bytes.len() == expected_tier0_bytes,
-                    "Tier 0 size mismatch: got {} bytes, layout expects {}",
-                    bytes.len(),
-                    expected_tier0_bytes
-                );
-                let tier0 = Tier0Data::from_layout(bytes, root_info.pir_layout)?;
-                anyhow::ensure!(
-                    tier0.root() == pir_root,
-                    "Tier 0 root does not match server pir_root"
-                );
-                Ok(tier0)
-            });
-        let tier1_result = tier1_resp
-            .context("connect data fetch failed")
-            .and_then(|response| {
-                let scenario: YpirScenario =
-                    serde_json::from_slice(&body_for_status(response, "GET /params/tier1 failed")?)
-                        .context("parse /params/tier1 response")?;
-                anyhow::ensure!(
-                    scenario.poly_len == expected_layout.poly_len,
-                    "PIR poly_len mismatch: expected {}, server advertised {}",
-                    expected_layout.poly_len,
-                    scenario.poly_len
-                );
-                anyhow::ensure!(
-                    scenario.num_items == root_info.tier1_rows
-                        && scenario.item_size_bits == scenario_item_bits,
-                    "server Tier 1 shape mismatch"
-                );
-                Ok(scenario)
-            });
-        let (tier0, tier1_scenario) = match (tier0_result, tier1_result) {
-            (Err(error), _) if !error.is::<RetryableTransportError>() => return Err(error),
-            (_, Err(error)) if !error.is::<RetryableTransportError>() => return Err(error),
-            (tier0, tier1) => (tier0?, tier1?),
-        };
 
         let empty_hashes = precompute_empty_hashes();
 
@@ -544,7 +551,7 @@ impl PirClient {
         let resp = match send_result {
             Ok(r) => r,
             Err(e) => {
-                log::warn!("YPIR request failed");
+                log::warn!("YPIR {} send error: {:?}", tier_name, e);
                 return Err(e);
             }
         };
@@ -556,8 +563,27 @@ impl PirClient {
         let status = resp.status;
         let response_bytes = resp.body;
         if !is_success(status) {
-            return Err(RetryableTransportError.into());
+            if status == 429 || status >= 500 {
+                return Err(RetryableTransportError.into());
+            }
+            anyhow::bail!("{} query failed: HTTP {}", tier_name, status);
         }
+        let params = ypir_client.params();
+        let expected_response_bytes = params
+            .instances
+            .checked_mul(expected_ct_byte_len(
+                params,
+                params.get_q_prime_1(),
+                params.get_q_prime_2(),
+            ))
+            .context("YPIR response length overflow")?;
+        anyhow::ensure!(
+            response_bytes.len() == expected_response_bytes,
+            "{} response length {}, expected {} bytes",
+            tier_name,
+            response_bytes.len(),
+            expected_response_bytes
+        );
         let rtt_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let download_from_server_ms = (rtt_ms - send_ms).max(0.0);
         let net_queue_ms = server_total_ms.map(|server_ms| (rtt_ms - server_ms).max(0.0));
@@ -568,7 +594,6 @@ impl PirClient {
         // path) become recoverable errors rather than allowing a hostile
         // response to unwind through and abort the client process.
         let t2 = Instant::now();
-        validate_simplepir_response_length(&ypir_client, response_bytes.len())?;
         let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ypir_client.decode_response_simplepir(seed, &response_bytes)
         }))
@@ -612,21 +637,6 @@ impl PirClient {
     }
 }
 
-fn validate_simplepir_response_length(client: &YPIRClient, length: usize) -> Result<()> {
-    use ypir::{modulus_switch::expected_ct_byte_len, params::GetQPrime};
-    let params = client.params();
-    // SimplePIR concatenates one modulus-switched ciphertext per instance.
-    // Use the codec's own geometry, before its assertion-based decoder is called.
-    let expected = expected_ct_byte_len(params, params.get_q_prime_1(), params.get_q_prime_2())
-        .checked_mul(params.instances)
-        .context("invalid YPIR response geometry")?;
-    anyhow::ensure!(
-        expected > 0 && length == expected,
-        "invalid YPIR response length"
-    );
-    Ok(())
-}
-
 fn fmt_time(ms: f64) -> String {
     if ms >= 1000.0 {
         format!("{:>5.1}s ", ms / 1000.0)
@@ -649,6 +659,8 @@ fn is_success(status: u16) -> bool {
 fn body_for_status(response: TransportResponse, context: &'static str) -> Result<Vec<u8>> {
     if is_success(response.status) {
         Ok(response.body)
+    } else if response.status == 429 || response.status >= 500 {
+        Err(RetryableTransportError.into())
     } else {
         anyhow::bail!(
             "{}: HTTP {} body={}",

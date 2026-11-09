@@ -8,13 +8,13 @@ use pasta_curves::pallas;
 use serde::{Deserialize, Serialize};
 use subtle::CtOption;
 use thiserror::Error;
+use voting_crypto_deps::zip32::Scope;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::{
     self, BlockHeight, Network as ZcashNetwork, NetworkType, NetworkUpgrade, Parameters,
 };
 use zeroize::Zeroizing;
-use zip32::Scope;
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
 pub use crate::wire::VotingRoundParams;
@@ -33,17 +33,280 @@ pub const MIN_VOTE_OPTIONS: u32 = 2;
 pub const MAX_VOTE_OPTIONS: u32 = 8;
 
 pub(crate) const REGTEST_NU6_3_ACTIVATION_HEIGHT: u32 = 10;
+pub(crate) const REGTEST_NU7_ACTIVATION_HEIGHT: u32 = 11;
+
+/// Delegation setup field that write-once persistence refuses to overwrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DelegationSetupField {
+    PaddedNoteSecrets,
+    PcztSighash,
+    Tx1Effects,
+    /// Exact serialized PCZT for a later external signing request.
+    DelegationPczt,
+}
+
+impl DelegationSetupField {
+    /// Durable column name, matching the wording of the earlier text-only error.
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::PaddedNoteSecrets => "padded_note_secrets",
+            Self::PcztSighash => "pczt_sighash",
+            Self::Tx1Effects => "tx1_effects",
+            Self::DelegationPczt => "delegation_pczt",
+        }
+    }
+}
+
+impl fmt::Display for DelegationSetupField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.column_name())
+    }
+}
+
+/// Stable category of a [`VotingError`].
+///
+/// Hosts branch on this instead of parsing error text. The enum is
+/// non-exhaustive so new categories can be added without breaking hosts; a
+/// host must keep a fallback arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VotingErrorKind {
+    InvalidInput,
+    KeystoneSignatureConflict,
+    ProofFailed,
+    Busy,
+    Storage,
+    Internal,
+    InsufficientEligibility,
+    NoSpendableNotes,
+    SetupAlreadyPersisted,
+    DelegationPcztUnavailable,
+    DbBusy,
+    PirUnavailable,
+    /// A bundle's stored delegation setup does not reproduce from the voting
+    /// hotkey the host holds.
+    ///
+    /// It says what disagrees, not what may be done about it: the comparison
+    /// is over the stored binding alone, and a bundle whose delegation is
+    /// already on chain fails it the same way one that never left the device
+    /// does. Rebuilding is safe only when nothing was broadcast, which is a
+    /// separate question — ask it with `delegation_broadcast_evidence`, or let
+    /// the discard answer it, since it refuses with
+    /// [`VotingErrorKind::DelegationAlreadyBroadcast`] rather than destroying
+    /// the setup that recovers a round's voting weight.
+    DelegationTargetMismatch,
+    /// A delegation may already be on chain, so the state the host asked to
+    /// clear is the only thing that can recover the round's voting weight.
+    DelegationAlreadyBroadcast,
+}
+
+fn insufficient_eligibility_message(
+    required_weight_zatoshi: &u64,
+    selected_weight_zatoshi: &u64,
+    selected_notes: &u32,
+    snapshot_height: &Option<u64>,
+) -> String {
+    let suffix = snapshot_height
+        .map(|height| format!(" at snapshot height {height}"))
+        .unwrap_or_default();
+    format!(
+        "minimum voting eligibility requires at least one eligible voting bundle with {required_weight_zatoshi} zatoshi voting weight; selected {selected_notes} distinct notes across eligible bundles with {selected_weight_zatoshi} zatoshi eligible bundle weight{suffix}"
+    )
+}
+
+fn pir_endpoint_suffix(endpoint: &Option<String>) -> String {
+    endpoint
+        .as_deref()
+        .map(|endpoint| format!(" at {endpoint}"))
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Error)]
 pub enum VotingError {
+    /// Stored setup is missing the exact transaction needed for Keystone signing.
+    #[error("delegation for round={round_id}, bundle={bundle_index} has no persisted PCZT for a Keystone signing request")]
+    DelegationPcztUnavailable { round_id: String, bundle_index: u32 },
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
     #[error("Keystone signature conflict for bundle {bundle_index}")]
     KeystoneSignatureConflict { bundle_index: u32 },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
+    #[error("Voting state is busy: {message}")]
+    Busy { message: String },
+    /// A durable-state read or write failed before its result could be interpreted.
+    #[error("Storage error: {message}")]
+    Storage { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
+    /// The planned note set does not reach the minimum voting weight.
+    #[error("{}", insufficient_eligibility_message(.required_weight_zatoshi, .selected_weight_zatoshi, .selected_notes, .snapshot_height))]
+    InsufficientEligibility {
+        required_weight_zatoshi: u64,
+        selected_weight_zatoshi: u64,
+        /// Snapshot height the check was evaluated at, when the caller knows it.
+        snapshot_height: Option<u64>,
+        /// Note slots one bundle must fill before it carries voting weight.
+        bundle_note_slots: u32,
+        /// Distinct notes that survived bundle planning.
+        selected_notes: u32,
+    },
+    /// The account holds no spendable Orchard notes at the round snapshot.
+    #[error("no spendable voting notes at snapshot height {snapshot_height}")]
+    NoSpendableNotes { snapshot_height: u64 },
+    /// Delegation setup is write-once and a differing value already exists.
+    ///
+    /// Callers that only need the persisted setup may treat this as success
+    /// and reuse the stored artifacts.
+    #[error("refusing to overwrite {field} for round={round_id}, bundle={bundle_index}")]
+    SetupAlreadyPersisted {
+        round_id: String,
+        bundle_index: u32,
+        field: DelegationSetupField,
+    },
+    /// SQLite reported the sidecar database busy or locked past its timeout.
+    #[error("Voting database is busy: {message}")]
+    DbBusy { message: String },
+    /// A PIR endpoint could not serve a request.
+    ///
+    /// `retryable` is true for connection, timeout, transient-status, and
+    /// body-read failures where another endpoint or a later attempt may
+    /// succeed. It is false for layout or content failures.
+    #[error("PIR unavailable{}: {message}", pir_endpoint_suffix(.endpoint))]
+    PirUnavailable {
+        endpoint: Option<String>,
+        http_status: Option<u16>,
+        retryable: bool,
+        message: String,
+    },
+    /// The stored delegation setup of `bundle_index` does not reproduce from
+    /// the voting hotkey the caller supplied.
+    ///
+    /// A comparison over the stored binding, and nothing more. It is distinct
+    /// from `InvalidInput` because retrying with the same key never succeeds:
+    /// either the caller holds the wrong hotkey for this round, or the bundle
+    /// is rebuilt against the key it does hold. It is not authorization to
+    /// discard anything — a bundle whose delegation is already on chain fails
+    /// this comparison exactly as one that never left the device does, and its
+    /// setup is then the only thing that can reproduce the round's voting
+    /// weight. The message says "if the bundle was never broadcast" for that
+    /// reason, and the discard settles the question itself, refusing with
+    /// [`VotingError::DelegationAlreadyBroadcast`].
+    ///
+    /// Preparation is the only path that rebuilds, so the message names it. A
+    /// host normally never sees this, because proof reuse absorbs it and
+    /// rebuilds; Keystone signing keeps the strict check, since the device
+    /// signed the exact PCZT the stored setup describes and this call may be
+    /// about to apply that signature. Naming the recovery is what turns that
+    /// refusal into an instruction instead of a dead end.
+    #[error(
+        "bundle {bundle_index}'s stored delegation target does not reproduce from this voting \
+         hotkey (van_matches={van_matches}, commitment_matches={commitment_matches}); if the \
+         bundle was never broadcast, re-run delegation preparation to rebuild it"
+    )]
+    DelegationTargetMismatch {
+        bundle_index: u32,
+        /// Whether the VAN commitment reproduced. It binds the hotkey, the
+        /// bundle's total note value and the round, so a false here with a
+        /// matching commitment means something other than the hotkey moved.
+        van_matches: bool,
+        /// Whether the governance output commitment reproduced. It binds the
+        /// hotkey and the note's own randomness.
+        commitment_matches: bool,
+    },
+    /// The caller asked to clear state for `bundle_index`, whose delegation may
+    /// already be on chain.
+    ///
+    /// The round's governance nullifiers are deterministic and spent by then,
+    /// so its stored setup is the only thing that can reproduce its voting
+    /// weight. Nothing was cleared.
+    #[error("delegation for bundle {bundle_index} may already be on chain ({evidence}), so its recovery state was kept")]
+    DelegationAlreadyBroadcast { bundle_index: u32, evidence: String },
+}
+
+impl VotingError {
+    /// Stable category of this error.
+    pub fn kind(&self) -> VotingErrorKind {
+        match self {
+            Self::InvalidInput { .. } => VotingErrorKind::InvalidInput,
+            Self::KeystoneSignatureConflict { .. } => VotingErrorKind::KeystoneSignatureConflict,
+            Self::ProofFailed { .. } => VotingErrorKind::ProofFailed,
+            Self::Busy { .. } => VotingErrorKind::Busy,
+            Self::Storage { .. } => VotingErrorKind::Storage,
+            Self::Internal { .. } => VotingErrorKind::Internal,
+            Self::InsufficientEligibility { .. } => VotingErrorKind::InsufficientEligibility,
+            Self::NoSpendableNotes { .. } => VotingErrorKind::NoSpendableNotes,
+            Self::SetupAlreadyPersisted { .. } => VotingErrorKind::SetupAlreadyPersisted,
+            Self::DelegationPcztUnavailable { .. } => VotingErrorKind::DelegationPcztUnavailable,
+            Self::DbBusy { .. } => VotingErrorKind::DbBusy,
+            Self::PirUnavailable { .. } => VotingErrorKind::PirUnavailable,
+            Self::DelegationTargetMismatch { .. } => VotingErrorKind::DelegationTargetMismatch,
+            Self::DelegationAlreadyBroadcast { .. } => VotingErrorKind::DelegationAlreadyBroadcast,
+        }
+    }
+
+    /// Whether repeating the same operation later, or against another
+    /// endpoint, has a reasonable chance of succeeding.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Busy { .. }
+                | Self::DbBusy { .. }
+                | Self::PirUnavailable {
+                    retryable: true,
+                    ..
+                }
+        )
+    }
+
+    /// Attaches the snapshot height to an eligibility failure that was
+    /// evaluated without one. Other errors are returned unchanged.
+    pub fn with_snapshot_height(self, height: u64) -> Self {
+        match self {
+            Self::InsufficientEligibility {
+                required_weight_zatoshi,
+                selected_weight_zatoshi,
+                snapshot_height: None,
+                bundle_note_slots,
+                selected_notes,
+            } => Self::InsufficientEligibility {
+                required_weight_zatoshi,
+                selected_weight_zatoshi,
+                snapshot_height: Some(height),
+                bundle_note_slots,
+                selected_notes,
+            },
+            other => other,
+        }
+    }
+
+    /// Classifies a SQLite failure, keeping `context` in the message.
+    pub(crate) fn from_sqlite(context: &str, error: &rusqlite::Error) -> Self {
+        let message = format!("{context}: {error}");
+        if is_sqlite_busy(error) {
+            Self::DbBusy { message }
+        } else {
+            Self::Storage { message }
+        }
+    }
+}
+
+pub(crate) fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+impl From<rusqlite::Error> for VotingError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::from_sqlite("sqlite", &error)
+    }
 }
 
 /// Zcash network selector used by wallet-facing voting APIs.
@@ -56,6 +319,22 @@ pub enum Network {
     Testnet,
     Mainnet,
     Regtest,
+}
+
+impl Network {
+    /// Vote-chain deployment identifier conventionally paired with this
+    /// network: `zvote-1` for mainnet and `svote-1` for the shared
+    /// staging chain used by testnet and regtest wallets.
+    ///
+    /// This is a convention, not an authenticated value; a deployment that
+    /// rotates chain ids must supply the id from configuration through
+    /// [`crate::ChainSubmissionClientConfig::with_vote_chain_id`].
+    pub fn default_vote_chain_id(self) -> &'static str {
+        match self {
+            Self::Mainnet => "zvote-1",
+            Self::Testnet | Self::Regtest => "svote-1",
+        }
+    }
 }
 
 impl Parameters for Network {
@@ -84,6 +363,8 @@ impl Parameters for Network {
                 NetworkUpgrade::Nu6_3 => {
                     Some(BlockHeight::from_u32(REGTEST_NU6_3_ACTIVATION_HEIGHT))
                 }
+                // Regtest mirrors the Zebra/Zakura fixtures that activate NU7 at height 11.
+                NetworkUpgrade::Nu7 => Some(BlockHeight::from_u32(REGTEST_NU7_ACTIVATION_HEIGHT)),
             },
         }
     }
@@ -388,7 +669,7 @@ impl NoteInfo {
             rho: note.rho().to_bytes().to_vec(),
             rseed: note.rseed().as_bytes().to_vec(),
             scope,
-            ufvk_str: ufvk.encode(network),
+            ufvk_str: crate::backend::encode_full_viewing_key(ufvk, network)?,
         })
     }
 }
@@ -1147,14 +1428,16 @@ pub fn validate_notes_for_round(notes: &[NoteInfo]) -> Result<(), VotingError> {
 
 #[cfg(test)]
 mod tests {
+    mod error_kind;
+
     use super::*;
     use crate::governance::BALLOT_DIVISOR;
-    use orchard::note::{ExtractedNoteCommitment, NoteVersion, Rho};
+    use orchard::note::{ExtractedNoteCommitment, NoteVersion};
     use orchard::value::NoteValue;
     use voting_crypto_deps::rand::rngs::OsRng;
+    use voting_crypto_deps::zip32::{AccountId, Scope};
     use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_protocol::consensus::TEST_NETWORK;
-    use zip32::{AccountId, Scope};
 
     fn placeholder_tree_state(snapshot_height: u64) -> TreeState {
         TreeState {
@@ -1304,7 +1587,10 @@ mod tests {
         assert_eq!(note_info.rho, note.rho().to_bytes().to_vec());
         assert_eq!(note_info.rseed, note.rseed().as_bytes().to_vec());
         assert_eq!(note_info.scope, 0);
-        assert_eq!(note_info.ufvk_str, ufvk.encode(&TEST_NETWORK));
+        assert_eq!(
+            note_info.ufvk_str,
+            crate::backend::encode_full_viewing_key(&ufvk, &TEST_NETWORK).unwrap()
+        );
     }
 
     #[test]
@@ -1334,11 +1620,11 @@ mod tests {
         version: NoteVersion,
         rng: &mut OsRng,
     ) -> orchard::Note {
-        let (_, _, parent_note) = orchard::Note::dummy(&mut *rng, None, NoteVersion::V2);
-        orchard::Note::new(
+        let (_, _, parent_note) = voting_crypto_deps::dummy_note(&mut *rng, None, NoteVersion::V2);
+        voting_crypto_deps::new_note(
             address,
             NoteValue::from_raw(12_500_000),
-            Rho::from_nf_old(parent_note.nullifier(fvk)),
+            voting_crypto_deps::rho_from_nullifier(parent_note.nullifier(fvk)),
             version,
             rng,
         )

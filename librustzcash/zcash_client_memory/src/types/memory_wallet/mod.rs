@@ -1937,6 +1937,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 #[cfg(feature = "orchard")]
                 vec![],
                 #[cfg(feature = "orchard")]

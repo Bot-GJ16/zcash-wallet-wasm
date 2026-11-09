@@ -47,7 +47,6 @@ fn export_intents_incoming_scan_fixture() {
         nu6_1: mainnet.activation_height(NetworkUpgrade::Nu6_1),
         nu6_2: mainnet.activation_height(NetworkUpgrade::Nu6_2),
         nu6_3: mainnet.activation_height(NetworkUpgrade::Nu6_3),
-        #[cfg(zcash_unstable = "nu7")]
         nu7: mainnet.activation_height(NetworkUpgrade::Nu7),
         #[cfg(zcash_unstable = "nutachyon")]
         nu_tachyon: mainnet.activation_height(NetworkUpgrade::NuTachyon),

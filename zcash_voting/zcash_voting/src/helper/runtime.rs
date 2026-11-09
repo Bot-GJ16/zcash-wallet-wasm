@@ -140,6 +140,9 @@ pub(crate) trait RuntimeClient {
     where
         Self: 'a;
     fn health(&self) -> &HelperHealth;
+    fn observation_scope(&self) -> crate::ObservationScope {
+        crate::ObservationScope::disabled()
+    }
     fn now(&self) -> Moment;
     fn sleep_until(&self, deadline: Moment) -> Self::Future<'_, ()>;
     fn checkpoint(&self) -> Self::Future<'_, Result<(), VotingError>>;
@@ -191,6 +194,9 @@ impl RuntimeClient for HelperClient {
     type Polls<'a> = tokio::task::JoinSet<PollResult>;
     fn health(&self) -> &HelperHealth {
         self.health()
+    }
+    fn observation_scope(&self) -> crate::ObservationScope {
+        HelperClient::observation_scope(self)
     }
     fn now(&self) -> Moment {
         Moment::Native(tokio::time::Instant::now())

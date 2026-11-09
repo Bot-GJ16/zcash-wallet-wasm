@@ -17,8 +17,8 @@ pub(crate) use share_delegations::record_share_delegation;
 pub(crate) use share_delegations::record_share_delegation_with_after_read;
 pub use share_delegations::{
     add_ambiguous_servers, add_attempting_server, add_sent_servers_preserving_schedule,
-    clear_stale_share_delegations_for_intent, get_share_delegations, get_unconfirmed_delegations,
-    pending_share_rounds, remove_attempting_server, share_is_confirmed,
+    get_share_delegations, get_unconfirmed_delegations, pending_share_rounds,
+    remove_attempting_server, share_is_confirmed,
 };
 pub(crate) use share_delegations::{
     add_ambiguous_servers_for_generation, add_attempting_server_for_generation,
@@ -411,6 +411,68 @@ pub fn advance_round_phase(
     }
 }
 
+/// Raise a round phase to `phase`, leaving a later phase alone.
+///
+/// `rounds.phase` is a lossy round-wide high-water mark, not an authority for
+/// per-bundle completion. Bundles progress independently, so a caller that
+/// reaches `phase` for its own bundle may find the round already further along
+/// because a different bundle got there first. That is a valid state, not a
+/// conflict: the marker keeps the later value and the caller continues.
+///
+/// This is the difference from [`advance_round_phase`], which rejects a
+/// regression as caller error. Use this when the phase is incidental to the
+/// work being committed, and `advance_round_phase` when moving the round
+/// backwards would mean the caller had lost track of the lifecycle.
+///
+/// A round that does not exist is an error rather than a silent no-op.
+pub fn advance_round_phase_to_at_least(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    phase: RoundPhase,
+) -> Result<(), VotingError> {
+    let rows = conn
+        .execute(
+            "UPDATE rounds
+             SET phase = :phase
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND phase < :phase",
+            named_params! {
+                ":phase": phase as i32,
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to advance round phase to at least {phase:?}: {e}"),
+        })?;
+    if rows > 0 {
+        return Ok(());
+    }
+
+    // No row changed: either the round is already at or past `phase`, which is
+    // the case this function exists to accept, or there is no such round.
+    let round_exists = conn
+        .query_row(
+            "SELECT 1 FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| row.get::<_, i32>(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to look up round {round_id}: {e}"),
+        })?
+        .is_some();
+    if round_exists {
+        Ok(())
+    } else {
+        Err(VotingError::InvalidInput {
+            message: format!("round not found: {round_id}"),
+        })
+    }
+}
+
 pub fn load_round_params(
     conn: &Connection,
     round_id: &str,
@@ -457,8 +519,13 @@ pub fn load_round_network(
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| row.get::<_, String>(0),
     )
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("round not found: {} ({})", round_id, e),
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => VotingError::InvalidInput {
+            message: format!("round not found: {round_id}"),
+        },
+        error => VotingError::Storage {
+            message: format!("failed to load round network for {round_id}: {error}"),
+        },
     })
     .and_then(|network| network_from_storage(&network))
 }
@@ -598,7 +665,15 @@ pub fn list_rounds(conn: &Connection, wallet_id: &str) -> Result<Vec<RoundSummar
 
 /// Delete a round and all associated data. Child tables (bundles, cached_tree_state,
 /// proofs, witnesses, votes) are removed automatically via ON DELETE CASCADE.
-pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<(), VotingError> {
+///
+/// Crate-internal: this is the raw delete, with no boundary check of its own.
+/// Callers outside the crate go through [`crate::VotingDb::clear_round`], which
+/// refuses a round whose delegation may already be on chain.
+pub(crate) fn clear_round(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
     conn.execute(
         "DELETE FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -607,6 +682,35 @@ pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result
         message: format!("failed to clear round: {}", e),
     })?;
     Ok(())
+}
+
+/// Deletes a round, but only when nothing in it has reached the network.
+///
+/// The evidence check and the delete share one immediate transaction, so a
+/// submission that starts after an advisory check cannot lose the rows that
+/// recover it: whatever that submission wrote is either already visible here,
+/// and refuses the delete, or it lands after this transaction commits and
+/// finds no round to attach to.
+///
+/// Returns the evidence that refused the delete, or `None` once the round is
+/// gone. The caller owns the wording of the refusal, so one definition of
+/// "already broadcast" reaches the host from every path.
+pub(crate) fn clear_round_if_unbroadcast(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite("failed to begin round deletion transaction", &error)
+    })?;
+    if let Some(evidence) = delegation_broadcast_evidence(&tx, round_id, wallet_id, None)? {
+        return Ok(Some(evidence));
+    }
+    clear_round(&tx, round_id, wallet_id)?;
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit round deletion transaction", &error)
+    })?;
+    Ok(None)
 }
 
 // --- Bundles ---
@@ -999,11 +1103,13 @@ pub fn store_delegation_data(
         Some(tx1_effects),
         None,
         None,
+        None,
     )
 }
 
-/// Persist delegation action data, the finalized TX1 effects, and PCZT-derived
-/// public inputs that the later delegation proof must reproduce.
+/// Persist delegation action data, the exact TX1 PCZT, finalized TX1 effects,
+/// and PCZT-derived public inputs that later signing and proof generation must
+/// reproduce.
 pub(crate) fn store_delegation_data_with_pczt_fields(
     conn: &Connection,
     round_id: &str,
@@ -1024,6 +1130,7 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
     tx1_effects: &[u8],
+    delegation_pczt: &[u8],
     rk: &[u8],
     gov_nullifiers: &[Vec<u8>],
 ) -> Result<(), VotingError> {
@@ -1048,9 +1155,106 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
         padded_note_secrets,
         pczt_sighash,
         Some(tx1_effects),
+        Some(delegation_pczt),
         Some(rk),
         Some(gov_nullifiers_blob.as_slice()),
     )
+}
+
+/// Replaces one bundle's delegation setup, discarding what it had, as a single
+/// transaction.
+///
+/// The rebuild path for a bundle whose stored target the wallet's voting
+/// hotkey no longer reproduces. The evidence check, the discard of the old
+/// setup and its derived rows, and the write of the replacement all commit
+/// together, so the bundle never sits with its recovery state deleted and no
+/// replacement in its place.
+///
+/// That matters because the round's submission gate is process-local: it
+/// cannot exclude a second process holding a payload for the old setup. If one
+/// dispatches while the replacement is being built, the evidence is here
+/// before this transaction takes it, and the whole rebuild is refused with the
+/// old setup still stored — which is the state that recovers the round's
+/// voting weight.
+///
+/// Refuses with `DelegationAlreadyBroadcast` and writes nothing when the
+/// bundle shows any broadcast evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_unbroadcast_delegation_setup(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    van_comm_rand: &[u8],
+    dummy_nullifiers: &[Vec<u8>],
+    rho_signed: &[u8],
+    padded_cmx: &[Vec<u8>],
+    nf_signed: &[u8],
+    cmx_new: &[u8],
+    alpha: &[u8],
+    rseed_signed: &[u8],
+    rseed_output: &[u8],
+    gov_comm: &[u8],
+    total_note_value: u64,
+    address_index: u32,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+    pczt_sighash: &[u8],
+    tx1_effects: &[u8],
+    delegation_pczt: &[u8],
+    rk: &[u8],
+    gov_nullifiers: &[Vec<u8>],
+) -> Result<(), VotingError> {
+    crate::tx1::validate_tx1_effects(tx1_effects)?;
+    let dummy_blob: Vec<u8> = dummy_nullifiers.iter().flatten().copied().collect();
+    let padded_blob: Vec<u8> = padded_cmx.iter().flatten().copied().collect();
+    let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
+    let gov_nullifiers_blob = encode_gov_nullifiers_blob(gov_nullifiers);
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite("failed to begin delegation setup replacement", &error)
+    })?;
+
+    if let Some((index, evidence)) =
+        first_broadcast_evidence(&tx, round_id, wallet_id, BundleScope::One(bundle_index))?
+    {
+        return Err(already_broadcast(
+            round_id,
+            index,
+            evidence,
+            "replace delegation setup",
+        ));
+    }
+
+    discard_unbroadcast_delegation_setup_within(&tx, round_id, wallet_id, Some(bundle_index))?;
+    store_delegation_setup_within(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        van_comm_rand,
+        &dummy_blob,
+        rho_signed,
+        &padded_blob,
+        nf_signed,
+        cmx_new,
+        alpha,
+        rseed_signed,
+        rseed_output,
+        gov_comm,
+        total_note_value,
+        address_index,
+        &secrets_blob,
+        pczt_sighash,
+        Some(tx1_effects),
+        Some(delegation_pczt),
+        Some(rk),
+        Some(gov_nullifiers_blob.as_slice()),
+    )?;
+
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit delegation setup replacement", &error)
+    })?;
+    Ok(())
 }
 
 fn store_delegation_data_inner(
@@ -1073,6 +1277,7 @@ fn store_delegation_data_inner(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
     tx1_effects: Option<&[u8]>,
+    delegation_pczt: Option<&[u8]>,
     rk: Option<&[u8]>,
     gov_nullifiers_blob: Option<&[u8]>,
 ) -> Result<(), VotingError> {
@@ -1093,22 +1298,92 @@ fn store_delegation_data_inner(
     // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
     let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
 
-    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    // One transaction, because the guards below read the state they guard.
+    // The evidence check in particular decides whether an existing binding may
+    // be replaced, and a submission that commits between that read and the
+    // UPDATE would otherwise have its setup rewritten underneath it.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite("failed to begin delegation setup write", &error)
+    })?;
+    store_delegation_setup_within(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        van_comm_rand,
+        &dummy_blob,
+        rho_signed,
+        &padded_blob,
+        nf_signed,
+        cmx_new,
+        alpha,
+        rseed_signed,
+        rseed_output,
+        gov_comm,
+        total_note_value,
+        address_index,
+        &secrets_blob,
+        pczt_sighash,
+        tx1_effects,
+        delegation_pczt,
+        rk,
+        gov_nullifiers_blob,
+    )?;
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit delegation setup write", &error)
+    })?;
+
+    Ok(())
+}
+
+/// The setup write's guards and update, for a caller that owns the
+/// transaction.
+///
+/// Blobs arrive already encoded, because a rebuild encodes them once and runs
+/// this beside the discard that made room for them.
+#[allow(clippy::too_many_arguments)]
+fn store_delegation_setup_within(
+    tx: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    van_comm_rand: &[u8],
+    dummy_blob: &[u8],
+    rho_signed: &[u8],
+    padded_blob: &[u8],
+    nf_signed: &[u8],
+    cmx_new: &[u8],
+    alpha: &[u8],
+    rseed_signed: &[u8],
+    rseed_output: &[u8],
+    gov_comm: &[u8],
+    total_note_value: u64,
+    address_index: u32,
+    secrets_blob: &[u8],
+    pczt_sighash: &[u8],
+    tx1_effects: Option<&[u8]>,
+    delegation_pczt: Option<&[u8]>,
+    rk: Option<&[u8]>,
+    gov_nullifiers_blob: Option<&[u8]>,
+) -> Result<(), VotingError> {
+    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = tx
         .query_row(
-            "SELECT padded_note_secrets, pczt_sighash, tx1_effects FROM bundles \
+            "SELECT padded_note_secrets, pczt_sighash, tx1_effects, delegation_pczt FROM bundles \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load existing delegation data: {}", e),
         })?;
-    let Some((existing_secrets, existing_sighash, existing_tx1_effects)) = existing else {
+    let Some((existing_secrets, existing_sighash, existing_tx1_effects, existing_delegation_pczt)) =
+        existing
+    else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -1118,36 +1393,125 @@ fn store_delegation_data_inner(
     };
     if let Some(existing_secrets) = existing_secrets {
         if existing_secrets != secrets_blob {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite padded_note_secrets for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::PaddedNoteSecrets,
             });
         }
     }
     if let Some(existing_sighash) = existing_sighash {
         if existing_sighash != pczt_sighash {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite pczt_sighash for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::PcztSighash,
             });
         }
     }
     if let (Some(existing_tx1_effects), Some(tx1_effects)) = (existing_tx1_effects, tx1_effects) {
         if existing_tx1_effects != tx1_effects {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite tx1_effects for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::Tx1Effects,
             });
         }
     }
+    if existing_delegation_pczt.is_some() && delegation_pczt.is_none() {
+        return Err(VotingError::SetupAlreadyPersisted {
+            round_id: round_id.to_string(),
+            bundle_index,
+            field: crate::types::DelegationSetupField::DelegationPczt,
+        });
+    }
+    if let (Some(existing_delegation_pczt), Some(delegation_pczt)) =
+        (existing_delegation_pczt.as_deref(), delegation_pczt)
+    {
+        if existing_delegation_pczt != delegation_pczt {
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::DelegationPczt,
+            });
+        }
 
-    let rows = conn
+        // The complete setup was already committed. Avoid rewriting any of
+        // its binding fields even when this is an idempotent retry.
+        return Ok(());
+    }
+
+    // Any write that would change the stored setup must not run over a bundle
+    // whose delegation reached the network: that bundle's stored setup is the
+    // only thing that reproduces its voting weight.
+    //
+    // The one case skipped is a write that leaves every column exactly as it
+    // found it, which is how an interrupted setup resumes. It is decided by
+    // comparing every column the update below can write, because the binding
+    // alone does not determine the rest: a caller supplying the stored
+    // `van_comm_rand` with any other derived field changed would otherwise
+    // walk straight past this guard. `IS` rather than `=` so a stored NULL
+    // compares as a value.
+    //
+    // An absent binding, in particular, is not evidence of a first write. The
+    // hotkey rebuild clears the setup and only then spends the time to
+    // construct its replacement, so that gap is exactly the window in which
+    // another process may have dispatched the old payload.
+    let write_changes_nothing: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM bundles \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+               AND bundle_index = :bundle_index \
+               AND van_comm_rand IS :rand AND dummy_nullifiers IS :dummies \
+               AND rho_signed IS :rho AND padded_note_data IS :padded \
+               AND nf_signed IS :nf_signed AND cmx_new IS :cmx_new \
+               AND alpha IS :alpha AND rseed_signed IS :rseed_signed \
+               AND rseed_output IS :rseed_output AND gov_comm IS :gov_comm \
+               AND total_note_value IS :total_note_value \
+               AND address_index IS :address_index \
+               AND delegation_pczt IS COALESCE(:delegation_pczt, delegation_pczt) \
+               AND (:rk IS NULL OR rk IS :rk) \
+               AND (:gov_nullifiers_blob IS NULL \
+                    OR gov_nullifiers_blob IS :gov_nullifiers_blob))",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":rand": van_comm_rand,
+                ":dummies": dummy_blob,
+                ":rho": rho_signed,
+                ":padded": padded_blob,
+                ":nf_signed": nf_signed,
+                ":cmx_new": cmx_new,
+                ":alpha": alpha,
+                ":rseed_signed": rseed_signed,
+                ":rseed_output": rseed_output,
+                ":gov_comm": gov_comm,
+                ":total_note_value": total_note_value as i64,
+                ":address_index": address_index as i64,
+                ":delegation_pczt": delegation_pczt,
+                ":rk": rk,
+                ":gov_nullifiers_blob": gov_nullifiers_blob,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to compare stored delegation setup: {error}"),
+        })?;
+    if !write_changes_nothing {
+        if let Some((index, evidence)) =
+            delegation_broadcast_evidence(&tx, round_id, wallet_id, Some(bundle_index))?
+        {
+            return Err(already_broadcast(
+                round_id,
+                index,
+                evidence,
+                "replace delegation setup",
+            ));
+        }
+    }
+
+    let rows = tx
         .execute(
             "UPDATE bundles SET van_comm_rand = :rand, dummy_nullifiers = :dummies, \
              rho_signed = :rho, padded_note_data = :padded, nf_signed = :nf_signed, \
@@ -1157,6 +1521,7 @@ fn store_delegation_data_inner(
              padded_note_secrets = COALESCE(padded_note_secrets, :secrets), \
              pczt_sighash = COALESCE(pczt_sighash, :sighash), \
              tx1_effects = COALESCE(tx1_effects, :tx1_effects), \
+             delegation_pczt = COALESCE(delegation_pczt, :delegation_pczt), \
              rk = COALESCE(:rk, rk), \
              gov_nullifiers_blob = COALESCE(:gov_nullifiers_blob, gov_nullifiers_blob) \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
@@ -1176,6 +1541,7 @@ fn store_delegation_data_inner(
                 ":secrets": secrets_blob,
                 ":sighash": pczt_sighash,
                 ":tx1_effects": tx1_effects,
+                ":delegation_pczt": delegation_pczt,
                 ":rk": rk,
                 ":gov_nullifiers_blob": gov_nullifiers_blob,
                 ":round_id": round_id,
@@ -1195,6 +1561,25 @@ fn store_delegation_data_inner(
                 round_id, bundle_index
             ),
         });
+    }
+
+    // A write that changed the setup ended the delegation generation any
+    // recorded rejection streak was counted against, so the streak no longer
+    // describes anything that can be sent again and must not block the
+    // replacement's first cast. This is the rebuild's cleanup: the discard's
+    // own `DELETE` cannot reach a bundle that still holds retired `votes`
+    // rows, and a rebuild replaces the setup rather than emptying it. An
+    // idempotent resume, which changes no column, deliberately keeps the
+    // streak: it reuses the very generation the chain refused.
+    //
+    // The comparison covers every column this write can touch, which is a
+    // superset of the delegation generation's inputs. It can therefore clear a
+    // streak for a write that changed only a non-input column, and never keeps
+    // one past a generation change. That is the safe direction: the cap is an
+    // advisory bound on recasting, so clearing it early costs one more attempt,
+    // while keeping it late blocks a delegation the chain has never seen.
+    if !write_changes_nothing {
+        clear_combined_rejection_ledger(tx, wallet_id, round_id, bundle_index)?;
     }
 
     Ok(())
@@ -1394,6 +1779,50 @@ pub fn load_pczt_sighash(
     })
 }
 
+/// Load the exact PCZT and the signing fields persisted with it.
+pub(crate) fn load_delegation_pczt_fields(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+    let fields: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT delegation_pczt, pczt_sighash, rk FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!(
+                "failed to load delegation PCZT for round={}, bundle={} ({})",
+                round_id, bundle_index, e
+            ),
+        })?;
+    let Some((pczt, sighash, rk)) = fields else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "no persisted delegation PCZT for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        });
+    };
+    match (pczt, sighash, rk) {
+        (Some(pczt), Some(sighash), Some(rk)) => Ok((pczt, sighash, rk)),
+        _ => Err(VotingError::DelegationPcztUnavailable {
+            round_id: round_id.to_string(),
+            bundle_index,
+        }),
+    }
+}
+
 /// Load the versioned Ironwood TX1 effecting data persisted at PCZT setup.
 pub fn load_tx1_effects(
     conn: &Connection,
@@ -1431,6 +1860,57 @@ pub fn load_van_comm_rand(
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no van_comm_rand for round={}, bundle={} ({})", round_id, bundle_index, e),
+    })
+}
+
+/// Persisted fields that bind a delegation bundle to its hotkey target.
+pub(crate) struct DelegationTargetBindingInputs {
+    pub(crate) van_comm_rand: Vec<u8>,
+    pub(crate) gov_comm: Vec<u8>,
+    pub(crate) total_note_value: u64,
+    /// The spend note's constrained rho. Reconstructs the *spend*, not the
+    /// output; `crate::action` documents the split where both are produced.
+    pub(crate) rho_signed: Vec<u8>,
+    /// The spend's nullifier, which Orchard makes the governance *output*
+    /// note's rho. This is the one that reproduces `cmx_new`.
+    pub(crate) nf_signed: Vec<u8>,
+    pub(crate) rseed_output: Vec<u8>,
+    pub(crate) cmx_new: Vec<u8>,
+}
+
+/// Loads the fields needed to reproduce a bundle's target-bound VAN and output
+/// note commitments.
+pub(crate) fn load_delegation_target_binding_inputs(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<DelegationTargetBindingInputs, VotingError> {
+    conn.query_row(
+        "SELECT van_comm_rand, gov_comm, total_note_value, rho_signed, nf_signed, rseed_output, \
+         cmx_new FROM bundles \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| {
+            Ok(DelegationTargetBindingInputs {
+                van_comm_rand: row.get(0)?,
+                gov_comm: row.get(1)?,
+                total_note_value: row.get::<_, i64>(2)? as u64,
+                rho_signed: row.get(3)?,
+                nf_signed: row.get(4)?,
+                rseed_output: row.get(5)?,
+                cmx_new: row.get(6)?,
+            })
+        },
+    )
+    .map_err(|error| VotingError::InvalidInput {
+        message: format!(
+            "no delegation target binding for round={round_id}, bundle={bundle_index} ({error})"
+        ),
     })
 }
 
@@ -1546,7 +2026,7 @@ pub(crate) struct VoteRowState {
 pub(crate) struct VotePreparationState {
     pub network: Network,
     pub zkp2: Zkp2DelegationData,
-    pub van_position: u32,
+    pub van_position: Option<u32>,
     /// `(skipped, choice)` from `ballot_intent`, if present.
     pub ballot_intent: Option<(bool, Option<u32>)>,
     pub vote: Option<VoteRowState>,
@@ -1585,11 +2065,23 @@ pub fn load_zkp2_inputs(
         message: format!("failed to load ZKP2 inputs for round={}, bundle={} ({})", round_id, bundle_index, e),
     })?;
 
-    // Compute current proposal_authority by clearing bits for votes with a
-    // durable tx hash for THIS bundle specifically.
+    // Clear a bit for every vote of THIS bundle that has reached the chain,
+    // by either of the two facts that can witness it.
+    //
+    // A transaction hash marks a submitted vote, and the VAN is spent as soon
+    // as that transaction lands, so the bit must clear then. But a hash is
+    // route-specific: the schema requires `confirmation_source = 'tree'` to
+    // carry none, so a vote confirmed by an exact-tree scan has none and never
+    // will. Testing the hash alone left such a vote's bit set, the next vote on
+    // the bundle rebuilt its VAN as though that proposal had never voted, and
+    // the chain rejected the stale nullifier as already spent — permanently,
+    // since no later pass could supply a hash that does not exist.
+    //
+    // Either fact is sufficient and neither is redundant: the hash covers a
+    // vote still in flight, the position covers one confirmed without a hash.
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
-        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND tx_hash IS NOT NULL")
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND (tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare proposal_authority query: {}", e),
         })?;
@@ -1625,8 +2117,8 @@ pub fn load_zkp2_inputs(
 ///
 /// # Errors
 ///
-/// - [`VotingError::InvalidInput`] if the round/bundle is missing, or the VAN
-///   leaf position is unset.
+/// - [`VotingError::InvalidInput`] if the round/bundle is missing, the VAN leaf
+///   position is unset, or the position exceeds the legacy `u32` circuit input.
 /// - [`VotingError::Internal`] on SQL failures loading ballot intent or vote state.
 pub(crate) fn load_vote_preparation_state(
     conn: &Connection,
@@ -1637,7 +2129,13 @@ pub(crate) fn load_vote_preparation_state(
 ) -> Result<VotePreparationState, VotingError> {
     let network = load_round_network(conn, round_id, wallet_id)?;
     let zkp2 = load_zkp2_inputs(conn, round_id, wallet_id, bundle_index)?;
-    let van_position = load_van_position(conn, round_id, wallet_id, bundle_index)?;
+    let van_position = load_optional_van_position_u64(conn, round_id, wallet_id, bundle_index)?
+        .map(|position| {
+            u32::try_from(position).map_err(|_| VotingError::InvalidInput {
+                message: "VAN position exceeds circuit range".to_string(),
+            })
+        })
+        .transpose()?;
     let ballot_intent = conn
         .query_row(
             "SELECT skipped, choice FROM ballot_intent
@@ -1699,8 +2197,8 @@ pub(crate) fn load_vote_row_state(
         },
     )
     .optional()
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to load vote state before vote preparation: {e}"),
+    .map_err(|error| VotingError::Storage {
+        message: format!("failed to load vote state before vote preparation: {error}"),
     })
 }
 
@@ -1708,21 +2206,35 @@ pub(crate) fn load_vote_row_state(
 
 /// Store the VAN leaf position after delegation TX is confirmed on chain.
 ///
-/// Cast-vote confirmations should use `confirmation::confirm_vote_submission`
-/// so the vote hash, successor VAN position, and VC position are recorded
-/// atomically.
-pub fn store_van_position(
+/// Test-only writer; production confirmation is recorded atomically by the
+/// `chain_submission` lifecycle.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) fn store_van_position(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
     position: u32,
 ) -> Result<(), VotingError> {
+    store_van_position_u64(conn, round_id, wallet_id, bundle_index, u64::from(position))
+}
+
+/// Stores a lifecycle VAN position after checking the SQLite representation.
+pub(crate) fn store_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    position: u64,
+) -> Result<(), VotingError> {
+    let position = i64::try_from(position).map_err(|_| VotingError::InvalidInput {
+        message: format!("VAN leaf position {position} does not fit in SQLite i64"),
+    })?;
     let rows = conn
         .execute(
             "UPDATE bundles SET van_leaf_position = :position WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
-                ":position": position as i64,
+                ":position": position,
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
@@ -1742,25 +2254,69 @@ pub fn store_van_position(
     Ok(())
 }
 
-/// Load the VAN leaf position for witness generation.
+/// Loads a VAN leaf position that fits the legacy `u32` witness interface.
+///
+/// Returns [`VotingError::InvalidInput`] when the position is missing or lies
+/// outside `u32`; use [`load_van_position_u64`] for lifecycle/recovery state.
 pub fn load_van_position(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
 ) -> Result<u32, VotingError> {
-    conn.query_row(
+    let position = load_van_position_u64(conn, round_id, wallet_id, bundle_index)?;
+    u32::try_from(position).map_err(|_| VotingError::InvalidInput {
+        message: format!(
+            "van_leaf_position {position} for round={round_id}, bundle={bundle_index} does not fit in u32"
+        ),
+    })
+}
+
+/// Loads the complete lifecycle VAN leaf position without narrowing it.
+///
+/// Returns [`VotingError::InvalidInput`] when the position is unset and
+/// [`VotingError::Internal`] when durable storage contains a negative value.
+pub fn load_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<u64, VotingError> {
+    load_optional_van_position_u64(conn, round_id, wallet_id, bundle_index)?.ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: format!(
+                "van_leaf_position not yet set for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        }
+    })
+}
+
+/// Loads an optional lifecycle VAN position without hiding malformed storage.
+pub(crate) fn load_optional_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<u64>, VotingError> {
+    let position = conn.query_row(
         "SELECT van_leaf_position FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get::<_, Option<i64>>(0),
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no van_leaf_position for round={}, bundle={} ({})", round_id, bundle_index, e),
-    })?
-    .map(|v| v as u32)
-    .ok_or_else(|| VotingError::InvalidInput {
-        message: format!("van_leaf_position not yet set for round={}, bundle={}", round_id, bundle_index),
-    })
+    })?;
+    let Some(position) = position else {
+        return Ok(None);
+    };
+    u64::try_from(position)
+        .map(Some)
+        .map_err(|_| VotingError::Internal {
+            message: format!(
+                "stored van_leaf_position for round={round_id}, bundle={bundle_index} must be non-negative, got {position}"
+            ),
+        })
 }
 
 /// One confirmed VAN position that must be retained during vote-tree sync.
@@ -1783,14 +2339,60 @@ pub(crate) fn load_van_tree_entries(
 ) -> Result<Vec<VanTreeEntry>, VotingError> {
     let mut stmt = conn
         .prepare(
+            // A bundle whose vote may already be on chain no longer holds its
+            // delegation VAN at that leaf: casting spends it. `tx_hash` alone
+            // is too weak a signal for that — a vote whose POST was dispatched
+            // but never classified has none, yet may have spent the VAN. The
+            // reservation is the authoritative fact: a committed
+            // `chain_submissions` row means a POST was released, which the
+            // submission lifecycle treats as possibly dispatched.
+            //
+            // Reading only `tx_hash` deadlocked recovery. The stale expectation
+            // failed tree sync, tree sync failing aborted the cast that would
+            // have classified the vote, and so `tx_hash` stayed null and the
+            // next pass failed identically.
+            //
+            // A terminally `rejected` row is the one exception, and it is
+            // excluded for the same reason the rest are counted: what retires
+            // the expectation is a POST that may have spent the VAN, and a
+            // definite rejection spent nothing. `Rejected` is safe to read
+            // that way because it is terminal — no observation transitions out
+            // of it, and `reserve_recovery_retry` accepts only `Recovering` —
+            // so the row can never acquire an outstanding POST after the fact.
+            // Its own row is never deleted, so without this it would retire
+            // the expectation for the rest of the round and silently skip both
+            // the leaf-content and the leaf-presence check.
+            //
+            // A `recovering` row carrying `chain_rejected` is deliberately NOT
+            // excluded, even though its last classified outcome also spent
+            // nothing. Exact-tree recovery reaches any `Recovering` row
+            // regardless of diagnostic, and on a no-match it reserves a retry
+            // and releases a POST while leaving both `state` and
+            // `diagnostic_kind` untouched. Between that reservation and the
+            // response being classified, the row is indistinguishable from a
+            // quiescent rejection, so excluding it would restore a delegation
+            // VAN the retry may already have spent — failing tree sync against
+            // the successor leaf, which aborts the cast that would classify
+            // the retry, which is the self-sustaining deadlock this predicate
+            // exists to break. Distinguishing the two needs the retry dispatch
+            // journaled against the reservation counter, which the row does
+            // not record today.
             "SELECT b.bundle_index, b.van_leaf_position, b.gov_comm,
-                    EXISTS (
+                    (EXISTS (
                         SELECT 1 FROM votes v
                         WHERE v.round_id = b.round_id
                           AND v.wallet_id = b.wallet_id
                           AND v.bundle_index = b.bundle_index
                           AND v.tx_hash IS NOT NULL
                     )
+                    OR EXISTS (
+                        SELECT 1 FROM chain_submissions cs
+                        WHERE cs.round_id = b.round_id
+                          AND cs.wallet_id = b.wallet_id
+                          AND cs.bundle_index = b.bundle_index
+                          AND cs.kind IN ('vote', 'vote_batch', 'delegate_and_cast_vote_batch')
+                          AND cs.state != 'rejected'
+                    ))
              FROM bundles b
              WHERE b.round_id = :round_id
                AND b.wallet_id = :wallet_id
@@ -2571,6 +3173,14 @@ pub fn store_proof(
 
 // --- Votes ---
 
+/// Stores or replaces one unsubmitted vote and clears helper shares that belong
+/// to the replaced vote.
+///
+/// At the top level this reserves SQLite's WAL writer before reading the
+/// existing row, allowing the configured busy handler to wait out a competing
+/// writer. When called inside an existing transaction, the caller must have
+/// reserved the writer before any validation reads; the nested savepoint only
+/// preserves atomicity and cannot upgrade the caller's transaction behavior.
 pub fn store_vote(
     conn: &Connection,
     round_id: &str,
@@ -2580,86 +3190,39 @@ pub fn store_vote(
     choice: u32,
     commitment: &[u8],
 ) -> Result<(), VotingError> {
-    let now = crate::clock::system_time_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    if conn.is_autocommit() {
+        let tx =
+            Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+                VotingError::from_sqlite("failed to start store vote transaction", &error)
+            })?;
+        validate_and_store_vote(
+            &tx,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+            choice,
+            commitment,
+        )?;
+        return tx.commit().map_err(|error| {
+            VotingError::from_sqlite("failed to commit store vote transaction", &error)
+        });
+    }
 
     conn.execute_batch("SAVEPOINT store_vote_replace")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to start store vote savepoint: {}", e),
         })?;
 
-    let result: Result<(), VotingError> = (|| {
-        let existing_vote: Option<(i64, Option<Vec<u8>>, bool)> = conn
-            .query_row(
-                "SELECT choice, commitment, tx_hash IS NOT NULL FROM votes
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND bundle_index = :bundle_index
-                   AND proposal_id = :proposal_id",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":bundle_index": bundle_index as i64,
-                    ":proposal_id": proposal_id as i64,
-                },
-                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
-            )
-            .optional()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to load existing vote before store: {}", e),
-            })?;
-        let vote_changed = existing_vote
-            .as_ref()
-            .map(|(stored_choice, stored_commitment, _)| {
-                *stored_choice != choice as i64 || stored_commitment.as_deref() != Some(commitment)
-            })
-            .unwrap_or(false);
-        if let Some((_, _, true)) = existing_vote.as_ref() {
-            if vote_changed {
-                return Err(VotingError::InvalidInput {
-                    message: format!(
-                        "cannot replace submitted vote for round={}, wallet={}, bundle={}, proposal={}",
-                        round_id, wallet_id, bundle_index, proposal_id
-                    ),
-                });
-            }
-            return Ok(());
-        }
-        if existing_vote.is_some() && !vote_changed {
-            return Ok(());
-        }
-
-        conn.execute(
-            "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, created_at)
-             VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, :created_at)",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index as i64,
-                ":proposal_id": proposal_id as i64,
-                ":choice": choice as i64,
-                ":commitment": commitment,
-                ":created_at": now,
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to store vote: {}", e),
-        })?;
-
-        if vote_changed {
-            share_delegations::delete_for_replaced_vote(
-                conn,
-                round_id,
-                wallet_id,
-                bundle_index,
-                proposal_id,
-            )?;
-        }
-
-        Ok(())
-    })();
+    let result = validate_and_store_vote(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        choice,
+        commitment,
+    );
 
     match result {
         Ok(()) => conn
@@ -2676,6 +3239,106 @@ pub fn store_vote(
     }
 }
 
+/// Applies the vote-row transition inside a transaction boundary established
+/// by [`store_vote`] or its caller.
+fn validate_and_store_vote(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    choice: u32,
+    commitment: &[u8],
+) -> Result<(), VotingError> {
+    let now = crate::clock::system_time_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Either witness of the vote having reached the chain forbids a
+    // replacement. A hash exists only for hash-confirmed submissions — the
+    // schema requires `confirmation_source = 'tree'` to carry none — so
+    // asking for it alone let a vote confirmed by an exact-tree scan have
+    // its choice and commitment silently overwritten, describing a vote
+    // whose proposal authority had already moved.
+    let existing_vote: Option<(i64, Option<Vec<u8>>, bool)> = conn
+        .query_row(
+            "SELECT choice, commitment,
+                    tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL
+             FROM votes
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load existing vote before store: {}", e),
+        })?;
+    let vote_changed = existing_vote
+        .as_ref()
+        .map(|(stored_choice, stored_commitment, _)| {
+            *stored_choice != choice as i64 || stored_commitment.as_deref() != Some(commitment)
+        })
+        .unwrap_or(false);
+    if let Some((_, _, true)) = existing_vote.as_ref() {
+        if vote_changed {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "cannot replace submitted vote for round={}, wallet={}, bundle={}, proposal={}",
+                    round_id, wallet_id, bundle_index, proposal_id
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if existing_vote.is_some() && !vote_changed {
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, created_at)
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, :created_at)",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+            ":choice": choice as i64,
+            ":commitment": commitment,
+            ":created_at": now,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store vote: {}", e),
+    })?;
+
+    if vote_changed {
+        share_delegations::delete_for_replaced_vote(
+            conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Refuses a ballot intent that disagrees with a vote already on chain.
+///
+/// A vote counts as on chain by either witness. The transaction hash exists
+/// only for hash-confirmed submissions, so reading it alone missed every vote
+/// confirmed by an exact-tree scan and accepted an intent that could no longer
+/// be honoured — the proposal's authority had already moved.
 pub fn ensure_no_submitted_vote_conflict_for_intent(
     conn: &Connection,
     round_id: &str,
@@ -2691,7 +3354,7 @@ pub fn ensure_no_submitted_vote_conflict_for_intent(
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND proposal_id = :proposal_id
-               AND tx_hash IS NOT NULL
+               AND (tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)
                AND (:skipped != 0 OR choice != :choice)
              ORDER BY bundle_index
              LIMIT 1",
@@ -2780,6 +3443,27 @@ pub fn delete_bundles_from(
         });
     }
 
+    // Every fact that says a delegation may already be on chain, not just a
+    // chain-submission row. A round delegated before the submission lifecycle
+    // existed carries only a transaction hash or a VAN position, and pruning it
+    // would destroy the `van_comm_rand` its spent governance nullifiers make
+    // irreplaceable.
+    //
+    // The refusal is `DelegationAlreadyBroadcast`, not `Busy`: every fact it
+    // reads is durable, so nothing a caller waits for will clear it, and a
+    // host retry loop driven by `retryable()` would spin forever on a
+    // condition that is permanent by construction.
+    if let Some((index, evidence)) =
+        first_broadcast_evidence_from(&tx, round_id, wallet_id, from_index)?
+    {
+        return Err(already_broadcast(
+            round_id,
+            index,
+            evidence,
+            "prune bundles",
+        ));
+    }
+
     let rows = tx
         .execute(
             "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index >= :from_index",
@@ -2805,15 +3489,14 @@ pub fn delete_bundles_from(
             message: format!("failed to clear bundle policy after deleting all bundles: {e}"),
         })?;
     }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit bundle deletion: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit bundle deletion", &e))?;
     Ok(rows as u64)
 }
 
 // --- Recovery state: TX hashes ---
 
-pub fn store_delegation_tx_hash(
+pub(crate) fn store_delegation_tx_hash(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -2908,7 +3591,7 @@ pub fn get_delegation_tx_hash(
     })
 }
 
-pub fn record_vote_submission(
+pub(crate) fn record_vote_submission(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -3038,6 +3721,218 @@ pub fn get_vote_tx_hash(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to get vote tx hash: {}", e),
     })
+}
+
+/// One vote row as round planning reads it: the stored choice, the
+/// version-17 projection columns, and the raw recovery JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VoteRecoveryRow {
+    pub(crate) bundle_index: u32,
+    pub(crate) proposal_id: u32,
+    pub(crate) choice: u32,
+    pub(crate) tx_hash: Option<String>,
+    pub(crate) vc_tree_position: Option<i64>,
+    pub(crate) commitment_bundle_json: Option<String>,
+}
+
+/// Every vote row of one wallet's round, ordered by bundle then proposal.
+pub(crate) fn vote_recovery_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<VoteRecoveryRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, proposal_id, choice, tx_hash, vc_tree_position,
+                    commitment_bundle_json
+             FROM votes
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index, proposal_id",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare vote recovery rows", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok(VoteRecoveryRow {
+                    bundle_index: row.get::<_, i64>(0)? as u32,
+                    proposal_id: row.get::<_, i64>(1)? as u32,
+                    choice: row.get::<_, i64>(2)? as u32,
+                    tx_hash: row.get(3)?,
+                    vc_tree_position: row.get(4)?,
+                    commitment_bundle_json: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query vote recovery rows", &e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read vote recovery row", &e))
+}
+
+/// One bundle row as round planning reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BundlePlanningRow {
+    pub(crate) bundle_index: u32,
+    /// The bundle came from a delegation capability import: it omits local
+    /// note selection, which locally prepared bundles always persist.
+    pub(crate) capability_imported: bool,
+    /// The version-17 projection of the delegation transaction hash.
+    pub(crate) delegation_tx_hash: Option<String>,
+}
+
+/// Every bundle row of one wallet's round, ordered by bundle index.
+pub(crate) fn bundle_planning_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<BundlePlanningRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, note_positions_blob IS NULL, delegation_tx_hash
+             FROM bundles
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare bundle planning rows", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok(BundlePlanningRow {
+                    bundle_index: row.get::<_, i64>(0)? as u32,
+                    capability_imported: row.get::<_, i64>(1)? != 0,
+                    delegation_tx_hash: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query bundle planning rows", &e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read bundle planning row", &e))
+}
+
+/// One bundle's combined-cast rejection streak.
+pub(crate) struct CombinedRejectionLedgerRow {
+    pub(crate) bundle_index: u32,
+    /// The delegation generation the streak was counted against. A bundle whose
+    /// current generation differs has been rebuilt and is not blocked.
+    pub(crate) delegation_generation_digest: [u8; 32],
+    pub(crate) consecutive_rejections: u32,
+    /// The chain's own last rejection, kept because retirement deletes the
+    /// lifecycle row that would otherwise carry it.
+    pub(crate) diagnostic: crate::ChainSubmissionDiagnostic,
+}
+
+/// Reads every bundle's combined-cast rejection streak for one round.
+pub(crate) fn combined_rejection_ledger_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<CombinedRejectionLedgerRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, delegation_generation_digest, consecutive_rejections,
+                    last_diagnostic_kind, last_diagnostic
+             FROM combined_cast_rejections
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare combined rejection ledger", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query combined rejection ledger", &e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read combined rejection ledger row", &e))?;
+    rows.into_iter()
+        .map(|(bundle_index, digest, streak, kind, message)| {
+            let delegation_generation_digest: [u8; 32] =
+                digest.try_into().map_err(|_| VotingError::Internal {
+                    message: "combined rejection ledger stores a malformed generation digest"
+                        .to_string(),
+                })?;
+            let diagnostic =
+                crate::phases::stored_submission_diagnostic(Some(kind), Some(message))?
+                    .ok_or_else(|| VotingError::Internal {
+                        message: "combined rejection ledger stores no diagnostic".to_string(),
+                    })?;
+            Ok(CombinedRejectionLedgerRow {
+                bundle_index,
+                delegation_generation_digest,
+                consecutive_rejections: u32::try_from(streak).unwrap_or(u32::MAX),
+                diagnostic,
+            })
+        })
+        .collect()
+}
+
+/// Forgets a bundle's combined-cast rejection streak, returning whether one
+/// was recorded. Callers use this when the streak's premise no longer holds:
+/// the batch confirmed, or the delegation setup it counted against changed.
+pub(crate) fn clear_combined_rejection_ledger(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    let removed = conn
+        .execute(
+            "DELETE FROM combined_cast_rejections
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("clear combined rejection ledger", &e))?;
+    Ok(removed > 0)
+}
+
+/// Clears the rejection streak of every bundle that holds a vote for
+/// `proposal_id`, and reports how many rows went.
+///
+/// A changed ballot means the next combined batch differs from the one the
+/// chain refused, so a streak counted against the old batch no longer describes
+/// anything that will be sent. The streak is keyed on the delegation
+/// generation, which a ballot edit does not change, so without this the block
+/// would outlive its own cause whenever the rejection came from a vote member
+/// rather than the delegation.
+///
+/// Scoped through `votes` rather than through live recovery: retiring a
+/// terminally rejected batch clears `commitment_bundle_json` but keeps the vote
+/// rows, and those retired bundles are exactly the ones carrying a streak.
+pub(crate) fn clear_combined_rejection_ledger_for_proposal(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<usize, VotingError> {
+    conn.execute(
+        "DELETE FROM combined_cast_rejections
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index IN (
+                SELECT bundle_index FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id
+            )",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::from_sqlite("clear combined rejection ledger for proposal", &e))
 }
 
 pub fn get_commitment_bundle(
@@ -3204,6 +4099,7 @@ pub fn clear_unsigned_delegation_setup_fields(
              rk = NULL,
              gov_nullifiers_blob = NULL,
              padded_note_secrets = NULL,
+             delegation_pczt = NULL,
              pczt_sighash = NULL,
              tx1_effects = NULL
          WHERE round_id = :round_id
@@ -3222,6 +4118,13 @@ pub fn clear_unsigned_delegation_setup_fields(
                SELECT bundle_index
                FROM keystone_signatures
                WHERE round_id = :round_id AND wallet_id = :wallet_id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submissions submission
+                WHERE submission.round_id = bundles.round_id
+                  AND submission.wallet_id = bundles.wallet_id
+                  AND submission.bundle_index = bundles.bundle_index
            )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
@@ -3231,51 +4134,408 @@ pub fn clear_unsigned_delegation_setup_fields(
     Ok(())
 }
 
-// --- Recovery state cleanup ---
-
-/// Clears retryable recovery state without erasing recorded confirmations or
-/// imported delegation capabilities.
-pub fn clear_recovery_state(
+/// Whether a bundle already holds the delegation setup that binds it to a
+/// hotkey target.
+pub fn bundle_has_delegation_setup(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
-) -> Result<(), VotingError> {
-    conn.execute(
-        "DELETE FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bundles
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index = :bundle_index
+            AND gov_comm IS NOT NULL AND cmx_new IS NOT NULL
+            AND rho_signed IS NOT NULL AND rseed_output IS NOT NULL)",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| row.get(0),
     )
     .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear share delegations: {}", e),
+        message: format!("failed to check delegation setup: {e}"),
+    })
+}
+
+/// Evidence that a bundle's delegation may already exist outside this wallet.
+///
+/// Each variant is a fact that only becomes true once the delegation has been
+/// handed to the network, or once work has been built on top of one that was.
+/// The delegation's governance nullifiers are deterministic and spent on chain,
+/// so once any of these holds, the bundle's setup — `van_comm_rand` above all,
+/// and the hotkey target it commits to — is the only thing that can ever
+/// reproduce that round's voting weight. It must never be cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationBroadcastEvidence {
+    /// A delegation transaction hash is recorded for the bundle.
+    DelegationTxHash,
+    /// The bundle holds a VAN leaf position, which only the chain assigns.
+    VanLeafPosition,
+    /// A chain submission row exists. The lifecycle owns dispatch from
+    /// `submitting` onward, so a row means a dispatch may already have gone out
+    /// even when no hash came back.
+    ChainSubmission,
+    /// A vote was built against this bundle's delegation.
+    Vote,
+    /// A helper share was delivered for this bundle.
+    ShareDelegation,
+}
+
+impl DelegationBroadcastEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegationTxHash => "a delegation transaction hash",
+            Self::VanLeafPosition => "a VAN leaf position",
+            Self::ChainSubmission => "a chain submission",
+            Self::Vote => "a vote",
+            Self::ShareDelegation => "a delivered helper share",
+        }
+    }
+}
+
+/// Names of the tables this database actually has, so a guard can tell a table
+/// that is empty from one that does not exist yet.
+fn present_tables(conn: &Connection) -> Result<Vec<String>, VotingError> {
+    let mut statement = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to prepare table listing: {error}"),
+        })?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to list tables: {error}"),
+        })?;
+    Ok(names)
+}
+
+/// The one wording every path uses to refuse a destructive or replacing call
+/// on a round that has already reached the network.
+pub(crate) fn already_broadcast(
+    round_id: &str,
+    bundle_index: u32,
+    evidence: DelegationBroadcastEvidence,
+    action: &str,
+) -> VotingError {
+    VotingError::DelegationAlreadyBroadcast {
+        bundle_index,
+        evidence: format!(
+            "{} for round {round_id}, refusing to {action}",
+            evidence.as_str()
+        ),
+    }
+}
+
+/// Which bundles of a round a broadcast-evidence check covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleScope {
+    /// Every bundle of the round.
+    Round,
+    /// One bundle.
+    One(u32),
+    /// Every bundle from this index upward, the shape a suffix prune deletes.
+    From(u32),
+}
+
+impl BundleScope {
+    fn filter(self) -> &'static str {
+        match self {
+            Self::Round => "",
+            Self::One(_) => "AND bundle_index = :bundle_index",
+            Self::From(_) => "AND bundle_index >= :bundle_index",
+        }
+    }
+
+    fn bound_index(self) -> Option<u32> {
+        match self {
+            Self::Round => None,
+            Self::One(index) | Self::From(index) => Some(index),
+        }
+    }
+}
+
+/// The first broadcast evidence found for a round, or one bundle of it.
+///
+/// Ordered checks, cheapest and most direct first; the caller only needs to
+/// know that the boundary was crossed and what to say about it.
+pub fn delegation_broadcast_evidence(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    let scope = match bundle_index {
+        Some(index) => BundleScope::One(index),
+        None => BundleScope::Round,
+    };
+    first_broadcast_evidence(conn, round_id, wallet_id, scope)
+}
+
+/// The first broadcast evidence found at or above `from_index`, which is the
+/// scope a suffix prune is about to delete.
+pub(crate) fn first_broadcast_evidence_from(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    from_index: u32,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    first_broadcast_evidence(conn, round_id, wallet_id, BundleScope::From(from_index))
+}
+
+fn first_broadcast_evidence(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    scope: BundleScope,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    let bundle_filter = scope.filter();
+    let checks: [(&str, &str, DelegationBroadcastEvidence); 5] = [
+        (
+            "bundles",
+            "SELECT bundle_index FROM bundles
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND delegation_tx_hash IS NOT NULL",
+            DelegationBroadcastEvidence::DelegationTxHash,
+        ),
+        (
+            "bundles",
+            "SELECT bundle_index FROM bundles
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND van_leaf_position IS NOT NULL",
+            DelegationBroadcastEvidence::VanLeafPosition,
+        ),
+        (
+            "chain_submissions",
+            "SELECT bundle_index FROM chain_submissions
+              WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            DelegationBroadcastEvidence::ChainSubmission,
+        ),
+        (
+            "votes",
+            "SELECT bundle_index FROM votes
+              WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            DelegationBroadcastEvidence::Vote,
+        ),
+        (
+            "share_delegations",
+            "SELECT bundle_index FROM share_delegations
+              WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            DelegationBroadcastEvidence::ShareDelegation,
+        ),
+    ];
+
+    // Setup writes run on sidecars that predate some of these tables, so the
+    // guard has to answer for them too. A table this build expects but that
+    // the database has not gained yet holds no evidence of anything, and
+    // saying so is the truthful answer rather than a read error.
+    let present = present_tables(conn)?;
+
+    for (table, sql, evidence) in checks {
+        if !present.iter().any(|name| name == table) {
+            continue;
+        }
+        let sql = format!("{sql} {bundle_filter} LIMIT 1");
+        let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare broadcast evidence query: {e}"),
+        })?;
+        let found: Option<i64> = match scope.bound_index() {
+            Some(index) => statement
+                .query_row(
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":bundle_index": index,
+                    },
+                    |row| row.get(0),
+                )
+                .optional(),
+            None => statement
+                .query_row(
+                    named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                    |row| row.get(0),
+                )
+                .optional(),
+        }
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read broadcast evidence: {e}"),
+        })?;
+        if let Some(index) = found {
+            return Ok(Some((index as u32, evidence)));
+        }
+    }
+    Ok(None)
+}
+
+/// Clears the local delegation setup of bundles that were never broadcast, so
+/// setup can rebuild them.
+///
+/// This is the recovery path for a bundle whose setup can no longer be used —
+/// the wallet's voting hotkey no longer reproduces the stored target, say — and
+/// it is deliberately allowed to discard a successful proof, which
+/// [`clear_unsigned_delegation_setup_fields`] preserves. A proof over a target
+/// the wallet cannot sign for is not work worth keeping, and re-proving costs
+/// only time.
+///
+/// Every broadcast guard is repeated in the statement itself, not just checked
+/// beforehand, so a submission that starts between the check and the write
+/// cannot lose its setup. Returns the number of bundles cleared.
+pub(crate) fn discard_unbroadcast_delegation_setup(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<u32, VotingError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite(
+            "failed to begin delegation setup discard transaction",
+            &error,
+        )
     })?;
-    conn.execute(
-        "DELETE FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear keystone signatures: {}", e),
+    let cleared =
+        discard_unbroadcast_delegation_setup_within(&tx, round_id, wallet_id, bundle_index)?;
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite(
+            "failed to commit delegation setup discard transaction",
+            &error,
+        )
     })?;
-    conn.execute(
-        "UPDATE bundles SET delegation_tx_hash = NULL
-         WHERE round_id = :round_id
+    Ok(cleared)
+}
+
+/// The discard's statements, for a caller that owns the transaction.
+///
+/// Separate from the entry point above because a rebuild must not commit the
+/// discard on its own: the replacement has to land in the same transaction, or
+/// a failure between them leaves the bundle with neither.
+fn discard_unbroadcast_delegation_setup_within(
+    tx: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<u32, VotingError> {
+    // The outer filter runs against four different tables, so it stays
+    // unqualified; the subquery below is the one that reads `bundles`.
+    let bundle_filter = match bundle_index {
+        Some(_) => "AND bundle_index = :bundle_index",
+        None => "",
+    };
+    let scoped_bundle_filter = match bundle_index {
+        Some(_) => "AND bundles.bundle_index = :bundle_index",
+        None => "",
+    };
+    // The guard is one expression, reused by every statement below, so no
+    // deletion can be written with a weaker condition than the others.
+    let unbroadcast_guard = format!(
+        "round_id = :round_id
            AND wallet_id = :wallet_id
-           AND note_positions_blob IS NOT NULL
-           AND van_leaf_position IS NULL",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear delegation tx hashes: {}", e),
-    })?;
-    conn.execute(
-        "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
-         WHERE round_id = :round_id
-           AND wallet_id = :wallet_id
-           AND vc_tree_position IS NULL",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear vote recovery columns: {}", e),
-    })?;
-    Ok(())
+           {bundle_filter}
+           AND bundle_index IN (
+               SELECT bundles.bundle_index FROM bundles
+                WHERE bundles.round_id = :round_id
+                  AND bundles.wallet_id = :wallet_id
+                  AND bundles.delegation_tx_hash IS NULL
+                  AND bundles.van_leaf_position IS NULL
+                  {scoped_bundle_filter}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chain_submissions submission
+                       WHERE submission.round_id = bundles.round_id
+                         AND submission.wallet_id = bundles.wallet_id
+                         AND submission.bundle_index = bundles.bundle_index
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM votes vote
+                       WHERE vote.round_id = bundles.round_id
+                         AND vote.wallet_id = bundles.wallet_id
+                         AND vote.bundle_index = bundles.bundle_index
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM share_delegations share
+                       WHERE share.round_id = bundles.round_id
+                         AND share.wallet_id = bundles.wallet_id
+                         AND share.bundle_index = bundles.bundle_index
+                  )
+           )"
+    );
+
+    let params = |statement: &mut rusqlite::Statement<'_>| -> Result<usize, rusqlite::Error> {
+        match bundle_index {
+            Some(index) => statement.execute(named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": index,
+            }),
+            None => {
+                statement.execute(named_params! { ":round_id": round_id, ":wallet_id": wallet_id })
+            }
+        }
+    };
+
+    let mut cleared = 0usize;
+    for (label, sql) in [
+        (
+            "clear delegation setup",
+            format!(
+                "UPDATE bundles
+                    SET van_comm_rand = NULL,
+                        dummy_nullifiers = NULL,
+                        rho_signed = NULL,
+                        padded_note_data = NULL,
+                        nf_signed = NULL,
+                        cmx_new = NULL,
+                        alpha = NULL,
+                        rseed_signed = NULL,
+                        rseed_output = NULL,
+                        gov_comm = NULL,
+                        total_note_value = NULL,
+                        address_index = NULL,
+                        rk = NULL,
+                        gov_nullifiers_blob = NULL,
+                        padded_note_secrets = NULL,
+                        pczt_sighash = NULL,
+                        delegation_pczt = NULL,
+                        tx1_effects = NULL
+                  WHERE {unbroadcast_guard}"
+            ),
+        ),
+        (
+            "discard delegation proofs",
+            format!("DELETE FROM proofs WHERE {unbroadcast_guard}"),
+        ),
+        (
+            "discard delegation keystone signatures",
+            format!("DELETE FROM keystone_signatures WHERE {unbroadcast_guard}"),
+        ),
+        (
+            "discard delegation witnesses",
+            format!("DELETE FROM witnesses WHERE {unbroadcast_guard}"),
+        ),
+        // The streak counts rejections of one delegation generation. Discarding
+        // the setup ends that generation, so the count no longer describes
+        // anything and must not block a rebuilt delegation's first cast. A
+        // rebuild, which replaces the setup rather than clearing it, clears the
+        // streak from `store_delegation_setup_within` instead: this statement
+        // only covers a discard that actually emptied the bundle.
+        (
+            "discard combined cast rejections",
+            format!("DELETE FROM combined_cast_rejections WHERE {unbroadcast_guard}"),
+        ),
+    ] {
+        let mut statement = tx.prepare(&sql).map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare {label}: {e}"),
+        })?;
+        let affected = params(&mut statement).map_err(|e| VotingError::Internal {
+            message: format!("failed to {label}: {e}"),
+        })?;
+        if label == "clear delegation setup" {
+            cleared = affected;
+        }
+    }
+
+    Ok(cleared as u32)
 }
 
 fn ensure_vote_submission_matches_ballot_intent(

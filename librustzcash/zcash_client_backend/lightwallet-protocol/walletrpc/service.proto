@@ -92,7 +92,7 @@ message SendResponse {
 // Chainspec is a placeholder to allow specification of a particular chain fork.
 message ChainSpec {}
 
-// Empty is for gRPCs that take no arguments, currently only GetLightdInfo.
+// Empty is for gRPCs that take no arguments, such as GetLightdInfo and GetStandardFee.
 message Empty {}
 
 // LightdInfo returns various information about this lightwalletd instance
@@ -143,6 +143,12 @@ message Duration {
 message PingResponse {
     int64 entry = 1;
     int64 exit = 2;
+}
+
+// ZIP 317 marginal fee recommended by the backend for the next block.
+message StandardFee {
+    uint64 feeZat = 1;           // zatoshis per logical action
+    uint32 estimatorVersion = 2; // 0 = static ZIP 317 marginal fee
 }
 
 message Address {
@@ -325,6 +331,9 @@ service CompactTxStreamer {
 
     // Return information about this lightwalletd instance and the blockchain
     rpc GetLightdInfo(Empty) returns (LightdInfo) {}
+
+    // Requires a backend implementing getstandardfee; otherwise returns Unimplemented.
+    rpc GetStandardFee(Empty) returns (StandardFee) {}
 
     // Testing-only, requires lightwalletd --ping-very-insecure (do not enable in production)
     rpc Ping(Duration) returns (PingResponse) {}

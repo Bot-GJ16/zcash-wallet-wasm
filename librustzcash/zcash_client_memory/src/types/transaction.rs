@@ -58,6 +58,9 @@ impl TransactionEntry {
     pub(crate) fn expiry_height(&self) -> Option<BlockHeight> {
         self.expiry_height
     }
+    pub(crate) fn created_locally(&self) -> bool {
+        self._target_height.is_some()
+    }
     pub(crate) fn status(&self) -> TransactionStatus {
         self.tx_status
     }

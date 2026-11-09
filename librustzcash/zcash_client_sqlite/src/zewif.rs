@@ -66,7 +66,7 @@ use bip0039::{
     ChineseSimplified, ChineseTraditional, Czech, English, French, Italian, Japanese, Korean,
     Mnemonic, Portuguese, Spanish,
 };
-use rand::RngCore;
+use rand::Rng;
 use secrecy::{ExposeSecret, SecretVec};
 use zcash_client_backend::{
     data_api::{
@@ -82,9 +82,7 @@ use zcash_keys::{
 use zcash_primitives::{block::BlockHash, transaction::Transaction};
 use zcash_protocol::{
     PoolType, ShieldedPool,
-    consensus::{
-        self, BlockHeight, BranchId, NetworkConstants as _, NetworkType, NetworkUpgrade, Parameters,
-    },
+    consensus::{self, BlockHeight, BranchId, NetworkType, NetworkUpgrade, Parameters},
 };
 use zip32::fingerprint::SeedFingerprint;
 
@@ -888,7 +886,7 @@ where
     C: std::borrow::BorrowMut<rusqlite::Connection>,
     P: consensus::Parameters,
     CL: Clock,
-    R: RngCore,
+    R: Rng,
     S: SecretSink,
 {
     let params = wdb.params().clone();
@@ -1043,15 +1041,14 @@ struct TransparentAddressRecords {
 /// uncompressed and the compressed (`0x01`-suffixed) payload forms.
 fn decode_wif(expected_prefix: u8, wif: &str) -> Option<secp256k1::SecretKey> {
     let payload = bs58::decode(wif).with_check(None).into_vec().ok()?;
-    match payload.as_slice() {
-        [prefix, key_data @ ..] if *prefix == expected_prefix && key_data.len() == 32 => {
-            secp256k1::SecretKey::from_slice(key_data).ok()
-        }
+    let key_data = match payload.as_slice() {
+        [prefix, key_data @ ..] if *prefix == expected_prefix && key_data.len() == 32 => key_data,
         [prefix, key_data @ .., 0x01] if *prefix == expected_prefix && key_data.len() == 32 => {
-            secp256k1::SecretKey::from_slice(key_data).ok()
+            key_data
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    secp256k1::SecretKey::from_secret_bytes(key_data.try_into().ok()?).ok()
 }
 
 /// Registers the secret store's standalone transparent spending keys with the
@@ -1073,7 +1070,6 @@ where
         NetworkType::Main => 0x80,
         NetworkType::Test | NetworkType::Regtest => 0xEF,
     };
-    let secp = secp256k1::Secp256k1::new();
 
     for entry in store.map_or(&[][..], |s| s.transparent_keys()) {
         if !entry.pubkey().is_compressed() {
@@ -1094,7 +1090,7 @@ where
                     address: address.clone(),
                 }
             })?;
-        if secret_key.public_key(&secp) != pubkey {
+        if secret_key.public_key() != pubkey {
             return Err(ZewifImportError::TransparentKeyMismatch { address });
         }
 
@@ -1491,10 +1487,10 @@ where
         match account.viewing_key() {
             ::zewif::AccountViewingKey::Ufvk(ufvk) => {
                 let decoded =
-                    UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|message| {
+                    UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|e| {
                         ZewifImportError::UfvkDecoding {
                             account_name: account.name().to_owned(),
-                            message,
+                            message: e.to_string(),
                         }
                     })?;
                 let purpose = account_purpose(
@@ -1509,9 +1505,9 @@ where
             }
             ::zewif::AccountViewingKey::SaplingExtFvk(efvk) => {
                 let decoded = zcash_keys::encoding::decode_extended_full_viewing_key(
-                    params
-                        .network_type()
-                        .hrp_sapling_extended_full_viewing_key(),
+                    zcash_keys::constants::hrp_sapling_extended_full_viewing_key(
+                        params.network_type(),
+                    ),
                     efvk.encoding(),
                 )
                 .map_err(|_| ZewifImportError::SaplingFvkDecoding {
@@ -1620,7 +1616,7 @@ fn ufvk_components_consistent(
     derived: &UnifiedFullViewingKey,
     recorded: &UnifiedFullViewingKey,
 ) -> bool {
-    let transparent_ok = match (derived.transparent(), recorded.transparent()) {
+    let transparent_ok = match (derived.p2pkh(), recorded.p2pkh()) {
         (Some(a), Some(b)) => a.serialize() == b.serialize(),
         _ => true,
     };
@@ -1645,10 +1641,10 @@ fn verify_hd_derivation<P: Parameters, S>(
     seed: &SecretVec<u8>,
     account_index: zip32::AccountId,
 ) -> Result<(), ZewifImportError<S>> {
-    let recorded = UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|message| {
+    let recorded = UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|e| {
         ZewifImportError::UfvkDecoding {
             account_name: account_name.to_owned(),
-            message,
+            message: e.to_string(),
         }
     })?;
     let derived = UnifiedSpendingKey::from_seed(params, seed.expose_secret(), account_index)
@@ -1778,7 +1774,6 @@ mod tests {
             nu6_1: one,
             nu6_2: one,
             nu6_3: one,
-            #[cfg(zcash_unstable = "nu7")]
             nu7: one,
             #[cfg(zcash_unstable = "nutachyon")]
             nu_tachyon: None,
@@ -1973,7 +1968,7 @@ mod tests {
         let ts = test_seed(0);
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("viewing");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2028,7 +2023,7 @@ mod tests {
         store.add_seed(seed_entry(&ts));
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("derived");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2073,9 +2068,10 @@ mod tests {
         }
         // The account's UFVK is re-derived from the seed and matches the
         // document's record of it.
-        assert_eq!(
-            imported.ufvk().map(|k| k.encode(&TEST_NETWORK)),
-            Some(ts.ufvk.encode(&TEST_NETWORK)),
+        assert!(
+            imported
+                .ufvk()
+                .is_some_and(|k| k.is_equivalent_to(&ts.ufvk))
         );
     }
 
@@ -2105,11 +2101,10 @@ mod tests {
         let (_file, mut wdb) = test_wallet_db();
         let ts = test_seed(0);
 
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let pubkey = secret_key.public_key(&secp);
+        let secret_key = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        let pubkey = secret_key.public_key();
         let mut wif_payload = vec![0xEF];
-        wif_payload.extend_from_slice(&secret_key.secret_bytes());
+        wif_payload.extend_from_slice(&secret_key.to_secret_bytes());
         wif_payload.push(0x01);
         let wif = bs58::encode(wif_payload).with_check().into_string();
 
@@ -2155,12 +2150,11 @@ mod tests {
         let (_file, mut wdb) = test_wallet_db();
         let ts = test_seed(0);
 
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let pubkey = secret_key.public_key(&secp);
+        let secret_key = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        let pubkey = secret_key.public_key();
         let address = TransparentAddress::from_pubkey(&pubkey).encode(&TEST_NETWORK);
         let mut wif_payload = vec![0xEF];
-        wif_payload.extend_from_slice(&secret_key.secret_bytes());
+        wif_payload.extend_from_slice(&secret_key.to_secret_bytes());
         wif_payload.push(0x01);
         let wif = bs58::encode(wif_payload).with_check().into_string();
 
@@ -2216,12 +2210,11 @@ mod tests {
         let (_file, mut wdb) = test_wallet_db();
         let ts = test_seed(0);
 
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let pubkey = secret_key.public_key(&secp);
+        let secret_key = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        let pubkey = secret_key.public_key();
         let address = TransparentAddress::from_pubkey(&pubkey).encode(&TEST_NETWORK);
         let mut wif_payload = vec![0xEF];
-        wif_payload.extend_from_slice(&secret_key.secret_bytes());
+        wif_payload.extend_from_slice(&secret_key.to_secret_bytes());
         wif_payload.push(0x01);
         let wif = bs58::encode(wif_payload).with_check().into_string();
 
@@ -2284,7 +2277,7 @@ mod tests {
 
         let external_ivk = ts
             .ufvk
-            .transparent()
+            .p2pkh()
             .expect("the test UFVK has a transparent component")
             .derive_external_ivk()
             .unwrap();
@@ -2381,7 +2374,7 @@ mod tests {
         account_index: u32,
     ) -> ::zewif::Account {
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("hd");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2456,12 +2449,12 @@ mod tests {
         // imported as spending rather than view-only.
         let mut store = ::zewif::SecretStore::new();
         store.add_unified_key(::zewif::UnifiedKeyEntry::new(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
             ::zewif::UnifiedSpendingKey::new("usk1testspendingkey"),
         ));
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("spending");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2501,8 +2494,6 @@ mod tests {
             BranchId::for_height(&TEST_NETWORK, height),
             0,
             height + 100,
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-            Zatoshis::ZERO,
             Some(transparent::Bundle {
                 vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],
                 vout: vec![TxOut::new(
@@ -2535,8 +2526,6 @@ mod tests {
             BranchId::for_height(&TEST_NETWORK, height),
             0,
             height + 100,
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-            Zatoshis::ZERO,
             Some(transparent::Bundle {
                 vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],
                 vout: outputs
@@ -2775,8 +2764,6 @@ mod tests {
             BranchId::for_height(params, height),
             0,
             consensus::BlockHeight::from(0),
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-            Zatoshis::ZERO,
             Some(transparent::Bundle {
                 vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],
                 vout: vec![TxOut::new(
@@ -2827,7 +2814,9 @@ mod tests {
         ));
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(usk.to_unified_full_viewing_key().encode(&params)),
+            ::zewif::UnifiedFullViewingKey::new(
+                usk.to_unified_full_viewing_key().encode(&params).unwrap(),
+            ),
         ));
         account.set_name("pre-sapling");
         // A birthday at Sapling activation (height 1 on regtest) writes no
@@ -2881,7 +2870,7 @@ mod tests {
         // aborts the import; the whole import must roll back, leaving nothing
         // committed.
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("viewing");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));

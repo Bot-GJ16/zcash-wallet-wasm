@@ -95,6 +95,8 @@ Read, without mutating:
 - workspace and package `Cargo.toml` files
 - matching package entries in `Cargo.lock`
 - changes since each package's previous release tag
+- `docs/release-branches.md` and relevant maintenance-line tags/changelogs
+- migration guidance and README lifecycle instructions for the affected APIs
 - crates.io versions for every candidate package
 
 Use `cargo metadata` or manifests to verify the internal dependency graph.
@@ -128,33 +130,61 @@ Update:
 
 Use the heading `## v<zcash_voting-version>` for a primary release. Mention
 supporting crate releases in that section when they are part of the release.
-Do not rewrite historical sections.
+Preserve historical release facts. Restore missing maintenance-release entries
+from their tags when needed; do not reclassify already-shipped behavior as new.
 
-Run:
+#### Review and edit release documentation
+
+Before freezing the release, perform an editing pass over the release entry,
+linked migration guide, and affected README guidance. This is release
+preparation work, not an optional list of findings for the release manager.
+
+- Establish the comparison baseline from actual tags. For a stable release
+  following prereleases, summarize the final behavior relative to the previous
+  stable line; do not concatenate the prerelease entries. Distinguish supported
+  upgrade paths when maintenance branches have different ancestry.
+- Reconcile relevant maintenance-line changes with the destination code and
+  release history. Embed inherited user-facing changes in the release summary,
+  identify which starting versions already have them, and retain their release
+  entries. Do not claim an unmerged fix is included; report that discrepancy.
+- Consolidate duplicate headings and overlapping bullets. Describe the final
+  API and behavior once per concern. Remove superseded intermediate APIs,
+  limits, dependency versions, internal refactor narratives, and publishing
+  instructions from user-facing release notes. Check substantial removed
+  entries are either covered by the summary/guide or truly superseded/internal.
+- For each breaking change, state the caller's required adaptation and any
+  build, service, wire, or database prerequisite. Significant API overhauls need
+  a linked migration guide with old-to-new mappings and usage examples. Check
+  names against released source; distinguish released APIs from development-only
+  ones. Explain unsupported upgrades and recovery/rollback limits without
+  promising that schema migration guarantees workflow compatibility.
+- Correct README instructions that contradict the destination API. Validate
+  links, anchors, example signatures, feature names, dependency pins, and stated
+  defaults against the final release commit. Keep unrelated historical docs
+  outside this editing pass.
+- Re-read the resulting entry and guide as a downstream integrator: can a user
+  identify what changed from their release, what they must change, and what is
+  already included? Resolve ambiguities and stale guidance before freezing.
+
+Use the repository's supported validation entry points:
 
 ```bash
-cargo check
-cargo test --locked
-cargo test -p zcash_voting -p zcash-voting-wallet-example \
-  --all-targets --no-default-features --features lrz \
-  --locked
-cargo test -p vote-commitment-tree -p vote-commitment-tree-client \
-  --all-targets --features vote-commitment-tree-client/cli --locked
-cargo test -p vote-commitment-tree -p vote-commitment-tree-client \
-  --all-targets --no-default-features \
-  --features vote-commitment-tree/lrz,vote-commitment-tree-client/lrz,vote-commitment-tree-client/cli \
-  --locked
+make check
+make test
 git diff --check
 ```
 
-Do not combine the Zakura-default and LRZ package sets in one Cargo
-invocation; their transitive cryptography features are mutually exclusive.
-Also run focused or feature-specific tests indicated by the changed code or
-repository documentation. Resolve failures before proceeding.
+Add `make test-lrz` for LRZ/backend-feature changes, `make test-vct` when tree
+crates change, `make doc-test` for changed Rust doc-comment examples, and
+`make msrv` for dependencies or newer language features, as required by
+`AGENTS.md`. Check documentation examples and local links even when they are
+Markdown and therefore not collected by Rust doctests. Resolve failures before
+proceeding.
 
 ### 4. Freeze the release commit
 
-Show the final diff, status, version matrix, publish order, and tags.
+Show the final diff, status, version matrix, publish order, and tags, together
+with the reviewed changelog/upgrade paths and documentation validation results.
 
 The default safe sequence is:
 

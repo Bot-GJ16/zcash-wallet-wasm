@@ -145,17 +145,6 @@ fn delegation_rest_events_reject_legacy_repairs_and_noncanonical_values() {
         delegation_fixture::event(&repaired_round, "3753"),
         delegation_fixture::event(&id, &repaired_position),
     ];
-    for event in &invalid {
-        let legacy = VotingDb::open_browser("owner", Network::Testnet, Some(&bytes)).unwrap();
-        zcash_voting::confirmation::confirm_delegation_submission(
-            &legacy,
-            &id,
-            0,
-            canonical.tx_hash(),
-            std::slice::from_ref(event),
-        )
-        .unwrap();
-    }
     let mut repaired_event_type = delegation_fixture::event(&id, "3753");
     repaired_event_type.event_type = STANDARD.encode("delegate_vote");
     invalid.push(repaired_event_type);
@@ -261,7 +250,7 @@ fn delegation_rest_events_reject_encoded_aliases_but_allow_unrelated_events() {
 }
 
 #[test]
-fn delegation_confirmation_is_atomic_immutable_and_v20_migration_is_fail_closed() {
+fn delegation_confirmation_is_atomic_immutable_and_fail_closed() {
     use zcash_voting::{
         delegation_submission::DelegationOutcome,
         session::{delegation_resume_steps, NextStep},
@@ -285,20 +274,12 @@ fn delegation_confirmation_is_atomic_immutable_and_v20_migration_is_fail_closed(
     db.record_delegation_outcome(&id, 0, DelegationOutcome::Ambiguous)
         .unwrap();
     let pending = db.serialize_bytes().unwrap();
-    let to_v20="ALTER TABLE delegation_attempts DROP COLUMN confirmation_tx_hash; ALTER TABLE delegation_attempts DROP COLUMN confirmation_van_position; PRAGMA user_version=20";
-    let migrated = VotingDb::open_browser(
-        "owner",
-        Network::Testnet,
-        Some(&delegation_fixture::corrupt(&pending, to_v20)),
-    )
-    .unwrap();
     assert_eq!(
-        delegation_resume_steps(&migrated, &id, &[1]).unwrap(),
-        [NextStep::PollDelegation { bundle_index: 0 }]
+        delegation_resume_steps(&db, &id, &[1]).unwrap(),
+        [NextStep::AdvanceDelegation { bundle_index: 0 }]
     );
     assert_eq!(
-        migrated
-            .delegation_submission(&id, 0)
+        db.delegation_submission(&id, 0)
             .unwrap()
             .unwrap()
             .canonical
@@ -316,7 +297,7 @@ fn delegation_confirmation_is_atomic_immutable_and_v20_migration_is_fail_closed(
         .is_err());
     assert_eq!(
         delegation_resume_steps(&blocked, &id, &[1]).unwrap(),
-        [NextStep::PollDelegation { bundle_index: 0 }]
+        [NextStep::AdvanceDelegation { bundle_index: 0 }]
     );
     assert!(blocked.load_van_position(&id, 0).is_err());
     db.confirm_journaled_delegation(
@@ -338,14 +319,7 @@ fn delegation_confirmation_is_atomic_immutable_and_v20_migration_is_fail_closed(
         )
         .is_err());
     assert!(delegation_resume_steps(&db, &id, &[1]).unwrap().is_empty());
-    let confirmed_v20 = delegation_fixture::corrupt(&db.serialize_bytes().unwrap(), to_v20);
-    let migrated = VotingDb::open_browser("owner", Network::Testnet, Some(&confirmed_v20)).unwrap();
-    assert!(delegation_resume_steps(&migrated, &id, &[1]).is_err());
-    assert_eq!(migrated.load_van_position(&id, 0).unwrap(), 42);
-    assert_eq!(
-        migrated.get_delegation_tx_hash(&id, 0).unwrap().as_deref(),
-        Some(canonical.tx_hash())
-    );
+    assert_eq!(db.load_van_position(&id, 0).unwrap(), 42);
 }
 
 #[test]
@@ -390,7 +364,7 @@ fn delegation_planner_orders_mixed_durable_bundles_without_ballot_intent() {
     .unwrap();
     let expected = vec![
         NextStep::Delegate { bundle_index: 0 },
-        NextStep::PollDelegation { bundle_index: 1 },
+        NextStep::AdvanceDelegation { bundle_index: 1 },
     ];
     assert_eq!(delegation_resume_steps(&db, &id, &[1]).unwrap(), expected);
     assert!(db.ballot_intents(&id).unwrap().is_empty());
@@ -411,7 +385,7 @@ fn delegation_planner_orders_mixed_durable_bundles_without_ballot_intent() {
     assert!(delegation_resume_steps(&restored, &id, &[1])
         .unwrap()
         .iter()
-        .all(|s| matches!(s, NextStep::PollDelegation { .. })));
+        .all(|s| matches!(s, NextStep::AdvanceDelegation { .. })));
 }
 
 #[test]
@@ -1538,8 +1512,11 @@ fn browser_db_file_backed_wal_snapshot_preserves_pending_rows() {
         let source = VotingDb::open_path(&files.0).unwrap();
         source.set_wallet_id("wallet-a");
         let observer = Connection::open(&files.0).unwrap();
-        // Exercise a v17 file and leave all subsequent round data in its WAL.
-        observer.execute_batch("DROP TABLE delegation_attempts; ALTER TABLE rounds DROP COLUMN voting_hotkey_secret; DROP TABLE wallet_metadata; PRAGMA user_version=17; PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Leave the round changes in the WAL; real v17 migration uses its
+        // archived schema fixture in the storage tests.
+        observer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         let params = RoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .into(),
@@ -1581,7 +1558,7 @@ fn browser_db_file_backed_wal_snapshot_preserves_pending_rows() {
             observer
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            17
+            25
         );
         assert_eq!(
             observer

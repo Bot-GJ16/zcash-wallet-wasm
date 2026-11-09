@@ -3,9 +3,9 @@
 //! These types are shared between the server and client sides of the vote commitment tree.
 
 use core::iter;
+use std::sync::LazyLock;
 
 use incrementalmerkletree::{Hashable, Level};
-use lazy_static::lazy_static;
 use voting_crypto_deps::pasta_curves::{group::ff::PrimeField, Fp};
 
 use crate::poseidon_hash;
@@ -19,30 +19,33 @@ use crate::poseidon_hash;
 /// (~2,000 fewer constraints) and shrinks Merkle paths from 1,028 to 772 bytes.
 pub const TREE_DEPTH: usize = 24;
 
+/// Number of leaves addressable by the Vote Commitment Tree.
+///
+/// Valid zero-based leaf positions are strictly less than this capacity.
+pub const TREE_CAPACITY: u64 = 1 << TREE_DEPTH;
+
 /// Shard height for the underlying `ShardTree` (each shard covers 2^4 = 16 leaves).
 pub(crate) const SHARD_HEIGHT: u8 = 4;
 
 /// Maximum number of checkpoints retained by the tree.
 pub(crate) const MAX_CHECKPOINTS: usize = 1000;
 
-lazy_static! {
-    /// Precomputed empty subtree hashes for each level.
-    ///
-    /// `EMPTY_ROOTS[0]` = `empty_leaf()` = `poseidon_hash(0, 0)`
-    /// `EMPTY_ROOTS[i]` = `combine(i-1, EMPTY_ROOTS[i-1], EMPTY_ROOTS[i-1])`
-    pub(crate) static ref EMPTY_ROOTS: Vec<MerkleHashVote> = {
-        iter::empty()
-            .chain(Some(MerkleHashVote::empty_leaf()))
-            .chain(
-                (0..TREE_DEPTH).scan(MerkleHashVote::empty_leaf(), |state, l| {
-                    let l = l as u8;
-                    *state = MerkleHashVote::combine(l.into(), state, state);
-                    Some(*state)
-                }),
-            )
-            .collect()
-    };
-}
+/// Precomputed empty subtree hashes for each level.
+///
+/// `EMPTY_ROOTS[0]` = [`MerkleHashVote::empty_leaf()`] = `poseidon_hash(0, 0)`
+/// `EMPTY_ROOTS[i]` = `combine(i-1, EMPTY_ROOTS[i-1], EMPTY_ROOTS[i-1])`
+pub(crate) static EMPTY_ROOTS: LazyLock<Vec<MerkleHashVote>> = LazyLock::new(|| {
+    iter::empty()
+        .chain(Some(MerkleHashVote::empty_leaf()))
+        .chain(
+            (0..TREE_DEPTH).scan(MerkleHashVote::empty_leaf(), |empty_root, level| {
+                let level = level as u8;
+                *empty_root = MerkleHashVote::combine(level.into(), empty_root, empty_root);
+                Some(*empty_root)
+            }),
+        )
+        .collect()
+});
 
 // ---------------------------------------------------------------------------
 // MerkleHashVote

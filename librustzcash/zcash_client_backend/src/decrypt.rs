@@ -145,7 +145,7 @@ fn candidate_ovks(ufvk: &UnifiedFullViewingKey) -> Vec<OutgoingViewingKey> {
     }
 
     #[cfg(feature = "transparent-inputs")]
-    if let Some(pubkey) = ufvk.transparent() {
+    if let Some(pubkey) = ufvk.p2pkh() {
         let shielding_ovks = pubkey.ovks_for_shielding();
         ovks.push(shielding_ovks.external().as_bytes().into());
         ovks.push(shielding_ovks.internal().as_bytes().into());
@@ -378,7 +378,7 @@ mod tests {
     use std::collections::HashMap;
 
     use rand_chacha::ChaChaRng;
-    use rand_core::{CryptoRng, RngCore, SeedableRng};
+    use rand_core::{CryptoRng, SeedableRng};
     use sapling::{
         note_encryption::sapling_note_encryption,
         util::generate_random_rseed,
@@ -440,7 +440,7 @@ mod tests {
 
         #[cfg(feature = "transparent-inputs")]
         {
-            let tfvk = ufvk.transparent().expect("UFVK has a transparent item");
+            let tfvk = ufvk.p2pkh().expect("UFVK has a transparent item");
             let shielding_ovks = tfvk.ovks_for_shielding();
             // Both halves of the pair become raw bytes as soon as they are used, so pin each half
             // against the accessor that names its scope: a key bound to the wrong scope here
@@ -479,7 +479,7 @@ mod tests {
     fn sapling_tx_paying(
         recipient: ::sapling::PaymentAddress,
         ovk: OutgoingViewingKey,
-        rng: &mut (impl RngCore + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Transaction {
         let enforcement =
             zip212_enforcement(&Network::TestNetwork, BlockHeight::from_u32(MINED_HEIGHT));
@@ -499,7 +499,7 @@ mod tests {
             cv,
             cmu,
             ephemeral_key,
-            enc_ciphertext,
+            enc_ciphertext.0,
             out_ciphertext,
             [0u8; core::mem::size_of::<::sapling::bundle::GrothProofBytes>()],
         );
@@ -519,8 +519,6 @@ mod tests {
             BranchId::Nu5,
             0,
             BlockHeight::from_u32(MINED_HEIGHT + 100),
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-            Zatoshis::ZERO,
             None,
             None,
             Some(bundle),
@@ -594,7 +592,7 @@ mod tests {
     fn orchard_tx_paying(
         recipient: ::orchard::Address,
         ovk: OutgoingViewingKey,
-        rng: &mut (impl RngCore + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Transaction {
         use ::orchard::{
             Anchor, Proof,
@@ -683,8 +681,6 @@ mod tests {
             BranchId::Nu5,
             0,
             BlockHeight::from_u32(MINED_HEIGHT + 100),
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-            Zatoshis::ZERO,
             None,
             None,
             None,

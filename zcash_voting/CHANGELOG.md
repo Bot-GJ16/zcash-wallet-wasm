@@ -6,10 +6,352 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+## v5.2.0
+
+Version 5.2.0 is the first stable release of the 5.2 line. It moves the
+default backend to Zakura Common 4.0.0 and requires Rust 1.97. Public notes,
+addresses, witnesses, and cryptographic keys must come from the matching
+dependency family, so this is an opt-in upgrade for Rust integrations despite
+its minor version number. The 5.1.x line keeps its existing dependencies. The
+voting lifecycle, wire formats, vote-tree encoding, and voting-sidecar schema
+are unchanged. See [Migrating from 5.1 to 5.2](docs/migrating-to-common-v3.md).
+
+Upgrade paths:
+
+- From 5.1.0 or a 5.1.1 prerelease, follow the migration guide. LRZ clients
+  must validate existing wallet databases before adopting 5.2. This release
+  already includes the v5.0.2 SQLite writer reservation and tree-recovery
+  fixes and v5.1.0's opt-in Ledger output review.
+- From 5.2.0-rc.2, the dependency family and public types are unchanged.
+- From 5.2.0-rc.1, move direct Common, wallet, circuit, and PIR dependencies
+  from Common v3 to the Common 4 matrix in the migration guide together.
+
+### Changed
+
+- Use published `zakura-protocol 4.0.0`, `voting-circuits 0.14.0`,
+  `voting-crypto-deps 0.4.0`, `imt-tree 0.7.0`, `pir-types 0.8.0`,
+  `pir-client 0.9.0`, and `zakura-wallet-lib 0.1.0-rc9.2`. The alternate LRZ
+  backend adapts to upstream's fallible viewing-key encoding, non-expiring
+  address constructors, and caller-supplied PCZT signing RNG.
+- Accept Ironwood snapshots on the NU7 consensus branch in addition to NU6.3,
+  and activate NU7 on `Network::Regtest` at height 11. The delegation signing
+  transaction (TX1) keeps the fixed V6 / NU6.3 signing profile for NU7
+  snapshots, so existing vote chains verify NU7 delegations without an
+  upgrade. Ironwood note and bundle versions are unchanged.
+- Release `vote-commitment-tree 0.8.1` and `vote-commitment-tree-client 0.10.1`.
+  Their backend features now enable only the field and Poseidon dependencies
+  instead of the full Orchard cryptography bundle. Public APIs, tree hashes,
+  and wire formats are unchanged.
+- Build the lightwalletd gRPC client without Tonic's default server and Axum
+  router dependencies. Public APIs are unchanged.
+
+## v5.2.0-rc.2
+
+Version 5.2.0-rc.2 moves the default backend from Zakura Common v3 to Common
+4.0.0. This changes the public cryptographic type family again for
+integrations qualifying 5.2.0-rc.1: upgrade direct Common, wallet, circuit, and
+PIR dependencies together. The voting lifecycle, wire formats, vote-tree
+encoding, and voting-sidecar schema remain unchanged, and Rust 1.97 remains
+the minimum. As with rc.1, this is an opt-in upgrade for the 5.2 line only;
+5.1.x keeps its existing dependencies. See
+[Migrating from 5.1 to 5.2](docs/migrating-to-common-v3.md).
+
+### Changed
+
+- Use published `zakura-protocol 4.0.0`, `voting-circuits 0.14.0`,
+  `voting-crypto-deps 0.4.0`, `imt-tree 0.7.0`, `pir-types 0.8.0`,
+  `pir-client 0.9.0`, and `zakura-wallet-lib 0.1.0-rc9.2`.
+- Release `vote-commitment-tree 0.8.0` and
+  `vote-commitment-tree-client 0.10.0` with the matching cryptographic types.
+
+## v5.2.0-rc.1
+
+Version 5.2 moves the default backend from Zakura Common v2 to v3 and requires
+Rust 1.97. Public notes, addresses, witnesses, and cryptographic keys must come
+from the matching dependency family. The voting lifecycle and voting-sidecar
+schema remain unchanged.
+The 5.1.x line keeps its existing dependencies; LRZ clients must opt into 5.2
+after adapting and validating their integration, including existing wallet
+databases. See [Migrating from 5.1 to 5.2](docs/migrating-to-common-v3.md).
+
+### Changed
+
+- Use published `voting-circuits 0.13.0`, `voting-crypto-deps 0.3.0`,
+  `imt-tree 0.6.0`, `pir-types 0.7.0`, `pir-client 0.8.0`, and
+  `zakura-wallet-lib 0.1.0-rc8`; remove the temporary source pins.
+- Release `vote-commitment-tree 0.7.0` and
+  `vote-commitment-tree-client 0.9.0` with the matching cryptographic types.
+- Adapt the alternate upstream backend to its fallible viewing-key encoding,
+  non-expiring address constructors, and caller-supplied PCZT signing RNG.
+  Keep vote-tree frontiers on their own tree API rather than Orchard's.
+- Include the SQLite writer reservation and tree-recovery fixes from v5.0.2,
+  and the opt-in Ledger output review from v5.1.0. These changes are already
+  present for integrations upgrading from those versions.
+
+## v5.1.1-rc.3
+
+`zcash_voting` 5.1.1-rc.3 keeps the 5.1.1-rc.2 dependency stack and gates the
+regtest `NetworkUpgrade::Nu7` arm behind the Zakura feature so the LRZ backend
+continues to build against crates.io `zcash_protocol 0.10`.
+
+## v5.1.1-rc.2
+
+`zcash_voting` 5.1.1-rc.2 aligns on the published Zakura cryptography `2.0.0`
+stack and supporting crate releases:
+
+- `zakura-wallet-lib 0.1.0-rc6`
+- `voting-circuits 0.12.2` and `voting-crypto-deps 0.2.4`
+- `imt-tree 0.5.4`, `pir-types 0.6.4`, and `pir-client 0.7.4`
+- `vote-commitment-tree 0.6.3` and `vote-commitment-tree-client 0.8.3`
+
+The Zakura path depends on `zakura-protocol 2.0.0` under the `zcash_protocol`
+import name; the LRZ path keeps crates.io `zcash_protocol 0.10.4`. Spiral
+remains at `valar-spiral-rs 0.5.3-rc.1` with `valar-ypir 0.2.1`.
+
+## v5.1.1-rc.1
+
+`zcash_voting` 5.1.1-rc.1 updates Spiral to `valar-spiral-rs 0.5.3-rc.1` and
+YPIR to published `valar-ypir 0.2.1`.
+
+## v5.1.0
+
+### Added
+
+- Opt-in Ledger output review through
+  `DelegationPipeline::with_ledger_output_review()` and
+  `DelegationKeys::with_ledger_output_review()`. New delegation requests use
+  the account's external outgoing viewing key and a printable ASCII memo so
+  Ledger can review the existing zero-value hotkey output. The outgoing
+  viewing key holder can recover the hotkey address and delegation memo from
+  the submitted action, without gaining signing authority. Configure this
+  before the first delegation setup; saved requests are reused unchanged.
+  Existing callers retain the default behavior. No database, circuit, or
+  vote-chain update is required. See
+  [Ledger output review](docs/delegation-signing-transaction.md#ledger-output-review).
+
+## v5.0.2
+
+`zcash_voting` 5.0.2 updates `vote-commitment-tree` to 0.6.2 and
+`vote-commitment-tree-client` to 0.8.2.
+
 ### Fixed
 
-- Session cleanup now preserves delegation setup fields for bundles with a
-  successful proof so wallets can resume signing without regenerating ZKP1.
+- Reserved the SQLite WAL writer before `store_vote` reads existing vote state,
+  preventing concurrent vote-commitment persistence from failing immediately
+  with `database is locked` instead of honoring the configured busy timeout.
+- Reject over-capacity leaves and non-increasing checkpoints from vote-tree
+  endpoints with typed sync errors instead of panicking the wallet.
+- Try configured vote-chain replicas in order during exact commitment-tree
+  recovery, restarting each replica from its own fixed snapshot and refusing
+  to fail over from ambiguous duplicate-layout evidence.
+
+## v5.0.1
+
+`zcash_voting` 5.0.1 supersedes 5.0.0 for wallet integrations. Version 5.0.0
+rejects an authenticated vote-chain configuration containing more than eight
+endpoints before making a network request.
+
+### Fixed
+
+- Allow chain submission clients to configure up to 100 vote-chain endpoints,
+  while retaining the separate limit of eight submission attempts.
+
+## v5.0.0
+
+> **Known issue:** Version 5.0.0 rejects vote-chain configurations containing
+> more than eight endpoints. Use 5.0.1 instead.
+
+`zcash_voting` 5.0.0 moves round execution, chain submission/recovery, and
+helper-share tracking into the SDK. Wallet integrations must adapt their
+orchestration and bindings; this is not a dependency-only upgrade.
+
+See [Migrating to v5](docs/migrating-to-v5.md) for the **v3.x → v5.0.x** and
+**v4.0.x → v5.0.x** upgrade paths, API replacements, and database restrictions.
+The notes below describe the final v5 API relative to v3.1.0. Integrations on
+v3.0.x or v4.0.x also need the guide's earlier integration changes.
+
+V5 includes the v4.0.x line's support for proposal IDs 1–50 (still 16 encrypted
+shares per vote), SQLite immediate-transaction fixes, explicit LRZ selection,
+and Rust 1.91 minimum. It supersedes the v4 prerelease dependency stack; the
+v4 release entries below retain their original version requirements.
+
+### Breaking changes
+
+- **Round orchestration:** use `RoundDriver::run` over a bound `RoundExecutor`
+  to execute and resume a round. The SDK selects work from durable state and
+  returns a `RoundRunReport` with progress, partial failures, and a typed stop
+  reason. Hosts supply ballot decisions, signing, authenticated configuration,
+  current timing, transport, and cancellation.
+- **Chain submission:** `ChainSubmissionClient` owns request construction,
+  dispatch, polling, recovery, and confirmation. Public payload builders,
+  host-parsed confirmation APIs, and writers for transaction hashes and VAN/VC
+  positions are removed. A transaction hash alone is not confirmation;
+  exact-tree recovery may confirm a vote without one.
+- **Atomic transactions:** fresh local delegation and chosen votes use
+  `delegate-and-cast-vote-batch`, including a single chosen proposal. Voting
+  through an existing delegation batches multiple due proposals with
+  `cast-vote-batch`; one proposal uses `cast-vote`. Target chains must support
+  these routes and the 50-proposal circuit/verifying keys. There is no fallback
+  from the combined route. Batch members are publicly linked as one transaction.
+- **Delegation signing and proving:** use `DelegationPipeline` or
+  `PreparedDelegationBundle::ensure_proof`; the direct
+  `VotingDb::build_and_prove_delegation` method is removed. Software wallets
+  supply a `SpendAuthSigner`; Keystone wallets supply device signatures. Chain
+  advancement takes the signature and reloads its authoritative signing context
+  from storage. Imported delegations remain signer-free and poll-only.
+- **Helper shares:** initial submission is now available through
+  `ConfirmedVote::submit_prepared_shares`, after converting a committed vote
+  with `CommittedVote::confirmed`. Replace host tracking timers with
+  `ShareTrackingDriver::run` and pending-round enumeration with
+  `share::pending_rounds_for_accounts`. Public host-cadence helpers are removed.
+- **Bindings and storage handles:** `VotingDb::open_wallet_sidecar` returns
+  `Arc<VotingDb>`; `scoped` returns `Result` and rejects an empty wallet ID.
+  `set_ballot_intents` requires the expected network. Wire step kinds, primary
+  actions, recovery kinds, and phases use typed enums; submission/poll kinds
+  become advancement kinds. Delegation recovery VAN positions are `u64`.
+  Update exhaustive matches for typed errors and newly non-exhaustive reports.
+- **Transport:** `HyperTransport` is generic over `RouteHttp`; PIR proof
+  consumers accept `&dyn PirProofSource`. Custom routes must follow the dispatch
+  hook contract and explicitly declare any connection-timeout enforcement.
+- **Database compatibility:** launched schemas upgrade in place to version 24,
+  but migration does not adopt legacy submissions into the new chain lifecycle.
+  Upgrading with an in-flight legacy submission is unsupported. Standalone
+  recovery-clearing APIs are removed, reset preserves submission evidence, and
+  ordinary round deletion refuses broadcast delegation state. See the guide
+  before upgrading an active wallet.
+
+### Added
+
+- `RoundDriver` and `ShareTrackingDriver` provide SDK-owned execution loops,
+  cancellation, progress events, and explicit reasons for stopping. Round
+  reports include signed delegation bundles and durable effects even when a
+  later step fails. `ProgressBaseline::SelectedChoices` supports a stable
+  selected-vote progress total across restarts.
+- `DelegationPipeline` shares bundle setup, eligibility, PIR preparation,
+  proving, and signing between foreground and background work. Keystone
+  requests retain the exact signing transaction across proof warmup and restart.
+- `PirFleet`, `PirSession`, and `PirProofSource` provide ordered endpoint
+  failover. `RouteHttp` lets hosts route PIR, vote-tree, helper, and chain HTTP
+  traffic through one Tor/proxy integration.
+- Optional per-invocation `*_with_report` APIs return `OperationReport<T>` with
+  bounded proof, chain, and helper diagnostics, including on failure. Existing
+  plain workflow variants remain available. See [observability](docs/observability.md).
+- A shared proving runtime with `ProvingPolicy` controls CPU workers and active
+  heavy jobs independently. Configure it before the first proof or cache warmup;
+  defaults use available parallelism, with a 64 MiB stack per worker.
+- [Staging benchmarks](stage-bench/README.md) and
+  [bundle-pipeline benchmarks](docs/bundle_pipeline_benchmark.md) measure full
+  voting flows and proof/delivery concurrency. They are opt-in and separate from
+  the normal test suite.
+
+### Changed
+
+- Round execution overlaps up to five independent bundles by default; a
+  `StopRound` failure policy remains serial. Proof work uses the shared runtime.
+  Initial helper delivery admits up to 50 active share workflows with an
+  independent 128-POST ceiling and accounts for helper fan-out before starting
+  delivery deadlines.
+- The round's designated immediate share is dispatched first when available,
+  with a bounded wait across concurrent bundles. Default foreground planning
+  requests confirmation only for that share; remaining shares are tracked in
+  the background. The durable designation survives restarts and roster changes.
+- Planning uses one consistent snapshot and reports missing bundle setup,
+  unfinished ballots, per-bundle signing needs, terminal submissions, and
+  background shares explicitly. Recovery continues for dispatched votes even
+  if their proposals leave the roster; undispatched obsolete work can be retired.
+- PIR requests split a 60-second budget across two timeout-bounded attempts,
+  allowing quicker detection of stalled connections while retaining time for
+  slow transfers. Custom connectors must implement the documented connection
+  deadline contract to gain the early timeout behavior.
+- Config resolution accepts both `vote_protocol` generations `v0` and `v1`.
+  This does not substitute for chain support for the required transaction routes.
+- Release dependencies are `voting-crypto-deps 0.2.3`,
+  `voting-circuits 0.12.1`, `imt-tree 0.5.3`, `pir-types 0.6.3`,
+  `pir-client 0.7.3`, and `zakura-wallet-lib 0.1.0-rc5`.
+  Supporting crates are `vote-commitment-tree 0.6.1` and
+  `vote-commitment-tree-client 0.8.1`. Rust 1.91 or newer is required.
+
+### Fixed
+
+- Interrupted chain submissions perform recovery in the first resumed run.
+  Ambiguous POSTs, including replaced gateway responses, retain recovery state
+  and ballot locks. Exact-tree recovery is resource-bounded, validates tree
+  positions, and preserves progress when a later operation fails.
+- Tree-confirmed votes advance subsequent proposals and prevent conflicting
+  ballot edits or rebuilds even without a transaction hash. Failed tree syncs
+  no longer leave cached state that poisons later attempts.
+- Combined delegation-and-vote confirmation reads the chain's `nullifier_count`
+  event correctly. Definite first-POST rejection retires the combined batch for
+  a fresh cast while retaining delegation setup; ambiguous dispatch remains
+  recoverable. Rejection streaks reset on a relevant ballot edit or setup rebuild.
+- Helper attempts are durably journaled in release builds as well as debug
+  builds. Cancellation, partial failures, and restarts preserve accepted and
+  outcome-unknown deliveries. Attempt-bound ingress-timeout receipts allow safe
+  retries when a helper proves the attempt was not enqueued.
+- Shared sidecar handles coordinate submission, proof production, and tree
+  state across opens and path aliases. Account/session changes interrupt stale
+  work, and concurrent writers report typed `DbBusy` errors rather than relying
+  on message parsing.
+- Schema upgrades preserve delegation, vote, share, and recovery material and
+  repair recognized preview/schema drift, including a missing
+  `chain_submissions` table. Unrecognized submission-tracking rows may be
+  discarded during repair; unknown combined-preview schemas fail without
+  rewriting stored state.
+- Delegation setup and Keystone signatures survive proof warmup, cancellation,
+  restart, and other bundles advancing first. Stale signing context cannot
+  overwrite a replacement setup, and imported delegations no longer prompt for
+  signatures their holders cannot provide.
+- Progress and diagnostics retain the correct round, bundle, proposal, and
+  share attribution, including cached-proof reuse, partial delivery, and
+  privacy-trimmed bundle counts.
+
+## v4.0.0-rc.1
+
+This LRZ maintenance release builds on `v4.0.0-rc.0`; it does not contain the
+v5 orchestration API overhaul.
+
+### Changed
+
+- Updated the release stack to `voting-crypto-deps 0.2.3`,
+  `voting-circuits 0.12.0`, and `imt-tree 0.5.3`, with supporting
+  `vote-commitment-tree 0.6.1` and `vote-commitment-tree-client 0.8.1` releases.
+- Added the explicit `lrz` feature for consumers disabling default features.
+- Raised the minimum supported Rust version from 1.88 to 1.91.
+
+## v4.0.0-rc.0
+
+This maintenance line is based on `v3.0.0`, not `v3.1.0`.
+
+### Changed
+
+- Expanded proposal IDs from 1–15 to 1–50 while retaining 16 encrypted shares
+  per vote commitment. This requires the breaking circuit and verifying-key
+  change in `voting-circuits 0.12.0-rc.2`.
+
+### Fixed
+
+- Voting writes that validate durable state before updating it use SQLite
+  immediate transactions, preventing stale-snapshot `database is locked`
+  failures during submission and confirmation, including VC-position and
+  helper-share writes.
+
+## v3.1.0
+
+### Changed
+
+- Released the exact `v3.1.0-rc.16` implementation as `v3.1.0` without
+  implementation changes. Its supporting production snapshots were released
+  as `pir-types 0.6.2`, `pir-client 0.7.2`, `voting-circuits 0.11.2`,
+  `vote-commitment-tree 0.6.0`, and `vote-commitment-tree-client 0.8.0`.
+
+## v3.1.0-rc.16
+
+### Changed
+
+- Local voting-hotkey delegation now derives each bundle's VAN blinding from
+  the stored hotkey secret and exact round and bundle identity. Restoring that
+  secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
+  after voting database loss without new authority-root or recovery tables.
 
 ## v3.1.0-rc.15
 
@@ -49,10 +391,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   without exposing encrypted helper payloads to the host.
 
 ### Changed
-- Local voting-hotkey delegation now derives each bundle's VAN blinding from
-  the stored hotkey secret and exact round and bundle identity. Restoring that
-  secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
-  after voting database loss without new authority-root or recovery tables.
 - Helper-share planning, persistence, submission, and recovery are now
   authoritative SDK responsibilities. Hosts provide authenticated helper
   configuration, round timing, transport, and cancellation.

@@ -8,7 +8,7 @@ use zcash_primitives::block::BlockHash;
 
 type TestWallet = Wallet<MemoryWalletDb<Network>, tonic_web_wasm_client::Client>;
 
-fn funded_db_at_confirmations(
+pub(super) fn funded_db_at_confirmations(
     confirmations: u32,
 ) -> (MemoryWalletDb<Network>, crate::bindgen::wallet::AccountId) {
     assert!(confirmations > 0);

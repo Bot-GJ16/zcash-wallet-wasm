@@ -35,6 +35,31 @@ pub(super) struct ResubmitReport {
     pub(super) outcome_unknown_urls: Vec<String>,
 }
 
+/// A recovery walk that failed after possibly retaining ambiguous outcomes.
+#[derive(Debug)]
+pub(super) struct FailedResubmission {
+    pub(super) error: VotingError,
+    pub(super) outcome_unknown_urls: Vec<String>,
+}
+
+impl FailedResubmission {
+    fn after_retained_outcomes(error: VotingError, outcome_unknown_urls: &[String]) -> Self {
+        Self {
+            error,
+            outcome_unknown_urls: outcome_unknown_urls.to_vec(),
+        }
+    }
+}
+
+impl From<VotingError> for FailedResubmission {
+    fn from(error: VotingError) -> Self {
+        Self {
+            error,
+            outcome_unknown_urls: Vec::new(),
+        }
+    }
+}
+
 pub(super) struct ResubmitRequest<'a> {
     pub(super) share: &'a ShareDelegationRecord,
     /// The configured helper fleet, already canonicalized by the caller.
@@ -98,7 +123,7 @@ pub(super) async fn resubmit_to_next_helper(
     attempted_urls: &mut Vec<String>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
-) -> Result<ResubmitReport, VotingError> {
+) -> Result<ResubmitReport, FailedResubmission> {
     let share = request.share;
     let generation = share::ShareGeneration::new(scope, &share.nullifier);
     let bundle = match vote_recovery::helper_recovery_material_for_wallet(
@@ -123,12 +148,13 @@ pub(super) async fn resubmit_to_next_helper(
         }
     };
 
-    let recovered_share_wire_json = match share::recover_wire_json(
+    let recovered_share_wire_json = match share::observe_recover_wire_json(
         &bundle.commitment_bundle_json,
         share.proposal_id,
         share.share_index,
         bundle.vc_tree_position,
         request.schedule.submit_at(),
+        &client.observation_scope(),
     ) {
         Ok(recovered_share_wire_json) => recovered_share_wire_json,
         // Corrupt recovery material cannot be fixed by trying another helper.
@@ -309,7 +335,10 @@ pub(super) async fn resubmit_to_next_helper(
                 generation,
                 request.configured_urls,
                 capacity_policy,
-            )? {
+            )
+            .map_err(|error| {
+                FailedResubmission::after_retained_outcomes(error, &newly_outcome_unknown_urls)
+            })? {
                 crate::storage::queries::ShareAttemptReservation::Started => true,
                 crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => false,
                 crate::storage::queries::ShareAttemptReservation::PlacementCapacityReached => {
@@ -325,7 +354,9 @@ pub(super) async fn resubmit_to_next_helper(
                 }
             }
         } else {
-            match share::is_confirmed_for_generation(db, &attempt, generation)? {
+            match share::is_confirmed_for_generation(db, &attempt, generation).map_err(|error| {
+                FailedResubmission::after_retained_outcomes(error, &newly_outcome_unknown_urls)
+            })? {
                 Some(confirmed) => !confirmed,
                 None => {
                     client.checkpoint().await?;
@@ -361,7 +392,10 @@ pub(super) async fn resubmit_to_next_helper(
             .await
         {
             Err(HelperError::CheckpointFailed) => {
-                return Err(crate::helper::runtime::checkpoint_error())
+                return Err(FailedResubmission::after_retained_outcomes(
+                    crate::helper::runtime::checkpoint_error(),
+                    &newly_outcome_unknown_urls,
+                ))
             }
             Ok(_) => {
                 if !share::resolve_delivery_attempt_for_generation(
@@ -370,7 +404,10 @@ pub(super) async fn resubmit_to_next_helper(
                     generation,
                     share::ShareDeliveryAttemptOutcome::Accepted,
                     request.schedule.reset_submit_at(),
-                )? {
+                )
+                .map_err(|error| {
+                    FailedResubmission::after_retained_outcomes(error, &newly_outcome_unknown_urls)
+                })? {
                     client.checkpoint().await?;
                     return Ok(ResubmitReport {
                         outcome: ResubmitOutcome::StaleGeneration,
@@ -391,7 +428,13 @@ pub(super) async fn resubmit_to_next_helper(
                         generation,
                         share::ShareDeliveryAttemptOutcome::DefiniteFailure,
                         request.schedule.reset_submit_at(),
-                    )?
+                    )
+                    .map_err(|error| {
+                        FailedResubmission::after_retained_outcomes(
+                            error,
+                            &newly_outcome_unknown_urls,
+                        )
+                    })?
                 {
                     client.checkpoint().await?;
                     return Ok(ResubmitReport {
@@ -415,7 +458,10 @@ pub(super) async fn resubmit_to_next_helper(
                     generation,
                     share::ShareDeliveryAttemptOutcome::Ambiguous,
                     request.schedule.reset_submit_at(),
-                )? {
+                )
+                .map_err(|error| {
+                    FailedResubmission::after_retained_outcomes(error, &newly_outcome_unknown_urls)
+                })? {
                     client.checkpoint().await?;
                     return Ok(ResubmitReport {
                         outcome: ResubmitOutcome::StaleGeneration,
@@ -433,7 +479,10 @@ pub(super) async fn resubmit_to_next_helper(
                     generation,
                     share::ShareDeliveryAttemptOutcome::Ambiguous,
                     request.schedule.reset_submit_at(),
-                )? {
+                )
+                .map_err(|error| {
+                    FailedResubmission::after_retained_outcomes(error, &newly_outcome_unknown_urls)
+                })? {
                     client.checkpoint().await?;
                     return Ok(ResubmitReport {
                         outcome: ResubmitOutcome::StaleGeneration,
@@ -452,7 +501,10 @@ pub(super) async fn resubmit_to_next_helper(
                     generation,
                     share::ShareDeliveryAttemptOutcome::DefiniteFailure,
                     request.schedule.reset_submit_at(),
-                )? {
+                )
+                .map_err(|error| {
+                    FailedResubmission::after_retained_outcomes(error, &newly_outcome_unknown_urls)
+                })? {
                     client.checkpoint().await?;
                     return Ok(ResubmitReport {
                         outcome: ResubmitOutcome::StaleGeneration,

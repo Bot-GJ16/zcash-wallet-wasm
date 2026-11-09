@@ -8,6 +8,7 @@ rustflags = [
     "-C", "link-arg=--import-memory",
     # Thread ABI consumed by wasm-bindgen 0.2.122 with the pinned Rust linker.
     "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__heap_base",
     "-C", "link-arg=--export=__tls_base",
     "-C", "link-arg=--export=__tls_size",
     "-C", "link-arg=--export=__tls_align",

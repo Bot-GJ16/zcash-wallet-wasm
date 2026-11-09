@@ -38,15 +38,17 @@ where
     let orchard_receiver = address.orchard().cloned();
     let sapling_receiver = address.sapling().cloned();
     let shielded_unified =
-        ZcashUnifiedAddress::from_receivers(orchard_receiver, sapling_receiver, None)
+        ZcashUnifiedAddress::from_receivers(orchard_receiver, sapling_receiver, None, None, None)
             .expect("all-available unified address should include a shielded receiver");
 
     let orchard = orchard_receiver.as_ref().and_then(|receiver| {
-        ZcashUnifiedAddress::from_receivers(Some(*receiver), None, None).map(|ua| ua.encode(params))
+        ZcashUnifiedAddress::from_receivers(Some(*receiver), None, None, None, None)
+            .map(|ua| ua.encode(params))
     });
 
     let sapling = sapling_receiver.as_ref().and_then(|receiver| {
-        ZcashUnifiedAddress::from_receivers(None, Some(*receiver), None).map(|ua| ua.encode(params))
+        ZcashUnifiedAddress::from_receivers(None, Some(*receiver), None, None, None)
+            .map(|ua| ua.encode(params))
     });
 
     UnifiedAddresses {
@@ -395,7 +397,7 @@ pub fn parse_unified_address(network: &str, unified_address: &str) -> Result<JsV
     // Get the network
     let net = crate::Network::from_str(network)?;
 
-    let (parsed_net, ua) =
+    let (parsed_net, revision, ua) =
         unified::Address::decode(unified_address).map_err(|_| Error::InvalidAddress)?;
 
     // Verify network matches
@@ -416,18 +418,22 @@ pub fn parse_unified_address(network: &str, unified_address: &str) -> Result<JsV
             unified::Receiver::Orchard(data) => {
                 shielded_receivers.push(unified::Receiver::Orchard(data));
                 // Create a unified address with only Orchard receiver
-                let single_ua =
-                    unified::Address::try_from_items(vec![unified::Receiver::Orchard(data)])
-                        .map_err(|_| Error::InvalidAddress)?;
+                let single_ua = unified::Address::try_from_items(
+                    revision,
+                    vec![unified::Uitem::Data(unified::Receiver::Orchard(data))],
+                )
+                .map_err(|_| Error::InvalidAddress)?;
                 // Encode the single-receiver UA
                 orchard_addr = Some(single_ua.encode(&parsed_net));
             }
             unified::Receiver::Sapling(data) => {
                 shielded_receivers.push(unified::Receiver::Sapling(data));
                 // Create a unified address with only Sapling receiver
-                let single_ua =
-                    unified::Address::try_from_items(vec![unified::Receiver::Sapling(data)])
-                        .map_err(|_| Error::InvalidAddress)?;
+                let single_ua = unified::Address::try_from_items(
+                    revision,
+                    vec![unified::Uitem::Data(unified::Receiver::Sapling(data))],
+                )
+                .map_err(|_| Error::InvalidAddress)?;
                 // Encode the single-receiver UA
                 sapling_addr = Some(single_ua.encode(&parsed_net));
 
@@ -448,8 +454,14 @@ pub fn parse_unified_address(network: &str, unified_address: &str) -> Result<JsV
         }
     }
 
-    let shielded_ua =
-        unified::Address::try_from_items(shielded_receivers).map_err(|_| Error::InvalidAddress)?;
+    let shielded_ua = unified::Address::try_from_items(
+        revision,
+        shielded_receivers
+            .into_iter()
+            .map(unified::Uitem::Data)
+            .collect(),
+    )
+    .map_err(|_| Error::InvalidAddress)?;
 
     // Create the result structure
     let result = UnifiedAddresses {

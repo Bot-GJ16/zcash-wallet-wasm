@@ -1,17 +1,35 @@
 # Valar Voting Upstream
 
 - Repository: https://github.com/valargroup/zcash_voting
-- Commit: `57e25c7dae7d75fe746e5f40e450f6cd65c5c7c5`
-- Crate: `zcash_voting` `3.1.0-rc.15`
-- Imported: 2026-09-07
+- Tag: `v5.2.0`
+- Commit: `340c34c47c1230fa2cca37ab2f38fd801db32d0a`
+- Crate: `zcash_voting` `5.2.0`
+- Imported: 2026-10-31
 - Wallet integration backend: `lrz`, with `browser`; never `zakura`.
 
-This directory contains the complete workspace from that commit, copied with
-`rsync -a --exclude=.git` after checking out and verifying the exact revision.
+This directory contains the complete workspace from that tag, merged with the
+browser and wallet patches and copied without upstream `.git` metadata.
 It is ordinary source, not a submodule. Upstream licenses, tests, examples,
 documentation, and release tooling are retained.
-One extra EOF blank line in `docs/immediate-share-selection-plan.md` is removed
-so the vendor import passes `git diff --check`.
+
+## Current local compatibility
+
+- The `lrz,browser` build retains the local LRZ graph and the caller-local
+  browser transport, SQLite ownership, proof execution, and helper recovery.
+- Voting schema v25 merges upstream v18-v24 with the earlier browser v18-v22
+  journals. Legacy submission evidence is captured during migration so old
+  accepted transactions resume by status lookup without a duplicate POST.
+- NU7 Testnet and Mainnet are accepted for Ironwood V3 voting notes at their
+  activation heights; TX1 effects v1 remains signed under NU6.3.
+- The root wallet supplies the browser session driver, durable checkpoints,
+  external signing, and compatibility wrappers for its existing public API.
+
+## Historical import notes
+
+The sections below document the earlier 3.1.0-rc.15 browser fork. Version and
+schema numbers there describe that prior import, not the current upstream tag.
+References below to testnet-only PIR and a snapshot-derived TX1 branch ID are
+historical; the current behavior is described under Current local compatibility.
 
 ## Local Compatibility Patches
 

@@ -37,8 +37,8 @@ pub fn confirmations_policy<DbT: WalletRead, ParamsT: consensus::Parameters>(
     let Some((target, anchor)) = wallet_db.get_target_and_anchor_heights(policy.trusted())? else {
         return Ok(None);
     };
-    let interval = wallet_db.pool_migration_params().anchor_bucket_interval();
-    if !params.is_nu_active(NetworkUpgrade::Nu6_3, target.into()) || !interval.is_boundary(anchor) {
+    let grid = wallet_db.pool_migration_params(params).anchor_grid();
+    if !params.is_nu_active(NetworkUpgrade::Nu6_3, target.into()) || !grid.is_boundary(anchor) {
         return Ok(Some(policy));
     }
     let Some(trusted) = (u32::from(target) - u32::from(anchor))
@@ -56,7 +56,7 @@ pub fn confirmations_policy<DbT: WalletRead, ParamsT: consensus::Parameters>(
     .expect("the untrusted requirement is at least the trusted requirement");
     Ok(wallet_db
         .get_target_and_anchor_heights(adjusted.trusted())?
-        .filter(|(_, anchor)| !interval.is_boundary(*anchor))
+        .filter(|(_, anchor)| !grid.is_boundary(*anchor))
         .map(|_| adjusted))
 }
 
@@ -99,7 +99,7 @@ where
         wallet_db,
         target_height,
         anchor_height,
-        &wallet_db.pool_migration_params(),
+        &wallet_db.pool_migration_params(params),
         policy,
         spend_from_account,
         request,

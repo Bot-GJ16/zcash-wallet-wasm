@@ -89,6 +89,16 @@ observed before a fresh reservation dispatches is different: because the POST
 is definitely unsent, the reservation is cleared as a definite failure rather
 than retained as outcome-unknown.
 
+"Durably reserved before its POST is dispatched" is a claim about the shipped
+binary, not about a test run. The reservation's only state mutation must sit on
+the ordinary execution path, never inside an assertion the compiler removes: a
+`debug_assert!` erases its argument in release, so a marker written there is
+recorded in every test and in no released build. The failure is invisible to
+the whole suite, and its symptom is precisely the one this section exists to
+prevent — a crash mid-POST leaving no evidence the helper was ever contacted,
+so recovery treats a possibly-delivered share as untried.
+`no_debug_assert_hides_a_fallible_call` guards the obvious form of this.
+
 An **interrupted helper** is an attempting helper whose durable reservation is
 loaded by a later tracking operation with no corresponding live request in
 that operation. The earlier process may have stopped before dispatch, during
@@ -308,12 +318,109 @@ Regression coverage:
    index 0 of the lowest voted proposal ID in the highest eligible bundle
    index. Bundles are value-descending, so this is the lowest-value eligible
    bundle.
-4. The immediate designation is derived from durable ballot choices and is
-   stable across restart and vote completion. Skipped proposals do not
-   participate.
+4. The immediate designation is derived from durable ballot choices the
+   first time the designated vote's own plan is prepared, and is then durable
+   state of its own (`round_immediate_share`, schema version 20): stable
+   across restart and vote completion, written once in the plan's
+   transaction, never updated, voided only with the undispatched generation
+   it was made for. Skipped proposals do not participate. Every later plan
+   reads the row and never re-derives it, so a designated proposal that
+   leaves the authenticated roster after its vote reached the chain lifecycle
+   keeps the designation and planning for the remaining roster names no
+   second share (`derive_immediate_share`, regression tests
+   `a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`,
+   `the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`,
+   `the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`,
+   `a_later_lower_choice_does_not_move_the_designation_or_block_its_submission`).
 5. `immediate = true` and `submit_at = 0` are not equivalent. Last-moment and
    single-share planning can assign `submit_at = 0` to undesignated shares,
    but the designated immediate share MUST always have `submit_at = 0`.
+6. **Initial delivery dispatches the designated share before the round's other
+   shares, and concurrent deliveries of the same round wait for it to reach a
+   helper.** The designation names the *highest* eligible bundle, which is the
+   last to reach the chain, while initial delivery runs once per confirmed unit
+   — so without this the share a voter waits on is submitted after the bundles
+   that confirmed earlier. Measured against staging on a 37-proposal round, 67%
+   of the round's shares preceded it with bundles running serially and 8% with
+   them concurrent.
+
+   The guarantee is best-effort and bounded on both sides. A call holding the
+   designation dispatches it first. A call without it proceeds on **any** of
+   three conditions, and never waits past the last of them:
+
+   1. the designated share already has a definite acceptance recorded against it
+      — an acknowledged enqueue, not a chain confirmation, and a duplicate answer
+      counts;
+   2. the call holding the designated share finished with it, **including with a
+      refusal or any other non-acceptance outcome** — a share no helper took will
+      not arrive by being waited for, so the round is released rather than made to
+      spend its budget discovering that; or
+   3. the wait budget expired, so a round whose designated bundle has not
+      confirmed never stalls the bundles that are ready.
+
+   Condition 2 covers a designated share this call cannot dispatch at all — one
+   whose preparation failed — as well as one the helpers refused. Holder identity
+   is resolved from the durable designation against the call's votes rather than
+   from its job list, because a failed preparation contributes no job and would
+   otherwise read as another call's responsibility, leaving this call's own
+   siblings waiting for a share already in front of them.
+
+   A wait is recorded as `helper::immediate_gate_wait`, with `Pending` marking
+   one that expired. Every share's `helper::delivery_queue_wait` is already open
+   when the gate wait begins, so without its own record an expired wait would be
+   charged to generic queue time and read as delivery contention.
+
+   Cancellation while waiting leaves the shares pending, as any cancelled
+   admission does.
+
+   Conditions 1 and 2 both persist for the round within a process: a release is
+   remembered, so a later pass does not wait again for a designated share that
+   has already been dealt with. That matters most for a refusal, which records no
+   acceptance and would otherwise send every later pass into the full budget
+   waiting for a share no helper took. The memory is bounded and does not survive
+   a restart, after which condition 1 still covers an accepted share and a refused
+   one pays a single wait once.
+
+   Condition 1 is read from durable state once, beside the plan loads the call
+   has already performed, which is what lets a later pass or anything after a
+   restart proceed with no state carried between calls. The wait budget bounds
+   the **wait**; it does not bound that read, and could not — a blocking
+   connection acquisition is not preemptible by a timer, and this path performs
+   one such read per proposal before the gate is reached at all. It is not re-read while waiting: a durable read takes the
+   sidecar connection that delivery is using continuously, and re-reading it on
+   every tick could block a bounded wait past its own deadline. Nothing is lost,
+   because a share accepted while this call waits is being accepted by a sibling
+   call in the same process, which is condition 2.
+
+   Within one share's fan-out the boundary is the completion of its wave: the
+   executor resolves a wave's outcomes only after all of its POSTs return,
+   deliberately and serially, so that a stale generation aborts before a later
+   write can mask it. That ordering is not changed here; the difference it costs
+   is at most one wave's slowest reply, is bounded by the wait budget regardless,
+   and is zero for a single-target placement.
+
+   It deliberately stops at ordering *inside* one call: holding a call's own
+   shares behind its designated one would break the no-proposal-barrier property
+   (`combined_reconciliation_delivers_later_proposals_while_the_first_is_unfinished`)
+   and prevent a full commitment reaching the POST ceiling
+   (`full_commitment_reaches_but_never_exceeds_128_posts`). Both are deliberate,
+   and every share measured ahead of the designated one belonged to another
+   bundle, which is what the gate addresses.
+
+   Enforcement:
+   [`immediate_gate`](../zcash_voting/src/vote/share_delivery/immediate_gate.rs)
+   and `submit_votes` in
+   [`queue.rs`](../zcash_voting/src/vote/share_delivery/queue.rs).
+
+   Regression tests:
+   `the_immediate_share_is_posted_before_every_other_share`,
+   `other_bundles_wait_for_the_immediate_ack_then_deliver_without_limits`,
+   `the_gate_expires_so_a_round_whose_designated_bundle_is_unconfirmed_still_delivers`,
+   `cancellation_while_waiting_on_the_gate_leaves_shares_pending`,
+   `a_pass_after_the_immediate_share_is_accepted_does_not_wait`, and
+   `a_later_pass_does_not_wait_again_after_the_designated_share_was_refused`,
+   `a_designated_share_that_cannot_be_prepared_releases_the_round`, and
+   `an_expired_gate_wait_is_recorded_separately_from_queue_time`.
 
 Enforcement:
 [`round_immediate_share_key`](../zcash_voting/src/share_policy/initial_placement.rs)
@@ -366,9 +473,42 @@ ready list to be a distinct subset of that fleet.
 `CommittedVote::prepare_share_delivery` consumes that validated snapshot.
 It also consumes the complete proposal-id roster from the authenticated round
 configuration. The roster must be nonempty, distinct, and exactly match the
-round's durable terminal ballot intents. The SDK combines those intents with
-the durable bundle set to derive the single immediate share; the host does not
-select an immediate share index.
+round's durable terminal decisions. Those decisions are the recorded ballot
+intents plus, for a vote the chain lifecycle owns or has finished that has no
+intent of its own, its stored choice: such a vote is the wallet's transaction
+whatever the ballot says, its shares are owed, and its choice stands
+(`durable_decisions`, regression test
+`a_lifecycle_owned_vote_without_an_intent_still_plans_and_delivers_its_shares`).
+The SDK combines those decisions with the durable bundle set to seed the
+single immediate share the first time; the host does not select an immediate
+share index.
+
+The planner carries the other half of that contract: `resume_plan` does not
+emit `NextStep::CastVote` while any roster proposal still lacks a terminal
+decision, nor while a durable intent exists for a proposal outside the roster,
+except an intent whose vote the chain lifecycle owns or has finished: that
+intent cannot be cleared, so it is neither reported nor allowed to withhold
+casting, and helper planning tolerates it when comparing the durable roster
+(`intent_is_lifecycle_owned`). Its vote is still advanced, its confirmed
+vote's missing shares are still scheduled as `SubmitShares`, and a committed
+but undispatched vote for such a proposal is retired by `CastVote` before the
+bundle is cast again (regression tests
+`an_unrostered_intent_the_chain_lifecycle_owns_does_not_withhold_casting`,
+`an_unrostered_submitted_vote_is_still_advanced`,
+`an_unrostered_confirmed_vote_still_schedules_its_missing_shares`,
+`a_committed_vote_for_a_dropped_proposal_does_not_hold_its_bundle`,
+`a_lifecycle_owned_intent_outside_the_roster_does_not_block_planning`).
+Casting persists the vote before the immediate share is derived, so planning a
+cast against a ballot that does not exactly match the roster would advertise a
+step that can only fail after a ZKP #2 proof and a durable write. The remaining
+proposals are reported through `RoundPlan::open_proposals` and the extra
+intents through `RoundPlan::unrostered_intents`, which the host clears with
+`VotingDb::clear_ballot_intent`; the bundle's `Delegate` prerequisite and the
+advancement of votes already on the wire are unaffected.
+Enforcement: `roster_is_terminal` in
+[`resume_plan`](../zcash_voting/src/session.rs) and
+`derive_immediate_share` in
+[`share_tracking/delivery_plan.rs`](../zcash_voting/src/share_tracking/delivery_plan.rs).
 Low-level pure planners remain implementation tools, not the wallet lifecycle
 boundary.
 
@@ -530,10 +670,12 @@ shares, it is the durable `created_at`.
 6. Under-placement is independent of overdue status and can trigger early
    replenishment when no vote-end time is available.
 
-After a tracking pass, the next delay is the earliest future grace boundary,
-capped at 30 seconds. If every remaining share is already ready, the delay is
-15 seconds. Every nonempty delay is at least three seconds. No unconfirmed
-shares yields no next delay.
+After a tracking pass, two clocks compete and the next delay is whichever comes
+first: a share already past its grace boundary is re-polled after 15 seconds,
+and a share still before its boundary is waited for until it arrives, capped at
+30 seconds. Taking the sooner of the two is what keeps a ready share from
+queueing behind an unrelated share whose check is further out. Every nonempty
+delay is at least three seconds. No unconfirmed shares yields no next delay.
 
 Enforcement: `share_recovery_base_time`, `should_resubmit_share`,
 `is_share_resubmission_window_open`, and `next_tracking_delay_seconds` in
@@ -543,14 +685,209 @@ Regression tests: `immediate_shares_use_created_at_for_status_and_retry`,
 `delayed_shares_use_submit_at_for_status_and_retry`,
 `overdue_threshold_is_quarter_window_with_bounds`,
 `resubmission_window_closes_exactly_at_the_cutoff`,
-`next_tracking_delay_applies_minimum_and_future_cap`, and
-`next_tracking_delay_uses_ready_poll_interval_for_ready_pending_shares` in
+`next_tracking_delay_applies_minimum_and_future_cap`,
+`next_tracking_delay_uses_ready_poll_interval_for_ready_pending_shares`,
+`a_ready_share_is_not_left_waiting_behind_a_later_one`, and
+`a_check_sooner_than_the_ready_cadence_still_wins` in
 [`share_policy/tests/timing.rs`](../zcash_voting/src/share_policy/tests/timing.rs).
 Facade-level timing behavior is covered by
 `confirmed_shares_are_never_ready_or_overdue`,
 `missing_vote_end_suppresses_overdue_but_not_status_checks`, and
 `young_share_is_idle_until_the_status_grace_passes` in
 [`share_tracking/tests/timing_policy.rs`](../zcash_voting/src/share_tracking/tests/timing_policy.rs).
+
+### Driving passes to quiescence
+
+`ShareTrackingDriver` repeats one pass until a round's shares are quiescent. It
+adds no facts about a share: every decision about what a share needs stays in
+the pass and the timing policy.
+
+- **The cadence is the pass's, not the driver's.** Between two successful
+  passes the driver waits exactly `next_delay_seconds`. It supplies a wait of
+  its own only after a failed pass, which computed none.
+- **No wait outlasts the round.** Whichever of the two produced it, a wait is
+  shortened to the time left before vote end, less the time the pass that
+  produced it consumed — the host clock is read before a pass, so a slow pass
+  has already spent part of the window. The pass computes its delay from share
+  rows, which say when a share is next worth polling and nothing about when the
+  round closes; without the cap a run would sit on a round it can no longer act
+  on for a whole poll interval, and a pass that failed near the boundary would
+  spend the window's last usable retry waiting.
+- **The host context is read once per pass.** A run can span hours, so a
+  refreshed helper fleet or round timing reaches the next pass. A pass already
+  running completes against the inputs it was given.
+- **Vote end is checked before a pass, never after.** Recovery is closed past
+  it, so a pass there could only re-poll shares it cannot act on.
+- **Passes are strictly sequential, and a round admits one run.** Each pass
+  plans from the rows the previous one wrote. The per-share locks keep two runs
+  off one share but not off one round: interleaved runs re-poll shares the
+  other has just answered, doubling the round's helper traffic for no added
+  progress. A round is keyed by sidecar, wallet, and round id: two
+  independently opened databases hold separate share rows, so they are not each
+  other's concurrency.
+
+  **A live holder turns a caller away; a departing one hands the round over.**
+  The holder's own liveness is recorded with its claim — a holder is live while
+  its control is uncancelled and still on the epoch it was admitted under — so
+  a caller decides on state rather than by waiting. Meeting a live holder it
+  stops at once with `AlreadyDriving`, without reading the host context or
+  touching a share: the work it was started for is in flight, and a run can
+  last until vote end, so queuing behind it would block the caller for hours.
+
+  Meeting a *departing* holder it waits for the round to be released and takes
+  over. That wait is **unbounded**: it ends when the holder releases the round
+  or when the waiting caller is itself cancelled, which it observes every tick,
+  and never by timing the holder out. A holder releases by completing or being
+  dropped, so a host must poll a cancelled run's future to completion or drop
+  it; one retained in neither state holds its round for the life of the process
+  and leaves a replacement waiting. This is the case that matters most: a host that
+  cancels a run and starts its replacement arrives between the cancel and the
+  holder's return, and turning that replacement away would leave the round with
+  no run at all until the next lifecycle event — possibly after vote end.
+  Because the decision reads the holder's state rather than racing its unwind,
+  a departing holder that is descheduled or slow still hands the round over.
+  Admission is released when the holding run ends, however it ends, including a
+  dropped future.
+
+- **A run's subject is fixed at entry, and each pass acts under it.** The
+  operation epoch is captured before the wallet, so a switch landing between
+  the two cannot leave a run holding the old wallet's admission while accepting
+  the new wallet's epoch as its own. The captured scope is then passed into
+  every pass rather than re-captured there: a switch landing between a run's
+  boundary check and its next pass would otherwise redirect that pass to
+  another wallet's rows, under this run's admission and beside that wallet's
+  own admitted run. The boundary check is what *stops* such a run; the passed
+  scope is what keeps the pass already under way honest.
+- **A failed pass's durable effects are kept.** A pass commits each
+  confirmation and retained recovery attempt as it walks, so an error means the
+  walk stopped, not that nothing happened, and the next pass walks only
+  unconfirmed shares — an effect dropped here is one nothing can rediscover.
+  The run folds those into its report and the `PassFailed` event carries them.
+  This includes ambiguous outcomes retained inside one share's recovery walk
+  before a later helper reservation fails; the nested recovery error carries
+  those durable effects into the pass's partial report.
+  An accumulated ambiguous attempt is withdrawn when a later pass retries that
+  same helper and is told plainly: the run's `ambiguous` promises outcomes that
+  remain unknown, and that one is known now. It does not return to `ambiguous`
+  afterwards, because the share is known to have reached that helper however an
+  even later attempt reads.
+
+  A run accumulates *which* helpers a share reached, not how many times. A pass
+  re-sends an overdue share to helpers that already accepted it — duplicate-safe,
+  and the point of recovery — so the same `(share, helper)` recurs pass after
+  pass, and a run bounded only by vote end has many. Each pair is recorded once;
+  the per-pass `PassFinished` events keep every attempt for telemetry. `passes`
+  counts dispatched passes rather than helper traffic for the same reason: a
+  pass over a round that owes nothing, or one that fails validating the fleet,
+  polls no helper at all.
+  A partial pass's `unrecoverable` is *not* folded: that set is a statement
+  about the whole round, and a prefix of the walk would narrow it. It is kept,
+  not frozen — a share the partial pass confirmed or reached a helper with is
+  no longer beyond repair, and is dropped from the retained set, so one report
+  never calls a share both recovered and unrecoverable. A **cancelled** pass is
+  partial for exactly the same reason and is folded the same way.
+- **Cancellation is rechecked after the host callback.** `host_context()` is
+  synchronous and arbitrary, and the vote-end and pass-budget checks read what
+  it returned. Without the recheck a cancellation landing during the callback
+  would be answered with a verdict about the round — `VoteEndReached` or
+  `PassBudgetExhausted` — for a run the host had already dropped.
+- **A run always reports why it stopped.** `ShareTrackingQuiescence` is
+  exhaustive over the reasons, so a host acts on it rather than re-reading
+  share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`, `Cancelled`,
+  `AlreadyDriving`, `Failing`, and `PassBudgetExhausted`. `NothingToTrack` rests
+  on the pass's own `unconfirmed_at_entry`, not on an empty effect list: a pass
+  that confirmed and resubmitted nothing may still have walked a share another
+  task confirmed underneath it, and that round did owe something. That
+  observation is absent, not zero, when a pass failed before it could look —
+  validating the fleet, or reading the round's shares — so a host is never told
+  a round owed nothing on the strength of a pass that never asked.
+- **A failing pass is retried, then surfaced.** `max_consecutive_failures`
+  consecutive failures end the run with the messages, rather than retrying
+  silently for the rest of the round. A successful pass resets the count.
+  Cancellation outranks the failure verdict on both paths: a pass that failed
+  because the host was draining the run reports `Cancelled`, with the failure
+  still listed, rather than `Failing`.
+- **Vote end bounds a healthy run; the pass budget is off by default.** A share
+  that never becomes pollable, and a share nothing can still repair, both stay
+  unconfirmed however long the run lasts, so both keep producing a next delay
+  and keep looking pollable. That is the case a budget would bound — but a pass
+  count is not a duration: passes are paced by the share rows, so a round of
+  ready-but-unconfirmed shares produces one pass per
+  `ready_poll_interval_seconds`, and a budget that looks generous expires hours
+  into a window that can last days. A run stopped there would abandon
+  confirmation and recovery with nothing to restart it, because the host starts
+  runs on lifecycle events rather than on a timer. So `max_passes` is `None` by
+  default and a run is bounded by vote end, confirmation, cancellation, and
+  `max_consecutive_failures`. A host that sets a budget — for a round reported
+  with no vote end, which has no time boundary at all, or for a test — gets
+  `PassBudgetExhausted` naming the shares recovery could not repair, and the
+  run never waits for a pass the budget will not allow.
+
+  Stopping *as soon as* nothing can make progress needs a terminality
+  classification the pass does not yet report: a share whose recovery material
+  is beyond rebuilding may still be confirmed by a helper that already accepted
+  it, so `unrecoverable` alone would end a run that could still finish. Until
+  the pass reports that, an unsettleable share is polled for the rest of the
+  round. That is wasted traffic, not lost correctness.
+- **Cancellation is observed in three places** — between passes, during the
+  wait, and inside a pass through its cancel callback — so a host draining a
+  run does not wait out a delay. The wait is woken by the control rather than
+  polled, because a wait spans the time until a share is actually due. An
+  operation-epoch change is the same signal; the epoch is captured at entry, so
+  a change made before a run is simply the epoch that run belongs to.
+
+Enforcement: [`share_tracking_drive`](../zcash_voting/src/share_tracking_drive/).
+
+Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
+`a_cancelled_run_stops_before_it_polls_anything`,
+`moving_to_another_operation_epoch_stops_the_run`,
+`a_round_past_its_vote_end_is_not_polled`,
+`vote_end_reached_between_passes_stops_the_run`,
+`a_share_that_never_becomes_pollable_stops_at_the_pass_budget`,
+`a_pass_that_fails_while_the_run_is_draining_reports_cancellation`,
+`an_interruption_during_the_host_callback_outranks_the_round_verdict`,
+`a_round_that_owed_a_share_is_never_reported_as_nothing_to_track`,
+`a_pass_that_failed_before_looking_reports_no_entry_count_at_all`,
+`a_wallet_switched_under_a_run_neither_redirects_it_nor_outlives_it`,
+`the_default_run_is_bounded_by_vote_end_rather_than_a_pass_count`,
+`a_zero_budget_stops_without_polling`, and
+`repeated_pass_failures_stop_the_run_and_are_reported` in
+[`share_tracking_drive/tests/stopping.rs`](../zcash_voting/src/share_tracking_drive/tests/stopping.rs);
+`a_pass_delay_is_shortened_to_what_is_left_of_the_window`,
+`a_failure_retry_is_shortened_to_what_is_left_of_the_window`,
+`the_pass_that_produced_a_delay_is_charged_to_the_window`,
+`a_pass_that_outlasts_the_window_leaves_no_wait_at_all`, and
+`a_round_with_no_vote_end_keeps_the_delay_it_was_given` in
+[`share_tracking_drive/tests/window.rs`](../zcash_voting/src/share_tracking_drive/tests/window.rs);
+`a_second_run_for_the_same_round_is_turned_away_without_polling`,
+`a_live_holder_turns_a_caller_away_without_making_it_wait`,
+`a_holder_left_behind_by_an_epoch_change_hands_the_round_over`,
+`a_finished_run_releases_its_round_for_the_next_one`,
+`another_round_in_the_same_wallet_runs_alongside`,
+`a_replacement_takes_the_round_over_from_a_cancelled_run`,
+`a_caller_cancelled_inside_the_wait_reports_cancellation`, and
+`two_sidecars_holding_the_same_round_do_not_block_each_other` in
+[`share_tracking_drive/tests/admission.rs`](../zcash_voting/src/share_tracking_drive/tests/admission.rs);
+`a_partial_pass_still_hands_over_what_it_committed`,
+`a_partial_pass_does_not_narrow_the_unrecoverable_set`,
+`a_partial_pass_drops_the_shares_it_recovered_from_the_snapshot`,
+`an_ambiguous_recovery_attempt_also_clears_a_share`,
+`an_ambiguous_attempt_settled_by_a_later_pass_leaves_the_run_report`,
+`a_settled_attempt_at_another_helper_leaves_the_ambiguity_alone`,
+`a_helper_reached_again_on_a_later_pass_is_recorded_once`,
+`a_share_reaching_two_helpers_keeps_both`,
+`a_repeated_ambiguous_attempt_is_recorded_once`,
+`a_settled_attempt_does_not_become_ambiguous_again`, and
+`a_complete_pass_replaces_the_unrecoverable_set` in
+[`share_tracking_drive/tests/partial_progress.rs`](../zcash_voting/src/share_tracking_drive/tests/partial_progress.rs);
+`failed_recovery_reports_ambiguity_retained_before_the_error` in
+[`share_tracking/tests/recovery.rs`](../zcash_voting/src/share_tracking/tests/recovery.rs);
+`the_wait_between_passes_is_the_one_the_pass_computed`,
+`a_pass_close_to_its_check_waits_only_until_then`,
+`the_host_context_is_read_once_per_pass`,
+`a_long_wait_is_cancelled_at_once_rather_than_slept_out`, and
+`the_default_policy_is_the_cadence_the_host_was_driving_by_hand` in
+[`share_tracking_drive/tests/pacing.rs`](../zcash_voting/src/share_tracking_drive/tests/pacing.rs).
 
 ## Transport and timeout invariants
 
@@ -588,7 +925,8 @@ report invalid or unfinished entries as not ready.
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
 | One helper POST | 30 seconds | `HelperClient` |
-| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `CommittedVote::submit_prepared_shares` |
+| Active initial share workflows across the process | 50 | shared `vote/share_delivery` queue |
+| Concurrent initial POSTs across the process | 128 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `ConfirmedVote::submit_prepared_shares` |
 | Total initial fan-out per share | 60 seconds | committed share delivery |
 | Minimum budget to start an initial POST | 1 second | committed share delivery |
 | Retry backoffs | 200 ms, then 600 ms | `HelperClient::with_retry` |
@@ -652,7 +990,7 @@ Regression tests: `preflight_keeps_slow_probes_alive_until_the_target_is_ready`,
 `every_retry_is_capped_to_the_remaining_delivery_deadline`,
 `retry_backoff_does_not_turn_a_definite_failure_ambiguous`,
 `retries_without_an_overall_deadline_keep_the_configured_timeout`,
-`fan_out_stops_at_the_overall_deadline_and_clamps_the_last_request`,
+`fan_out_bounds_every_attempt_by_the_overall_deadline`,
 `definite_failure_in_backoff_is_not_marked_ambiguous`,
 `definite_failure_at_backoff_deadline_clears_durable_attempt_and_retries_later`,
 `no_attempt_starts_under_minimum_budget`, and the
@@ -681,6 +1019,7 @@ For current POST classification:
 | `queued` or `duplicate` | Definite acceptance | Stop |
 | DNS, connect, TLS, or route failure before dispatch | Definite failure | Retry |
 | HTTP 429 | Definite transient failure | Retry |
+| HTTP 408 with a valid attempt-bound ingress receipt | Definite transient failure of this attempt | Retry within the existing initial-delivery budget |
 | HTTP 500, 502, 503, or 504 | Ambiguous transient failure | Never |
 | Timeout | Ambiguous | Never |
 | Failure after dispatch but before headers | Ambiguous | Never |
@@ -732,7 +1071,7 @@ plan validates against its own persisted planning fleet. Existing round plans
 are checked so roster drift cannot create a second or conflicting immediate
 designation.
 
-`CommittedVote::submit_prepared_shares` is the delivery boundary. It loads that
+`ConfirmedVote::submit_prepared_shares` is the delivery boundary. It loads that
 plan, requires the plan's exact current committed-vote generation, binds the
 submitting handle to that generation, validates the immutable plan against its
 persisted planning fleet, and separately validates the complete current fleet.
@@ -748,9 +1087,77 @@ immediate share, or a missing confirmed VC position fail before network I/O.
 The raw per-share executor is
 crate-private, and there is no public post-hoc delivery mutator.
 
-Up to 16 share tasks across all wallets and committed votes in the process may
-hold a delivery permit at once. Each task retains per-share serialization, the
-30-second request deadline, the 60-second total fan-out deadline, and durable
+The private `vote/share_delivery` package owns the shared initial-delivery
+queue. Both singleton `ConfirmedVote` submission and completion of a confirmed
+atomic unit use this implementation and the same admission semaphore. Unit
+completion validates each member's complete plan before admitting any of its
+shares, then queues share jobs in member order and persisted payload order.
+Completed slots are refilled across proposal boundaries: the final slow share
+of one proposal does not hold the next proposal's remaining work behind it.
+Jobs retain one immutable validated plan per proposal and the wallet scope
+captured before the queue's asynchronous work; the per-share executor still
+revalidates the exact generation before durable preparation and dispatch.
+
+Preparation runs on a blocking worker with owned handles and the captured
+wallet scope. It reads the requested plans inside one deferred read transaction,
+sharing a successful authoritative-generation and immediate-designation audit
+per round within that transaction only. Every member still validates its exact
+handle generation and complete plan. The connection is released before complete
+payload wire validation; confirmation is re-read and matched to that generation.
+The read-only worker cannot write or POST if its awaiting caller is dropped.
+No audit is cached across calls, and dispatch retains its generation checks,
+reservation and cancellation boundaries. `preparation_connection_wait_does_not_block_sibling_futures`,
+`a_later_delivery_reaudits_round_immediate_plans`, and
+`wallet_switch_during_preparation_does_not_redirect_the_snapshot` cover the
+worker and snapshot scope. `cancellation_during_preparation_leaves_every_share_pending`
+covers cancellation across the worker handoff. The queue observability test requires one round
+audit and one full payload-validation pass per member.
+
+A proposal-local plan or payload validation error prevents every POST for that
+proposal while other valid proposals continue. A share execution error does
+not abort sibling futures or stop independent proposals. Cancellation or an
+operation-epoch change suppresses further admission and drains admitted
+workflows under the existing transport cancellation rules below. Waiting for
+share capacity does not consume the 60-second fan-out budget: that budget
+still begins inside per-share fan-out, after its operation lock is acquired.
+The lower-level POST-capacity wait remains inside that budget.
+
+Reports finalize per proposal, including partial reports after share errors.
+The primary share error is selected in persisted payload order, independently
+of completion timing. Unprocessed and failed shares remain pending; completed
+shares retain their durable acceptance or ambiguity. Existing public singleton
+submission APIs and report shapes are unchanged.
+
+Concurrent bundle execution uses this existing shared queue, rather than adding
+per-bundle network budgets. The limits below remain process-wide across all
+executors and wallets and are independent of CPU proving admission. Every
+proposal's complete or partial report reaches the step ledger; completion events
+may interleave across bundles while aggregate reports retain dispatch and
+canonical proposal order. Full atomic chain confirmation still precedes every
+fresh delivery. `a_finished_pipeline_refills_while_an_original_bundle_remains_blocked`
+covers rolling bundle admission; the existing delivery queue conformance tests
+continue to own sibling-progress and partial-report behavior.
+
+Up to 50 share tasks across all wallets and committed votes in the process may
+hold a delivery permit at once. Admission uses one process-wide budget of 6400
+units, charging each share `max(128, 50 * planned target_count)` units atomically.
+Thus up to 50 shares with targets of two or fewer, 32 shares with targets of four,
+or 12 shares with targets of ten can run at once; mixed fleets share the same
+budget. The charge uses the validated persisted plan and is retained until outcomes are journaled, including across
+fallback waves. Waiting for this budget occurs before share preparation and the
+fan-out deadline, and cancellation releases the complete charge. This bounds the
+aggregate planned fan-out of admitted queue workflows to 128 without changing
+placement targets. Separately, a process-wide semaphore limits initial POST
+operations to 128, including lower-level delivery calls outside this queue.
+Waiting for a POST permit observes cancellation every 50 milliseconds and stops when one second or less
+remains in the fan-out budget. An unsent reservation is cleared as a
+definite failure on cancellation or budget exhaustion. After admission, the
+executor re-reads the starting wallet's exact share nullifier and requires the
+helper's attempting marker before dispatch. Deletion, generation replacement,
+or loss of that reservation fails without sending the queued payload or
+applying its outcome to a different generation. Each task retains
+per-share serialization, the 30-second request deadline, the 60-second total
+fan-out deadline, and durable
 reservation-before-POST. `ShareBatchDeliveryReport` is sorted by domain share
 index. It contains durable reports for completed tasks, the indexes still
 queued when cancellation stopped new work, a final cancellation flag, and the
@@ -803,10 +1210,12 @@ pass walk disjoint fallbacks beyond the shared target.
 Planned targets are attempted first, followed by the remaining configured
 fleet. Health ranking is applied independently within those groups, so a
 healthy fallback never moves ahead of a degraded planned target. For every
-selected helper it writes
-`attempting_urls` before dispatch, then:
+selected helper it writes `attempting_urls` before dispatch. Helpers are reserved
+sequentially in waves capped at the outstanding definite acceptances, and each
+wave's POSTs run concurrently subject to the process-wide 128-POST limit. The
+executor:
 
-1. re-evaluates helper health before each attempt;
+1. re-evaluates helper health before each reservation;
 2. selects each helper at most once in the outer fan-out (the client can still
    repeat a definite transient transport attempt under its retry policy);
 3. resolves definite and ambiguous outcomes into their separate durable sets;
@@ -814,6 +1223,14 @@ selected helper it writes
    exhausted, cancellation fires, or the 60-second deadline expires; and
 5. returns partial or empty acceptance as a report rather than treating it as
    a network-level function error.
+
+Reaching placement capacity during reservation ends the current wave, not the
+whole pass. The capacity-rejected helper remains eligible for the next wave.
+After outcomes are persisted, definite failures and ambiguous completions can
+free reservation capacity; accepted and still-attempting helpers continue to
+count against the target. A wave that cannot reserve any helper ends the pass
+without dispatch. `resumed_delivery_rechecks_capacity_after_wave_outcomes`
+covers all three outcomes with a preexisting interrupted attempt.
 
 Ambiguous attempts do not satisfy the target. The returned report summarizes
 the exact current durable generation after fan-out, including placements made
@@ -840,7 +1257,9 @@ by `overlapping_initial_fan_outs_share_one_target`,
 `tracking_waits_for_live_initial_fan_out_before_replenishing`, and
 `concurrent_attempt_reservations_share_one_placement_capacity`.
 Cancellation while waiting for that serialization boundary is covered by
-`cancellation_aborts_initial_wait_for_live_share_operation`.
+`cancellation_aborts_initial_wait_for_live_share_operation`. Destructive
+deletion while a stale delivery result is pending is covered by
+`initial_delivery_does_not_recreate_share_after_round_deletion`.
 Typed-boundary coverage is
 provided by
 `committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback`,
@@ -850,9 +1269,8 @@ provided by
 `repeated_partial_committed_submission_sends_original_schedule_to_new_helper`,
 `repeated_committed_submission_does_not_resurrect_zero_schedule`,
 `committed_vote_submission_rejects_mismatched_plan_before_side_effects`, and
-`invalid_candidate_url_does_not_create_a_share_record`. Cleanup concurrency is
-covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
-Released recovery-format migration and strict plan invalidation are covered by
+`invalid_candidate_url_does_not_create_a_share_record`. Released
+recovery-format migration and strict plan invalidation are covered by
 `migrate_v15_recovery_json_preserves_plan_only_through_confirmation`.
 The high-level boundary regressions in
 [`share_tracking/tests/delivery_plan.rs`](../zcash_voting/src/share_tracking/tests/delivery_plan.rs)
@@ -875,8 +1293,101 @@ are `stale_handle_cannot_prepare_same_commitment_replacement`,
 `planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence`,
 `later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan`,
 `delayed_immediate_plan_is_rejected_before_network`, and
-`global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
+`four_target_admission_ceiling_is_thirty_two_and_queued_cancellation_returns_pending_shares`.
 These replace the former wallet-example planner and per-share delivery tests.
+
+Cross-proposal queue regressions live in
+`share_tracking/tests/delivery_queue/`:
+
+- `completed_slots_refill_across_four_proposals_without_a_barrier` and
+  `batch_and_singleton_calls_share_the_process_wide_fifty_slots` pin refill
+  and shared admission;
+- `thirty_seven_proposals_finish_faster_with_identical_durable_results`
+  compares the production queue to sequential singleton calls under identical
+  scripted latency and requires the same reports and durable placements;
+- `invalid_proposal_plan_does_not_send_that_proposal_or_block_later_ones`,
+  `reservation_failure_keeps_siblings_and_later_proposals`, and
+  `outcome_write_failure_keeps_interrupted_marker_and_other_proposals` pin
+  validation isolation, retained partial reports, and deterministic errors;
+- `cancellation_before_admission_keeps_every_share_pending`,
+  `cancellation_and_epoch_changes_drain_live_posts_and_release_capacity`, and
+  `cancellation_from_report_callback_stops_further_admission` pin cancellation;
+- `queued_replaced_generation_is_not_posted_or_mutated`,
+  `queued_work_retains_its_wallet_even_after_active_wallet_switches`,
+  `waiting_in_queue_does_not_spend_the_next_shares_fanout_budget`, and
+  `reopened_database_reuses_plans_and_only_delivers_unsent_proposals` pin
+  identity, timeouts, and restart safety; and
+- `reports_complete_out_of_order_but_return_in_proposal_and_share_order`
+  distinguishes callback completion order from deterministic returned order.
+
+### Delivery diagnostics
+
+`share_tracking::delivery_progress` is the shared placement-evidence classifier
+used by vote completion and observability. Completed tasks do not imply accepted
+placement: after errors, cancellation, and unprocessed shares are accounted for,
+a share with no accepted or ambiguous helper reports diagnostic failure; a share
+with only ambiguous helpers reports pending. At least one definite acceptance
+per share suffices for initial-delivery success, independently of redundancy and
+confirmation. Diagnostics never change durable state or the returned domain
+result.
+
+The common committed-share delivery boundary binds the actual round, bundle,
+proposal, and share identity to its local observation client before fallible
+work. Concurrent shares and atomic-batch members retain their own identities
+through HTTP retries without changing the parent step's identity.
+
+Regression tests in `share_tracking/tests/observability.rs`:
+`delivery_diagnostics_classify_evidence_and_boundary_precedence`,
+`reported_delivery_preserves_results_and_classifies_completed_tasks`, and
+`atomic_round_delivery_attributes_every_proposal_share_and_retry`.
+
+Diagnostics additionally distinguish queue residence, active share execution,
+POST-capacity and per-share lock waits, parsed acceptance, and durable acceptance.
+Queue residence begins at enqueue, before admission; measuring it does not move
+the fan-out deadline. Confirmation reports distinguish quorum observation,
+generation-qualified persistence, and reuse of an existing confirmation.
+Validated-fleet endpoint ordinals retain configured order through health sorting
+and retries. Background driver waits are measured without changing cadence.
+No diagnostic grants placement, confirmation, or permission to retry.
+
+`helper::prepare_delivery_queue` times complete-plan and payload validation
+before queue residence begins. It does not admit shares before validation.
+`helper::load_delivery_snapshot`, `helper::audit_delivery_round`, and
+`helper::validate_delivery_payloads` distinguish the consistent database read,
+its shared round audit, and each proposal's subsequent payload validation.
+Round-audit spans clear inherited bundle, proposal, and share identity without
+changing the parent scope or losing the round identity. An audit failure can
+originate in a proposal other than the one being submitted;
+`round_audit_spans_clear_caller_identity_including_failures` covers that case
+and successful audits with both unattributed and share-attributed callers.
+Each payload-validation span names the current vote's bundle and proposal,
+including failed validations, and clears any inherited share index because it
+covers the whole proposal. Attributing a member never changes its parent scope.
+`payload_validation_spans_identify_each_vote_including_failures` covers singleton
+and multi-member calls, mismatched parent identities, and a malformed payload
+that prevents only its proposal's POSTs.
+`queue_residence_precedes_admission_and_active_delivery_includes_journaling`
+also checks that successful queue preparation precedes every share's enqueue.
+
+These boundaries are covered by
+`queue_residence_precedes_admission_and_active_delivery_includes_journaling`,
+`confirmation_diagnostics_distinguish_quorum_persistence_and_reuse`,
+`status_endpoint_ordinals_survive_health_order_and_keep_pending_semantics`,
+`cancelled_confirmation_reports_lock_wait_without_polling`, and
+`reported_tracking_waits_preserve_cadence_and_cancellation`.
+Reported helper POSTs also measure response headers/body collection, individual
+future polls, suspension between polls, and first wake to the next poll. These
+are nested diagnostic spans, not additional deadlines. The request-local
+context preserves attribution across host route callbacks and exposes only a
+closed phase vocabulary for route selection, direct/Tor requests and Tor body
+collection. Disabled collection bypasses the polling wrapper. Diagnostics never
+spawn request tasks or alter dispatch, timeout, placement or retry semantics.
+`records_wake_delay_and_preserves_result_and_attribution`,
+`disabled_observation_preserves_pending_and_cancellation`, and
+`separates_response_headers_from_delayed_body` cover these boundaries.
+
+See [the benchmark procedure](helper_delivery_benchmark.md) for correlation
+limitations and the difference between helper acceptance and chain inclusion.
 
 ## Confirmation and health invariants
 
@@ -990,6 +1501,36 @@ For each unconfirmed share, `track_pending_shares` computes timing and current
 definite placement from the intersection of durable state and the currently
 configured helper set.
 
+Resumed vote work (`AdvanceVote`, `AdvanceVoteBatch`, and the recovery
+driver's equivalents) reconciles the chain before any helper-plan
+preparation. The plan was made durable at cast time, or the vote predates
+plans, and an open ballot must not keep an already-dispatched vote from being
+polled or recovered; each vote's plan is loaded or created after confirmation,
+right before its shares are delivered. A fresh `CastVote` still makes its
+plans durable before the broadcast (regression test
+`a_dispatched_vote_is_reconciled_before_its_ballot_is_terminal`).
+`RoundPlan::immediate_share_key` reports the designation a persisted plan
+carries whenever one exists (regression test
+`the_plan_reports_the_persisted_immediate_share_after_its_proposal_leaves_the_roster`).
+
+A share row with no accepted, ambiguous, or attempting helper (every initial
+POST failed definitely, or a reservation was cleared before dispatch) is
+`RoundPlan::blocking_share_work`. The planner still lists it as
+`NextStep::ConfirmShare` but classifies it as `SubmitShares` recovery work,
+and the executor runs that delivery from the durable plan instead of the
+focused confirmation poll, which could never confirm a share no helper holds
+(regression test
+`a_blocking_confirm_share_step_delivers_before_polling`).
+
+`RoundDriver` dispatches only that safely repeatable share work in the
+foreground. A share with a definite acceptance or an ambiguous or attempting
+helper is handed to background tracking, which owns confirmation,
+duplicate-safe reconciliation, and replenishment. Such a step is filtered even
+when the same plan contains a later deliverable share: polling it would return
+`Pending`, promote it ahead of plan order again, and starve the delivery until
+the round dispatch budget was exhausted
+(`an_outcome_unknown_share_never_outranks_the_delivery_the_round_owes`).
+
 ### Replenishment and ordering
 
 1. Under-placement starts replenishment immediately; it does not wait for the
@@ -1058,8 +1599,13 @@ already-persisted delivery history. A definite acceptance moves the helper to
 and a definite failure of a fresh attempt removes the reservation so the
 helper can be retried in a later pass. A definite failure of an overdue
 outcome-unknown re-POST leaves that earlier unknown state in place, while a
-failure of an accepted fallback leaves the earlier acceptance intact. Each
-transition is persisted before the workflow contacts another helper.
+failure of an accepted fallback leaves the earlier acceptance intact. Recovery
+persists each outcome transition before contacting another helper. Initial
+delivery reserves every target in a wave durably before dispatch, waits for
+all POST operations in that wave to finish, then persists their outcomes one
+at a time in wave order before reserving or dispatching the next wave. Until
+an outcome is persisted, its helper remains in `attempting_urls`, even if its
+POST has already completed.
 
 A process interruption during an in-flight initial or recovery request leaves
 the helper in `attempting_urls`. On restart, that state is exposed as
@@ -1160,7 +1706,7 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
 `cancelled_pass_reports_cancellation_and_keeps_durable_effects`,
 `cancellation_aborts_initial_wait_for_live_share_operation`,
 `cancellation_aborts_wait_for_live_share_operation`,
-`global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`,
+`four_target_admission_ceiling_is_thirty_two_and_queued_cancellation_returns_pending_shares`,
 `cancellation_before_request_is_not_scored`,
 `late_cancellation_does_not_replace_final_failed_poll`, and
 `late_cancellation_does_not_replace_final_failed_resubmission`.
@@ -1187,8 +1733,14 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
    schedule already delivered to an accepted helper.
 9. Immediate overdue recovery sets durable `submit_at` to zero. Early
    replenishment leaves it unchanged.
-10. Share writes and confirmation MUST match the current durable ballot intent.
-   Changing or skipping that intent clears stale share rows.
+10. Share writes and confirmation MUST match the current durable decision for
+   the proposal. Changing or skipping a recorded intent clears stale share
+   rows. A delivery pass whose every eligible POST for some share ended
+   ambiguously reports the step as pending rather than advanced: no helper
+   definitely holds that share, the ambiguous helpers are excluded from the
+   next initial pass, and only tracking can classify them, so rerunning
+   delivery at once would make no progress
+   (`a_share_every_helper_answered_ambiguously_waits_for_tracking_rather_than_advancing`).
 11. Pending rounds are wallet-scoped and remain discoverable until every share
     is confirmed.
 12. An asynchronous submission or tracking pass captures its wallet scope
@@ -1218,7 +1770,7 @@ Regression coverage: `test_share_delegation_lifecycle` in
 `confirmation_does_not_apply_to_a_replaced_share_generation`,
 `initial_delivery_stays_bound_to_its_starting_wallet`,
 `initial_delivery_rejects_a_replaced_share_generation`, and
-`initial_delivery_does_not_recreate_share_after_recovery_cleanup`,
+`initial_delivery_does_not_recreate_share_after_round_deletion`,
 `interrupted_retry_does_not_resolve_a_replaced_share_generation` in
 `share_tracking/tests`,
 `public_vote_writers_reserve_before_validation_and_wait_on_contention`
@@ -1233,7 +1785,14 @@ the embedded recovery proposal to the durable key,
 `share_tracking/tests/initial_delivery.rs` for identity-bound confirmation and
 placement updates, and
 `changed_choice_ignores_stale_share_confirmations` and
-`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
+`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`. Active
+chain-generation preservation is covered by
+`active_singleton_generation_locks_intent_and_recovery_material` and
+`active_batch_generation_locks_every_member_intent`; both reject the intent
+change before vote recovery or helper-delivery rows can be cleared. A rejected
+atomic batch retains the same protection because its authoritative member
+roster still depends on those recovery rows; this is covered by
+`rejected_vote_batch_never_reschedules_its_members`.
 
 ### Configuration and migration
 
@@ -1307,21 +1866,34 @@ Regression tests: `migrate_from_launch_version_preserves_delegation_state`,
 
 ### Recovery cleanup
 
-Explicit recovery cleanup removes share-delivery rows and retryable,
-unconfirmed vote recovery artifacts. It preserves ballot intent, confirmed
-vote positions, and imported delegation capabilities. Full round deletion is
-a separate operation.
+There is no standalone recovery-cleanup operation or
+`clear_recovery_state` primitive. Ordinary cleanup and reset preserve helper
+plans and delivery history required by unresolved or confirmed chain
+submissions.
+
+Explicit round and account deletion are destructive escape hatches. They delete
+the owning rows, and foreign-key cascades remove the round's helper plans and
+delivery history as part of that deletion. The records are not selectively
+cleared while their round remains live.
+
+`VotingDb::delete_round` refuses a round that shows broadcast evidence — a
+delegation transaction hash, a VAN position, a chain submission, a vote, or a
+delivered helper share — so ordinary deletion cannot destroy what recovers a
+round. `VotingDb::delete_round_discarding_recovery` remains the explicit
+per-round escape hatch for a deliberate abandonment and is not refused. Both
+take the round's chain-submission gate before reading the evidence they act on,
+and the checked path re-reads that evidence inside the transaction that
+deletes, so a submission starting concurrently cannot lose its rows.
 
 Enforcement:
-[`recovery::clear`](../zcash_voting/src/recovery.rs) and
-`clear_recovery_state` in
-[`storage/queries/mod.rs`](../zcash_voting/src/storage/queries/mod.rs).
+[`VotingDb::delete_round`](../zcash_voting/src/round/mod.rs),
+[`VotingDb::delete_round_discarding_recovery`](../zcash_voting/src/round/mod.rs),
+[`VotingDb::clear_wallet_state`](../zcash_voting/src/storage/operations.rs),
+and the `rounds` foreign-key cascades.
 
-Regression tests:
-`clear_preserves_recorded_positions_and_resets_unconfirmed_votes` and
-`test_clear_recovery_state_resets_vote_recovery`, plus
-`initial_delivery_does_not_recreate_share_after_recovery_cleanup` for cleanup
-racing active helper delivery.
+Regression coverage must show that ordinary cleanup and reset preserve delivery
+rows, explicit round or account deletion removes their owning rows, and no
+standalone recovery-clear API or storage primitive remains.
 
 ## Helper identity and payload invariants
 
@@ -1370,19 +1942,46 @@ host wallet:
    type around every transport implementation.
 3. **Entropy.** The SDK owns production entropy for complete-plan timing and
    helper ordering. Hosts do not supply randomness to the planning lifecycle.
-4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
-   invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial delivery invocation.** The host obtains `HelperFleetPreflight`
-   from the SDK, calls
-   `prepare_share_delivery` with the complete proposal roster from the
-   authenticated round configuration, and waits for chain confirmation when
-   necessary. It then recovers a fresh `CommittedVote` and calls
-   `submit_prepared_shares`. It supplies the complete current configured fleet
-   and cancellation signal. The SDK validates the stored plan against its
-   original planning fleet while limiting delivery to that current fleet. The
-   host does not select the immediate share, serialize plans, select helpers,
-   derive targets, expose share payloads, filter missing shares, or replan
-   after restart.
+4. **Share-tracking lifecycle.** Supported wallet integrations drive a round's
+   helper shares with `ShareTrackingDriver::run`, which owns the cadence: it
+   repeats a pass on the delay that pass computed, shortens every wait to what
+   is left before vote end, and stops with a `ShareTrackingQuiescence` the host
+   acts on. Once per pass, through `ShareTrackingHostSource`, the host supplies
+   the complete current configured fleet, its clock, and the round's vote end;
+   it also supplies cancellation and the operation epoch, through which app
+   lock and a change of account or round reach the run. The host no longer owns
+   the timer or the round-expiry boundary for share tracking, and cannot derive
+   that schedule for itself — the values a host-side loop was assembled from
+   are crate-private.
+
+   A host may still run a single pass with `track_pending_shares`, and the pass
+   reports its own `next_delay_seconds`, so a host scheduling by hand follows
+   the schedule the SDK computed rather than one it derived. What it takes back
+   is narrower than the whole vote-end boundary: the pass still enforces the
+   recovery cutoff itself, refusing to resubmit within `resubmit_cutoff_seconds`
+   of vote end. What it does not do is bound its own delay — that is computed
+   from share rows alone — or stop polling once the round closes. So a host
+   driving passes by hand owns not sleeping past vote end, and ending the loop
+   there.
+5. **Initial delivery invocation.** Supported wallet integrations bind a
+   `RoundExecutor` to the complete proposal roster from the authenticated round
+   configuration and drive it with `RoundDriver::run`, which supplies the
+   complete current configured fleet, timing, and cancellation once per
+   dispatch through `RoundHostSource`. Running the round's steps is the
+   driver's: it carries the epoch it dispatched under into each step, which an
+   integration selecting one step at a time could not do. An integration that
+   needs per-obligation visibility reads it from `RoundDriveReporter` events
+   rather than by driving steps itself. The executor obtains
+   `HelperFleetPreflight`, prepares every affected delivery plan, advances the
+   chain until confirmation is durable, recovers fresh `CommittedVote` handles,
+   converts them to `ConfirmedVote`, and submits the prepared shares. Lower-level
+   integrations may perform that exact sequence directly; submission is only
+   offered on `ConfirmedVote`, which only the durable confirmation produces. The SDK
+   validates the stored plan against its original planning fleet while limiting
+   delivery to the current fleet. The host does not interpret recovery steps,
+   select atomic-batch members, select the immediate share, serialize plans,
+   select helpers, derive targets, expose share payloads, filter missing shares,
+   or replan after restart.
 6. **Helper-operator trust.** The protocol assumes that the authority supplying
    the wallet's helper configuration is trusted to choose independent operators
    and govern changes. URLs are endpoint identities, not authenticated operator
@@ -1402,13 +2001,29 @@ host wallet:
 ### Exported policy values versus enforced behavior
 
 `share_server_selection_policy` describes a two-second preflight soft window,
-a 30-second hard deadline, and 16 concurrent POSTs.
+a 30-second hard deadline, and 128 concurrent POSTs.
 `HelperClient::preflight_fleet` enforces both windows and derives the readiness
-target internally. `CommittedVote::submit_prepared_shares` enforces the
-process-wide 16-POST ceiling with a shared semaphore. Complete-plan persistence
+target internally. `ConfirmedVote::submit_prepared_shares` enforces the
+process-wide 128-POST ceiling with a shared semaphore. Complete-plan persistence
 lets the SDK validate commitment-wide quota, current-fleet compatibility, and
-restart reuse before network dispatch. These are enforced behavior, not host
-integration metadata.
+restart reuse before network dispatch. The POST ceiling is exercised by
+`full_commitment_reaches_but_never_exceeds_128_posts`; cancellation and
+budget expiry while queued are covered by
+`post_capacity_cancellation_clears_unsent_reservations` and
+`post_capacity_deadline_clears_unsent_reservations`. Generation-bound admission
+is covered by `queued_delivery_rejects_a_deleted_round_before_posting`,
+`queued_delivery_leaves_a_replacement_generation_untouched`,
+`queued_delivery_requires_its_attempt_reservation`, and
+`queued_delivery_does_not_validate_against_a_different_wallet`.
+`helper_fanout_bounds_admitted_workflows` covers the 50-share/one-target boundary
+across four commitments, plus the 32-share/four-target and 12-share/ten-target
+boundaries across two commitments.
+`slow_successful_fanout_keeps_queued_shares_outside_the_deadline` delivers all
+320 placements through 25-second successful POSTs without generating ambiguity.
+`mixed_fleet_admission_cancellation_releases_the_full_charge` covers shared
+admission across wallets with different targets, cancellation while capacity is
+occupied, durable accepted outcomes, and resumption of unsent shares.
+These are enforced behavior, not host integration metadata.
 
 `SHARE_STATUS_MAX_CONCURRENT_POLLS` and
 `SHARE_STATUS_POLL_BUDGET_MILLISECONDS` are enforced tracker behavior, not
@@ -1422,7 +2037,44 @@ canonical identity with `InvalidInput` before storage or network effects.
 Hosts remain responsible only for supplying the configured list from an
 authenticated configuration source.
 
-### Browser local runtime and host durability
+## Staging conformance coverage
+
+The rules in this document are enforced by unit tests, which run against a clean
+`drop` of the database and a scripted helper. Two of them are also exercised
+against a live staging round by `recovery-conformance/`, which is where a claim
+about *multi-helper* behaviour can first be made at all: driven against a single
+configured helper the target count is 1, the per-helper quota is the whole
+commitment, and the minimum planning pool is 1, so the placement rules in
+[Initial fan-out invariants](#initial-fan-out-invariants) and
+[Recovery invariants](#recovery-invariants) have nothing to decide.
+
+`recovery-conformance/tests/helper_fleet_conformance.rs` drives a round through
+ten configured helpers whose reachability changes between runs, and asserts:
+
+- every helper a share was POSTed to was durably journaled first, not just some
+  helper (the reservation rule at
+  [Durable record semantics](#durable-record-semantics));
+- a definite acceptance is never downgraded, including when the helper that
+  gave it becomes unreachable;
+- every share reaches its target number of definite acceptances, where the
+  scenario leaves that target reachable;
+- a resume fills only the deficit — no re-POST to a helper that already accepted
+  while an untried helper remains, which is the ordering rule at
+  [Replenishment and ordering](#replenishment-and-ordering);
+- no share is POSTed to a helper outside the configured fleet.
+
+`recovery-conformance/tests/stall_conformance.rs` covers
+[Transport and timeout invariants](#transport-and-timeout-invariants) from the
+outside: it makes one class of request never answer, below every deadline the
+SDK applies, and asserts that the run ends by itself rather than wedging. The
+helper POST, fan-out, readiness and status-poll budgets in
+[Default limits](#default-limits) are each a target there.
+
+Both are staging suites: they need the network, they kill processes, and they
+are not part of `make test`. They do not replace the unit tests for these rules,
+and a change to the rules must still update the unit tests this document cites.
+
+## Browser local runtime and host durability
 
 The browser entry points use `helper::client::local::LocalHelperClient` with a
 borrowed `CheckpointHook`, an owned-data `HttpTransport`, and a caller-local
@@ -1514,5 +2166,155 @@ A change to helper submission or recovery should answer all of the following:
 - Can cancellation interrupt a wait for the per-share operation lock?
 - Is the trust placed in a helper `confirmed` response still explicit?
 - Do schema and wire changes preserve legacy rows and safe helper identity?
-- Are readiness, status, per-share timeout, and the process-wide 16-POST limit
+- Are readiness, status, per-share timeout, and the process-wide 128-POST limit
   still enforced by their SDK entry points?
+
+
+## Combined delegation and cast integration
+
+A combined delegation-and-cast envelope is one atomic vote unit, including
+when it has one member. Fresh execution persists every signed vote and the
+delegation authorization, then persists the complete helper plan before the
+combined POST. A recovered unit already owned by the chain lifecycle reconciles
+that lifecycle first. Helper delivery starts only after the unit's complete
+confirmation records the final VAN and every VC position. The existing timeout,
+placement, ambiguous-POST and durable delivery rules apply unchanged.
+
+`combined_reconciliation_delivers_later_proposals_while_the_first_is_unfinished`
+exercises combined reconciliation with full helper payloads: every helper POST
+sees the confirmed delegation and both VC positions, and the later proposal
+finishes while the first proposal's slow share remains in flight.
+
+A definite first-POST rejection of the combined unit retires it: the members'
+recovery JSON is cleared, which the existing generation-change triggers turn
+into deleted helper plans and a cleared immediate-share designation, and the
+members' share records are deleted with it. Nothing was delivered, because
+delivery waits for confirmation. The recast is a fresh cast and re-plans its
+helpers before its own POST.
+
+Recasting is bounded. Consecutive rejections of one delegation generation are
+counted durably, and at the cap the bundle stops being planned until a host
+clears the streak, so a delegation the chain keeps refusing cannot re-plan and
+re-deliver helper shares on every run. This changes only how often a recast is
+planned; every share the recast does plan follows the timeout, placement,
+ambiguous-POST and durable delivery rules unchanged.
+`docs/round_orchestration_invariants.md` is the source of truth for the cap.
+
+A route-shaped chain POST response — an HTML 200 fallback page or any 404/405,
+including the gateway's exact JSON error shape — is not a definite rejection.
+An intermediary can reproduce every unsigned shape after forwarding the POST,
+so the response preserves the combined generation and its recovery material; a
+later rejection cannot erase that dispatch ambiguity. This keeps helper
+delivery recoverable if the envelope already reached the chain.
+`replaced_post_response_keeps_combined_recovery_and_ballot_locked` and
+`rejection_after_replaced_post_response_cannot_retire_combined_recovery` cover
+that boundary. The chain-submission specification owns the response
+classification and retry rules.
+
+### Live combined recovery conformance
+
+The `recovery-conformance` matrices exercise fresh combined rounds. Their scoped
+snapshots require the complete authorization and ordered membership, helper plans
+before a fresh POST, and the final VAN plus every contiguous vote position at
+confirmation. Crash resumes preserve already-persisted PCZT/proof fingerprints,
+authorization, and batch membership. A target-only round-driver pass removes the
+voter mnemonic and supplies no signing inputs before normal round completion.
+
+`recovery-conformance/tests/combined_recovery.rs` rejects missing authorization,
+partial membership or confirmation, wrong generation metadata, missing helper
+plans, and evidence belonging to another wallet. The combined POST fault wrapper
+is exercised on both sides of dispatch by
+`combined_post_stalls_on_the_selected_side_of_dispatch`. Live tree-read stalls
+start from a real hashless dispatch because a fresh combined cast does not need
+the initial tree synchronization of a standalone delegation.
+
+The live `whole-fleet-down` case cancels its opening round drive through the
+host control after the first `ShareOutcome` observation. It requires observed
+refusals and unaccepted durable share work before restoring the fleet and
+resuming. This bounds the intentionally unavailable phase without changing SDK
+retry policy or treating a setup failure as evidence of helper recovery.
+
+A normal conformance resume that stops only with `HelperDeliveryIncomplete`
+reopens the same sidecar within the existing six-attempt bound. Background
+tracking can confirm the attempted member while later members of its combined
+unit still owe initial delivery; another round drive executes those obligations.
+A mixed failure or exhausted bound remains a failure, and terminal checks still
+require every member and all 144 shares.
+
+The PIR stall fixture separates padded-note setup from proof-cache warmup. Its
+armed fresh sidecar has stable fixture padding but no imported proofs, so it
+must reach the real PIR transport fault. Fault-free resumes may import the
+control's snapshot-bound proof cache; existing padding is never overwritten.
+`cold_fault_keeps_dummy_nullifiers_but_resume_can_warm_proofs` and
+`seeding_preserves_existing_padding_and_other_wallets_and_rounds` pin this
+fixture behavior without changing the SDK's proof validation or retry rules.
+
+If the foreground finishes but the last background tracking run reaches the
+harness time budget, the parent reopens the same sidecar within its existing
+six-attempt bound. This does not accept cancellation, mixed failures, or
+unrecoverable shares as progress. The final comparison still requires all
+144 shares confirmed; exhaustion remains a failure. The regression
+`only_the_last_recoverable_background_budget_pause_is_resumed` pins this rule.
+
+The conformance share-POST stall also stops through host cancellation after its
+first completed share-delivery result. The injected request must be observed
+and return through the SDK deadline before that callback can stop the drive.
+Fault-free resume restores normal tracking and must confirm every share; the
+host stop does not turn incomplete delivery into a successful round.
+
+### Exact-key delivery revalidation
+
+Initial delivery and the per-share tracking loop reload only the complete
+wallet/round/bundle/proposal/share key, then check the expected nullifier.
+Tracking additionally rejects a row already confirmed since its pass snapshot.
+The tracker still loads its full pending set at pass boundaries. These reads
+must not replace generation checks with cached state or weaken reservations.
+`delivering_one_share_does_not_decode_unrelated_round_rows` guards against
+reintroducing full-round decoding in a per-share operation;
+`full_ballot_delivers_592_shares_with_bounded_admission` exercises a 37-proposal
+ballot, durable acceptance and the 50-delivery limit. Existing queued-deletion,
+wallet-scope, generation-replacement and confirmation-race tests remain binding.
+
+## Attempt-bound helper ingress timeout receipts
+
+Each helper POST can carry a fresh random 32-byte lowercase-hex
+`X-Vote-Ingress-Attempt-V1` token. A trusted helper may answer HTTP 408 with the
+v1 `request_body_timeout` receipt defined in the chain-submission specification,
+with `dispatch: "not_started"` and the exact current attempt token, only when its
+original synchronous body read timed out before enqueue or scheduling work.
+This is protocol binding, not a diagnostic request ID or an idempotency key.
+The client validates JSON content type, its existing response-size limit, the
+complete duplicate-free schema, version, and token before classifying
+`HelperError::NotEnqueuedByServer`.
+
+Initial delivery may retry this definite transient failure using the existing
+200/600 ms backoffs and at most three attempts. Each actual POST gets a new token.
+An insufficient remaining deadline returns the held definite failure without
+sleeping into ambiguity. Cancellation stops further retries. Recovery still
+makes one attempt per helper; a receipt cannot erase a previous acceptance,
+ambiguous attempt, or interrupted request. It records no acceptance, changes no
+placement target or schedule, and creates no additional durable state.
+
+An unrecognized HTTP 408 retains the existing definite non-transient status
+classification and never gains same-helper retry permission. Generic transport
+timeouts, lost receipts, and incomplete response reads remain ambiguous. A
+complete matching receipt says nothing about earlier attempts. The trusted
+HTTPS ingress must neither cache receipts nor replay POSTs nor synthesize a
+receipt after forwarding work; token binding does not protect against a lying
+trusted helper.
+
+`HelperTransport::post_json_with_headers` is an optional extension whose default
+calls the legacy method without forwarding optional headers. Existing custom
+transports therefore remain compatible and cannot normally obtain a matching
+receipt until they forward the token. HyperTransport and the Arc and crash-test
+transport wrappers forward the header over the caller's existing route.
+
+Conformance: `helper_receipts_retry_with_fresh_tokens_and_existing_backoff`,
+`helper_receipts_obey_initial_budget_and_recovery_single_attempt`,
+`invalid_helper_receipts_never_authorize_retry`,
+`lost_helper_receipt_stays_ambiguous_and_stops_retries`,
+`helper_receipt_deadline_returns_definite_failure_without_waiting`,
+`helper_receipt_cancellation_stops_before_retry`,
+`legacy_helper_transport_keeps_generic_timeout_handling`,
+`exhausted_helper_receipts_clear_fresh_reservation_without_acceptance`, and
+`helper_receipt_preserves_prior_ambiguity_after_reopen`.

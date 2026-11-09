@@ -5,3 +5,6 @@ pub mod health;
 pub(crate) mod runtime;
 pub mod transport;
 pub mod url;
+
+#[cfg(test)]
+pub(crate) mod tests;

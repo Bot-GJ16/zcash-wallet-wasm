@@ -13,7 +13,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 RUN rustup set auto-self-update disable && \
-    rustup toolchain install nightly-2025-11-15 \
+    rustup toolchain install nightly-2026-10-20 \
     --profile minimal --component rust-src --component clippy --component rustfmt \
     --target wasm32-unknown-unknown
 

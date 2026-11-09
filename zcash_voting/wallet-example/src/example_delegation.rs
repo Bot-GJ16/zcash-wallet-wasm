@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use voting_crypto_deps::pasta_curves::group::ff::PrimeField;
 
+use voting_crypto_deps::zip32::{fingerprint::SeedFingerprint, AccountId};
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::backend::{orchard, pasta_curves, zcash_client_sqlite, zcash_keys};
@@ -19,10 +20,7 @@ use zcash_voting::prelude::{
     PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
 };
 use zcash_voting::wire::PirLayout;
-use zcash_voting::{
-    connect_pir_blocking, BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams,
-};
-use zip32::{fingerprint::SeedFingerprint, AccountId};
+use zcash_voting::{BundlePolicy, HyperTransport, PirFleet, VotingRoundParams};
 
 /// Inputs for preparing one reusable delegation bundle context.
 ///
@@ -279,9 +277,8 @@ where
     C: std::borrow::Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    prepared
-        .precompute(voting_db, wallet_db, &pir_client)
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| prepared.precompute(voting_db, wallet_db, session))
         .context("precompute delegation bundle")
 }
 
@@ -321,14 +318,16 @@ pub fn warm_pir_proof_cache_for_notes(
     pir_layout: PirLayout,
     pir_server_url: &str,
 ) -> Result<zcash_voting::PirCachePrecomputeResult> {
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    zcash_voting::prelude::precompute_pir_proofs(
-        voting_db,
-        notes,
-        bundle_policy,
-        network,
-        &pir_client,
-    )
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| {
+        zcash_voting::prelude::precompute_pir_proofs(
+            voting_db,
+            notes,
+            bundle_policy,
+            network,
+            session,
+        )
+    })
     .context("warm PIR proof cache")
 }
 
@@ -360,15 +359,17 @@ pub fn precompute_snapshot_bundles(
     pir_layout: PirLayout,
     pir_server_url: &str,
 ) -> Result<zcash_voting::prelude::SnapshotBundlePrecomputeReport> {
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    zcash_voting::prelude::precompute_snapshot_bundles(
-        voting_db,
-        round_id,
-        notes,
-        bundle_policy,
-        &pir_client,
-        network,
-    )
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| {
+        zcash_voting::prelude::precompute_snapshot_bundles(
+            voting_db,
+            round_id,
+            notes,
+            bundle_policy,
+            session,
+            network,
+        )
+    })
     .context("precompute snapshot bundles")
 }
 
@@ -399,9 +400,8 @@ pub fn prove_and_submit_delegation_bundle(
         .context("load delegation signing request")?;
     let (sig, sighash) = example_sign_delegation_request(seed, signing_request)?;
 
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    prepared
-        .prove(voting_db, &pir_client, &progress)
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| prepared.prove(voting_db, session, &progress))
         .context("prove delegation bundle")?;
 
     prepared
@@ -459,9 +459,8 @@ pub fn prove_and_submit_keystone_delegation_bundle(
     // Generate the proof using warmed witnesses and PIR rows, without
     // rebuilding the PCZT that Keystone already signed.
     let progress = NoopProgressReporter;
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    prepared
-        .prove(voting_db, &pir_client, &progress)
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| prepared.prove(voting_db, session, &progress))
         .context("prove delegation bundle")?;
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
@@ -499,19 +498,27 @@ fn example_sign_delegation_request(
         .map_err(|_| anyhow::anyhow!("invalid account_index {}", request.account_index))?;
     let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account)
         .context("derive account unified spending key")?;
-    let sk = *usk.orchard();
+    let sk = usk.orchard().to_owned();
     let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
     let alpha = Option::<pasta_curves::pallas::Scalar>::from(
         pasta_curves::pallas::Scalar::from_repr(request.alpha),
     )
     .ok_or_else(|| anyhow::anyhow!("delegation alpha is not a valid Pallas scalar"))?;
-    let rsk = ask.randomize(&alpha);
+    let rsk = ask.randomize(&voting_crypto_deps::spend_auth_randomizer(&alpha));
     let mut rng = voting_crypto_deps::rand::rngs::OsRng;
     let sig = rsk.sign(&mut rng, &request.sighash);
     Ok(((&sig).into(), request.sighash))
 }
 
-fn connect_pir(pir_layout: PirLayout, pir_server_url: &str) -> Result<PirClientBlocking> {
-    connect_pir_blocking(pir_layout, pir_server_url, Arc::new(HyperTransport::new()))
-        .context("connect to PIR server")
+/// One-endpoint PIR fleet.
+///
+/// A wallet with several PIR endpoints passes them all and gets ordered
+/// failover; this example takes a single URL from the command line.
+fn pir_fleet(pir_layout: PirLayout, pir_server_url: &str) -> Result<PirFleet> {
+    PirFleet::new(
+        &[pir_server_url.to_string()],
+        pir_layout,
+        Arc::new(HyperTransport::new()),
+    )
+    .context("connect to PIR server")
 }

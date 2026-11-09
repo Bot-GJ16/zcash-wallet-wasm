@@ -39,56 +39,6 @@ pub(super) fn delete_for_replaced_vote(
     Ok(())
 }
 
-pub fn clear_stale_share_delegations_for_intent(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    proposal_id: u32,
-    skipped: bool,
-    choice: Option<u32>,
-) -> Result<u64, VotingError> {
-    let deleted_row_count = if skipped {
-        conn.execute(
-            "DELETE FROM share_delegations
-             WHERE round_id = :round_id
-               AND wallet_id = :wallet_id
-               AND proposal_id = :proposal_id",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":proposal_id": proposal_id as i64,
-            },
-        )
-    } else if let Some(choice) = choice {
-        conn.execute(
-            "DELETE FROM share_delegations
-             WHERE round_id = :round_id
-               AND wallet_id = :wallet_id
-               AND proposal_id = :proposal_id
-               AND NOT EXISTS (
-                   SELECT 1 FROM votes
-                   WHERE votes.round_id = share_delegations.round_id
-                     AND votes.wallet_id = share_delegations.wallet_id
-                     AND votes.bundle_index = share_delegations.bundle_index
-                     AND votes.proposal_id = share_delegations.proposal_id
-                     AND votes.choice = :choice
-               )",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":proposal_id": proposal_id as i64,
-                ":choice": choice as i64,
-            },
-        )
-    } else {
-        Ok(0)
-    }
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear stale share delegations: {}", e),
-    })?;
-    Ok(deleted_row_count as u64)
-}
-
 /// Splits persisted helper identities into canonical entries and legacy
 /// entries accepted by older schemas that no longer canonicalize. Legacy
 /// entries are never contacted or counted, but rewrites preserve them verbatim
@@ -269,7 +219,14 @@ pub(crate) fn add_attempting_server_for_generation(
         if placement_capacity_reached {
             return Ok(ShareAttemptReservation::PlacementCapacityReached);
         }
-        debug_assert!(state.begin(&server_url)?);
+        // Called unconditionally: `begin` is what puts the helper in the
+        // in-flight set, and `debug_assert!` compiles its argument out of
+        // release builds entirely. Inside the assertion, a release build wrote
+        // `attempting_urls = []` and still reported `Started`, so the marker
+        // this reservation exists to create was never recorded — while every
+        // test, running with debug assertions on, saw it work.
+        let began = state.begin(&server_url)?;
+        debug_assert!(began, "a reserved helper must not already be in flight");
         let updated_attempting_json = serialize_url_list(
             state.in_flight_urls(),
             &preserved_legacy_in_flight_urls,
@@ -434,7 +391,7 @@ pub(crate) fn remove_attempting_server_for_generation(
 ///
 /// This raw SQL helper is crate-internal because callers must provide a
 /// nullifier that matches the persisted vote recovery bundle. Wallet
-/// integrations should use `CommittedVote::submit_prepared_shares`, which
+/// integrations should use `ConfirmedVote::submit_prepared_shares`, which
 /// derives that nullifier and owns journal-before-dispatch ordering.
 ///
 /// All reported helper URLs must canonicalize. Existing evidence is merged
@@ -494,8 +451,8 @@ pub(crate) fn record_share_delegation_for_vote_generation(
 ) -> Result<u64, VotingError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to lock committed vote for helper delivery: {e}"),
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to lock committed vote for helper delivery", &e)
         })?;
     let current_commitment_bundle_json: Option<String> = tx
         .query_row(
@@ -536,8 +493,8 @@ pub(crate) fn record_share_delegation_for_vote_generation(
         submit_at,
         &mut || {},
     )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit helper-share generation transaction: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("failed to commit helper-share generation transaction", &e)
     })?;
     Ok(submit_at)
 }

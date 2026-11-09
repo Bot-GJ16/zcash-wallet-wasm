@@ -29,130 +29,84 @@ transport.
 
 ## Building
 
-```bash
-cargo check                   # check the default Zakura wallet path
-cargo build -p zcash_voting  # build just the core library
-```
-
-Run the LRZ Ironwood / NU6.3 tests with:
+Use the supported Make targets, which keep separate build directories for each
+backend:
 
 ```bash
-cargo test -p zcash_voting --no-default-features --features lrz --locked
+make check  # type-check the default Zakura stack
+make test   # run the default Zakura test suite
 ```
+
+Use `make test-lrz` for LRZ/backend-feature changes and `make test-vct` for
+changes to the tree crates. Run `make help` for the complete list.
+
+## Releases and Branching
+
+`main` is the development line for the next release. Each shipped release
+series is maintained on a `release/vMAJOR.MINOR.x` branch, and semver-compatible
+fixes reach those branches through reviewed automated backports rather than
+direct pushes. The historical `release/v3.x` branch and the
+`release/v4.0.x` and `release/v5.0.x` lines are currently supported.
+
+See [Release branches and backports](docs/release-branches.md) for the backport
+labels and the rules for what may ship on a maintenance line, and
+[CONTRIBUTING.md](CONTRIBUTING.md) for the build, test, and code standards.
 
 ## Wallet API Lifecycle
 
-New wallet integrations should import `zcash_voting::prelude::*` and use the
-stage-oriented API:
+**Upgrading from v5?** See [Migrating from 5.1 to 5.2](docs/migrating-to-common-v3.md)
+for the Common 4 dependency and type changes.
 
-- `round::*` creates rounds and binds eligible notes into bundles. Planning
-  trims the low-value bundle tail so a concentrated holder emits fewer
-  delegation submissions, bounded by the smaller of 1% of selected note value
-  and 1,000 ZEC by default. `PrivacyTrim` reports the raw note value excluded,
-  not bundle-quantized voting weight.
-- `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
-  witnesses for vote proofs. `precompute_pir_proofs` warms PIR nullifier proofs in
-  the background before any round or bundle exists (no hotkey needed), keyed by
-  network and served IMT root; it plans the selected note set with the caller's
-  `BundlePolicy` first so a dust tail is not fetched. The delegation prove path
-  reads the same cache. `validate_cached_pir_proofs` checks warmed proofs against
-  a round's `nullifier_imt_root` offline. Snapshots coexist in the cache;
-  leftover roots are unused, and background warmup prunes cache rows created
-  more than four weeks ago.
-- `delegate::*` builds delegation PCZTs, proves delegation, prepares signing
-  requests, and assembles signed delegation submissions. Wallets keep root seed
-  material outside this crate, sign requests at the wallet boundary, and pass
-  only signature bytes back through `PreparedSigner::signature`.
-- `confirmation::*` parses delegation and cast-vote tx events, then records tx
-  hashes and tree positions atomically.
-- `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
-  `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
-- `share::*` computes helper-share nullifiers and applies scheduling policy.
-  `HelperClient::preflight_fleet`, `CommittedVote::prepare_share_delivery`, and
-  `CommittedVote::submit_prepared_shares` own validated, journaled initial
-  delivery, while `track_pending_shares` requires two distinct configured
-  helpers to agree before persisting confirmation.
-- `session::*` records durable ballot intent and returns a round-level
-  `RoundPlan` with ordered `NextStep`s for restart recovery. Wallets should
-  write `Decision::Choice` with the proposal's declared option count before
-  starting a cast-vote flow, write `Decision::Skipped` with the same option
-  count for proposals the user intentionally leaves blank, and use `resume_plan`
-  after restart to decide whether to delegate, poll delegation/vote
-  transactions, cast remaining votes, or confirm helper shares.
-  `CastVote` steps include the recorded choice. `SubmitVote` resumes one
-  singleton through `vote::submission`, `vote::record_submission`, and
-  `confirmation::confirm_vote_submission`. `SubmitVoteBatch` and
-  `PollVoteBatch` identify the first ordered action as a recovery anchor. Pass
-  that key to `vote::recover_atomic_vote_batch`, submit its canonical
-  `batch_json` once, persist the shared tx hash with
-  `vote::record_batch_submission`, and record its ordered event with
-  `confirmation::confirm_vote_batch_submission`. Recover each
-  `vote::CommittedVote`, validate and rank the complete helper fleet with
-  `HelperClient::preflight_fleet`, then call
-  `CommittedVote::prepare_share_delivery` with the complete proposal id roster
-  from the authenticated round configuration. The SDK requires matching
-  terminal ballot intents and derives the round's single immediate share while
-  atomically creating or reloading the complete plan. After vote confirmation,
-  recover a fresh `CommittedVote`, then call
-  `CommittedVote::submit_prepared_shares` with the complete current fleet. The
-  crate validates every payload, rebuilds it with the confirmed VC position,
-  and journals delivery before dispatch. After restart, prepare again to load
-  the original plan; never replan only missing shares. Re-run `resume_plan`
-  after each durable action because later work may depend on on-chain
-  confirmations.
-  `open_proposals` contains only proposals with no terminal decision yet.
+**Upgrading from v3.x or v4.0.x?** Start with
+[Migrating to v5](docs/migrating-to-v5.md) and the
+[v5 release notes](CHANGELOG.md#v500). The guide distinguishes the release
+lines, maps removed APIs to their replacements, and explains the limits on
+upgrading a wallet with in-flight legacy submissions.
 
-The Zcash-format transaction signed during delegation is specified separately
-in [Delegation signing transaction (TX1)](docs/delegation-signing-transaction.md).
-It distinguishes the PCZT-only signing artifact from the vote-chain
-delegation submission and includes software-wallet and Keystone examples.
-The companion
-[delegation capability handoff](docs/exporting-to-external-software.md)
-documents the public-target, delivery-receipt, and zero-migration import flow
-for cases where the funds controller and voter are separate parties, including
-custody provider integrations.
+New integrations should import `zcash_voting::prelude::*` and use the SDK's
+round and share-tracking drivers:
 
-## Migrating 0.11 to 0.12
+1. Open the wallet's voting sidecar and persist bundle setup through
+   `DelegationPipeline::setup_bundles` or the `round` APIs. Bind the round,
+   authenticated proposal roster, network, and voting hotkey to a
+   `RoundExecutor`.
+2. Record choices and explicit skips with `set_ballot_intents`. Supply a
+   `RoundHostSource` with fresh timing, authenticated service configuration,
+   and delegation signing inputs. Software wallets supply a `SpendAuthSigner`;
+   Keystone wallets supply device signatures. Root wallet seeds stay in the
+   wallet.
+3. Call `RoundDriver::run`. It selects work from durable state, overlaps
+   independent bundles, owns chain submission/recovery and initial helper
+   delivery, and returns a `RoundRunReport`. Read its stop reason, failures,
+   and durable effects before deciding whether to collect input or run again.
+4. Run `ShareTrackingDriver` for pending helper shares, including after restart.
+   The default foreground plan confirms only the designated immediate share;
+   chain confirmation and remaining helper confirmation are separate milestones.
 
-- Replace `VotingDb::build_vote_commitment` + `vote_commitment::sign_cast_vote`
-  + `VotingDb::build_share_payloads` orchestration with `vote::commit`.
-- Replace custom cast-vote recovery JSON with `vote::serialize_recovery` and
-  `vote::parse_recovery`.
-- Replace direct `VoteTreeSync` ownership with
-  `precompute::{sync_vote_tree, van_witness, reset_vote_tree}`.
-- Replace direct `share_tracking` calls with `share::*`, and `share_policy`
-  imports with `share::policy::*`.
-- Replace raw vote/share workflow SQL with
-  `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}`.
-- Replace wallet-local "what comes next" recovery planning with
-  `session::resume_plan`; fetch execution material through crate APIs such as
-  `vote::submission`, `vote::CommittedVote::recover`, `share::*`, and the tx hash
-  accessors, then keep wallet-specific networking, proof execution, and UI
-  routing at the wallet boundary.
-- Replace wallet-local delegation proof and signing orchestration with
-  `delegate::PreparedDelegationBundle`. Callers can use the prepared lifecycle
-  for setup, witness completion, proving, signing request construction, signed
-  payload assembly, and Keystone request construction.
-- Use `confirmation::{confirm_delegation_submission, confirm_vote_submission,
-  confirm_vote_batch_submission}`
-  after chain clients report confirmed delegation or cast-vote tx events. The
-  confirmation API parses the chain `leaf_index` events and records tx hashes,
-  VAN positions, and VC positions atomically.
-- Use `vote::commit` for one singleton. The existing `vote::commit_batch`
-  remains as a one-draft compatibility wrapper for singleton submission, while
-  `vote::commit_atomic_vote_batch` builds one atomic, ordered multi-question
-  transaction. The distinct `SignedVoteCommitments` and `SignedVoteBatch`
-  result types keep the singleton and atomic submission endpoints separate.
-  Use `vote::submission`, `vote::CommittedVote::recover`,
-  `vote::record_submission`, and `vote::record_vc_position` for the singleton
-  lifecycle. Wallets should not write recovery JSON, submission flags, or vote
-  commitment positions directly.
+Fresh local delegation and chosen proposals are submitted together through
+`delegate-and-cast-vote-batch`, including a single chosen proposal. This path
+needs no initial vote-tree sync. Existing standalone and imported delegations
+keep their recovery paths; multiple due proposals on an existing delegation
+use `cast-vote-batch`. The target chain must support these routes. Atomic
+transactions reveal that the included proposal actions were submitted together.
 
-Pre-launch wallet databases with older schema versions are reset when opened by
-this branch; callers that need to preserve test data should export it before
-upgrading the crate.
+Use `HyperTransport::with_route` over a host `RouteHttp` for Tor or proxies,
+and bind routed transports for PIR and tree sync as well as helper and chain
+traffic. `PirFleet` supplies endpoint failover. The SDK handles request
+encoding, timeout classification, and durable dispatch evidence.
 
-The workspace uses the published `voting-circuits 0.12.1` release.
+Stage APIs remain available for specialized integrations. `delegate` owns
+setup, proof reuse, and signing requests; `vote` owns commitment preparation and
+persistence; `ChainSubmissionClient` owns submission and confirmation; and
+`ConfirmedVote` owns initial helper submission. Hosts do not parse chain events,
+write confirmation columns, or execute `NextStep` values themselves.
+`session::resume_plan` remains a read-only projection for UI and recovery status.
+
+See the [migration walkthrough](docs/migrating-to-v5.md#replace-the-host-workflow),
+[wallet examples](wallet-example/src),
+[delegation signing transaction](docs/delegation-signing-transaction.md),
+[capability handoff](docs/exporting-to-external-software.md), and
+[optional observability](docs/observability.md).
 
 ## Dependency Strategy
 
@@ -160,9 +114,9 @@ The LRZ backend uses one Ironwood dependency stack:
 
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths.
-- **`pczt 0.9.2`, `zcash_client_backend 0.24.0-rc.7`,
-  `zcash_client_sqlite 0.22.0-rc.7`, `zcash_keys 0.16.1`,
-  `zcash_primitives 0.30.0`, and `zcash_protocol 0.10.4`** from published
+- **`pczt 0.9.3`, `zcash_client_backend 0.24.0`,
+  `zcash_client_sqlite 0.22.0`, `zcash_keys 0.16.1`,
+  `zcash_primitives 0.30.1`, and `zcash_protocol 0.10.5`** from published
   librustzcash releases.
 - **`voting-circuits 0.12.1`** from
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
@@ -174,7 +128,7 @@ build with `--no-default-features --features lrz` for the LRZ VCT backend.
 
 The published `zcash_voting` crate defaults to Zakura and exposes LRZ through
 the mutually exclusive `lrz` feature. Wallet-family selection is consolidated
-in published `zakura-wallet-lib 0.1.0-rc4`, whose complete `zakura` and `lrz`
+in published `zakura-wallet-lib 0.1.0-rc5`, whose complete `zakura` and `lrz`
 modes never weak-reference both backend families. Gemini selects
 `zcash_voting` with `default-features = false, features = ["lrz"]`; Vizor uses
 the defaults. External-consumer regression tests verify that Gemini's Cargo
@@ -182,7 +136,7 @@ lockfile and resolved metadata contain no Zakura forks.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.
-The current PIR and IMT releases require Rust 1.91 or newer.
+The current PIR and IMT releases require Rust 1.97 or newer.
 
 ## FFI
 

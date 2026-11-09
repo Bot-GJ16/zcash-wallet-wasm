@@ -1,5 +1,5 @@
 //! Synthetic signatures and placeholder proof bytes for orchestration tests only.
-use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+use zcash_voting::backend::zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 use zcash_voting::{
     backend::{orchard, pczt, zcash_keys},
     delegate,
@@ -81,10 +81,14 @@ pub fn complete_bundle_for_stored_network(
     {
         return canonical.clone();
     }
-    use base64::{Engine, engine::general_purpose::STANDARD};
+    use base64::Engine as _;
     let wire: zcash_voting::wire::DelegationSubmissionWire =
         serde_json::from_slice(canonical.json_bytes()).unwrap();
-    let decode = |value: &str| STANDARD.decode(value).unwrap();
+    let decode = |value: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .unwrap()
+    };
     db.store_delegation_proof(
         &params.vote_round_id,
         bundle,
@@ -191,6 +195,9 @@ fn prepare_selected_bundles(
                     .unwrap();
             signer
                 .sign_ironwood(
+                    zcash_voting::backend::rand10::rand_core::UnwrapErr(
+                        zcash_voting::backend::rand10::rngs::SysRng,
+                    ),
                     setup.action_index,
                     &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
                 )

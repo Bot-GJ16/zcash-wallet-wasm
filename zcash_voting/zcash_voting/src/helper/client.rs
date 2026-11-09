@@ -148,6 +148,10 @@ pub enum ShareSubmissionStatus {
 /// A helper request that did not produce a usable answer.
 #[derive(Clone, Debug)]
 pub enum HelperError {
+    /// A matching ingress receipt proves this attempt never enqueued the share.
+    /// Earlier ambiguous attempts remain unresolved. Initial delivery may retry
+    /// within its existing budget; recovery still makes only one POST per helper.
+    NotEnqueuedByServer,
     /// The caller supplied a request that cannot be dispatched safely.
     InvalidRequest { message: String },
     /// The request never completed. Carries the ambiguity of a timeout.
@@ -184,7 +188,7 @@ impl HelperError {
     /// retryable for an idempotent GET.
     fn is_transient(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::NotEnqueuedByServer => true,
             Self::Status { status } => matches!(status, 429 | 500 | 502 | 503 | 504),
             Self::InvalidRequest { .. }
             | Self::Decode { .. }
@@ -215,6 +219,7 @@ impl HelperError {
 impl std::fmt::Display for HelperError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotEnqueuedByServer => write!(f, "helper request body timed out before enqueue"),
             Self::InvalidRequest { message } => write!(f, "invalid helper request: {message}"),
             Self::Transport(error) => write!(f, "{error}"),
             Self::Status { status } => write!(f, "helper returned HTTP {status}"),
@@ -362,15 +367,78 @@ fn require_valid_duration(duration: Duration, name: &str) -> Result<(), VotingEr
 /// bounded number of independent status requests concurrently.
 #[derive(Clone)]
 pub struct HelperClient {
+    pub(crate) observations: Option<crate::ObservationScope>,
     transport: Arc<dyn HelperTransport>,
     health: HelperHealth,
     config: HelperClientConfig,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl HelperClient {
+    /// Propagates a workflow's borrowed context into nested helper operations.
+    pub(crate) fn observing(&self, observations: &crate::ObservationScope) -> Self {
+        Self {
+            observations: Some(observations.clone()),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn observation_scope(&self) -> crate::ObservationScope {
+        self.observations
+            .clone()
+            .unwrap_or_else(|| crate::ObservationScope::disabled())
+    }
+
     /// Canonicalizes and probes a complete helper fleet for share planning.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn preflight_fleet(
+        &self,
+        server_urls: &[String],
+    ) -> Result<HelperFleetPreflight, VotingError> {
+        self.observe_preflight_fleet(server_urls).await
+    }
+
+    pub(crate) async fn observe_preflight_fleet(
+        &self,
+        server_urls: &[String],
+    ) -> Result<HelperFleetPreflight, VotingError> {
+        let observations = self.observation_scope();
+        let stage = observations.stage("helper::preflight_fleet");
+        let client = self.observing(stage.scope());
+        let result = client.execute_preflight_fleet(server_urls).await;
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn preflight_fleet_with_report(
+        &self,
+        server_urls: &[String],
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<HelperFleetPreflight, VotingError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let client = self.observing(invocation.scope());
+        let result = client.observe_preflight_fleet(server_urls).await;
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("preflight_fleet", outcome, result)
+    }
+
+    pub(crate) async fn execute_preflight_fleet(
         &self,
         server_urls: &[String],
     ) -> Result<HelperFleetPreflight, VotingError> {
@@ -411,6 +479,8 @@ impl HelperClient {
             transport,
             health,
             config,
+
+            observations: None,
         }
     }
 
@@ -553,6 +623,75 @@ impl HelperClient {
         now_seconds: u64,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ShareStatus, HelperError> {
+        self.observe_share_status(server_url, round_id, share_id, now_seconds, cancel)
+            .await
+    }
+
+    pub(crate) async fn observe_share_status(
+        &self,
+        server_url: &str,
+        round_id: &str,
+        share_id: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ShareStatus, HelperError> {
+        let observations = self.observation_scope().for_helper(server_url);
+        observations.bind_round_id(round_id);
+        let stage = observations.stage("helper::share_status");
+        let client = self.observing(stage.scope());
+        let result = client
+            .execute_share_status(server_url, round_id, share_id, now_seconds, cancel)
+            .await;
+        let outcome = match &result {
+            Ok(ShareStatus::Pending) => crate::ObservationOutcome::Pending,
+            Ok(ShareStatus::Confirmed) => crate::ObservationOutcome::Succeeded,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::helper_error_kind),
+        );
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn share_status_with_report(
+        &self,
+        server_url: &str,
+        round_id: &str,
+        share_id: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ShareStatus, HelperError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let client = self.observing(invocation.scope());
+        let result = client
+            .observe_share_status(server_url, round_id, share_id, now_seconds, cancel)
+            .await;
+        let outcome = match &result {
+            Ok(ShareStatus::Pending) => crate::ObservationOutcome::Pending,
+            Ok(ShareStatus::Confirmed) => crate::ObservationOutcome::Succeeded,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        invocation.complete("share_status", outcome, result)
+    }
+
+    pub(crate) async fn execute_share_status(
+        &self,
+        server_url: &str,
+        round_id: &str,
+        share_id: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ShareStatus, HelperError> {
         let server_url = canonicalize_helper_base_url(server_url).map_err(invalid_request)?;
         let round_id = normalize_round_id(round_id).map_err(invalid_request)?;
         let share_id = validate_hex_path_segment(share_id, "share_id").map_err(invalid_request)?;
@@ -561,10 +700,10 @@ impl HelperClient {
 
         let request_started = tokio::time::Instant::now();
         let result = self
-            .with_retry(cancel, true, None, |_| {
+            .with_retry(cancel, true, None, |_, attempt_client| {
                 let url = url.clone();
                 async move {
-                    let response = self
+                    let response = attempt_client
                         .get(&url, self.config.request_timeout)
                         .await
                         .map_err(HelperError::Transport)?;
@@ -599,6 +738,71 @@ impl HelperClient {
         now_seconds: u64,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ShareSubmissionStatus, HelperError> {
+        self.observe_submit_share(server_url, share_wire_json, now_seconds, cancel)
+            .await
+    }
+
+    pub(crate) async fn observe_submit_share(
+        &self,
+        server_url: &str,
+        share_wire_json: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ShareSubmissionStatus, HelperError> {
+        let observations = self.observation_scope().for_helper(server_url);
+        let stage = observations.stage("helper::submit_share");
+        let client = self.observing(stage.scope());
+        let result = client
+            .execute_submit_share(server_url, share_wire_json, now_seconds, cancel)
+            .await;
+        let outcome = match &result {
+            Ok(ShareSubmissionStatus::Queued) => crate::ObservationOutcome::Pending,
+            Ok(ShareSubmissionStatus::Duplicate) => crate::ObservationOutcome::Reused,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::helper_error_kind),
+        );
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn submit_share_with_report(
+        &self,
+        server_url: &str,
+        share_wire_json: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ShareSubmissionStatus, HelperError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let client = self.observing(invocation.scope());
+        let result = client
+            .observe_submit_share(server_url, share_wire_json, now_seconds, cancel)
+            .await;
+        let outcome = match &result {
+            Ok(ShareSubmissionStatus::Queued) => crate::ObservationOutcome::Pending,
+            Ok(ShareSubmissionStatus::Duplicate) => crate::ObservationOutcome::Reused,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        invocation.complete("submit_share", outcome, result)
+    }
+
+    pub(crate) async fn execute_submit_share(
+        &self,
+        server_url: &str,
+        share_wire_json: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ShareSubmissionStatus, HelperError> {
         self.submit_share_with_timeout(
             server_url,
             share_wire_json,
@@ -627,25 +831,46 @@ impl HelperClient {
         timeout: Duration,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<ShareSubmissionStatus, HelperError> {
-        if timeout.is_zero() {
-            return Err(HelperError::InvalidRequest {
-                message: "share submission timeout must be nonzero".to_string(),
-            });
+        let observations = self.observation_scope().for_helper(server_url);
+        let stage = observations.stage("helper::post_share");
+        let observed_client = self.observing(stage.scope());
+        let result = async {
+            if timeout.is_zero() {
+                return Err(HelperError::InvalidRequest {
+                    message: "share submission timeout must be nonzero".to_string(),
+                });
+            }
+            let server_url = canonicalize_helper_base_url(server_url).map_err(invalid_request)?;
+            let body = validate_share_body(share_wire_json)?;
+            let request_started = tokio::time::Instant::now();
+            let result = observed_client
+                .post_share(
+                    &server_url,
+                    body,
+                    cancel,
+                    false,
+                    timeout.min(self.config.post_timeout),
+                    deadline,
+                )
+                .await;
+            self.score(&server_url, &result, now_seconds, request_started);
+            result
         }
-        let server_url = canonicalize_helper_base_url(server_url).map_err(invalid_request)?;
-        let body = validate_share_body(share_wire_json)?;
-        let request_started = tokio::time::Instant::now();
-        let result = self
-            .post_share(
-                &server_url,
-                body,
-                cancel,
-                false,
-                timeout.min(self.config.post_timeout),
-                deadline,
-            )
-            .await;
-        self.score(&server_url, &result, now_seconds, request_started);
+        .await;
+        let outcome = match &result {
+            Ok(ShareSubmissionStatus::Queued) => crate::ObservationOutcome::Pending,
+            Ok(ShareSubmissionStatus::Duplicate) => crate::ObservationOutcome::Reused,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::helper_error_kind),
+        );
         result
     }
 
@@ -661,6 +886,71 @@ impl HelperClient {
     /// time spent completing the operation.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn resubmit_share(
+        &self,
+        server_url: &str,
+        share_wire_json: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ShareSubmissionStatus, HelperError> {
+        self.observe_resubmit_share(server_url, share_wire_json, now_seconds, cancel)
+            .await
+    }
+
+    pub(crate) async fn observe_resubmit_share(
+        &self,
+        server_url: &str,
+        share_wire_json: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ShareSubmissionStatus, HelperError> {
+        let observations = self.observation_scope().for_helper(server_url);
+        let stage = observations.stage("helper::resubmit_share");
+        let client = self.observing(stage.scope());
+        let result = client
+            .execute_resubmit_share(server_url, share_wire_json, now_seconds, cancel)
+            .await;
+        let outcome = match &result {
+            Ok(ShareSubmissionStatus::Queued) => crate::ObservationOutcome::Pending,
+            Ok(ShareSubmissionStatus::Duplicate) => crate::ObservationOutcome::Reused,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::helper_error_kind),
+        );
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn resubmit_share_with_report(
+        &self,
+        server_url: &str,
+        share_wire_json: &str,
+        now_seconds: u64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ShareSubmissionStatus, HelperError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let client = self.observing(invocation.scope());
+        let result = client
+            .observe_resubmit_share(server_url, share_wire_json, now_seconds, cancel)
+            .await;
+        let outcome = match &result {
+            Ok(ShareSubmissionStatus::Queued) => crate::ObservationOutcome::Pending,
+            Ok(ShareSubmissionStatus::Duplicate) => crate::ObservationOutcome::Reused,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        invocation.complete("resubmit_share", outcome, result)
+    }
+
+    pub(crate) async fn execute_resubmit_share(
         &self,
         server_url: &str,
         share_wire_json: &str,
@@ -701,20 +991,24 @@ impl HelperClient {
             if cancel() {
                 return Err(HelperError::Cancelled);
             }
-            return self
+            let observations = self.observation_scope().attempt(1);
+            let client = self.observing(&observations);
+            return client
                 .post_json(&url, body, post_timeout)
                 .await
                 .and_then(parse_submission_response);
         }
 
-        self.with_retry(cancel, false, deadline, |remaining| {
+        self.with_retry(cancel, false, deadline, |remaining, attempt_client| {
             let url = url.clone();
             let body = body.clone();
             let attempt_timeout = remaining
                 .map(|remaining| post_timeout.min(remaining))
                 .unwrap_or(post_timeout);
             async move {
-                let response = self.post_json(&url, body, attempt_timeout).await?;
+                let response = attempt_client
+                    .post_json(&url, body, attempt_timeout)
+                    .await?;
                 parse_submission_response(response)
             }
         })
@@ -729,12 +1023,32 @@ impl HelperClient {
         url: &str,
         timeout: Duration,
     ) -> Result<HelperResponse, HelperTransportError> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(HelperTransportError::Timeout)?;
-        tokio::time::timeout_at(deadline, self.transport.get(url, timeout))
-            .await
-            .map_err(|_| HelperTransportError::Timeout)?
+        let observations = self.observation_scope();
+        let stage = observations.stage("helper.http.get");
+        let result: Result<HelperResponse, HelperTransportError> = async {
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or(HelperTransportError::Timeout)?;
+            tokio::time::timeout_at(deadline, self.transport.get(url, timeout))
+                .await
+                .map_err(|_| HelperTransportError::Timeout)?
+        }
+        .await;
+        let status = result.as_ref().ok().map(HelperResponse::status);
+        let outcome = match &result {
+            Ok(response) if (200..300).contains(&response.status()) => {
+                crate::ObservationOutcome::Succeeded
+            }
+            Ok(_) => crate::ObservationOutcome::Failed,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish_http(
+            outcome,
+            result.as_ref().err().map(|_| "Transport"),
+            status,
+            None,
+        );
+        result
     }
 
     /// Enforces the client deadline around the complete custom transport
@@ -746,18 +1060,67 @@ impl HelperClient {
         body: Vec<u8>,
         timeout: Duration,
     ) -> Result<HelperResponse, HelperError> {
-        if timeout.is_zero() {
-            return Err(HelperError::InvalidRequest {
-                message: "share submission attempt timeout must be nonzero".to_string(),
-            });
-        }
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(HelperError::Transport(HelperTransportError::Timeout))?;
-        tokio::time::timeout_at(deadline, self.transport.post_json(url, body, timeout))
+        let observations = self.observation_scope();
+        let stage = observations.stage("helper.http.post_json");
+        let result: Result<HelperResponse, HelperError> = async {
+            if timeout.is_zero() {
+                return Err(HelperError::InvalidRequest {
+                    message: "share submission attempt timeout must be nonzero".to_string(),
+                });
+            }
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or(HelperError::Transport(HelperTransportError::Timeout))?;
+            let attempt = crate::ingress_timeout::attempt_token();
+            let headers = attempt
+                .as_ref()
+                .map(|token| {
+                    vec![(
+                        crate::ingress_timeout::REQUEST_HEADER.to_owned(),
+                        token.clone(),
+                    )]
+                })
+                .unwrap_or_default();
+            let response = tokio::time::timeout_at(
+                deadline,
+                crate::http_transport::observe_helper_http(
+                    stage.scope().clone(),
+                    self.transport
+                        .post_json_with_headers(url, body, timeout, &headers),
+                ),
+            )
             .await
             .map_err(|_| HelperError::Transport(HelperTransportError::Timeout))?
-            .map_err(HelperError::Transport)
+            .map_err(HelperError::Transport)?;
+            if validate_json_response(&response).is_ok()
+                && crate::ingress_timeout::is_not_dispatched(
+                    response.status(),
+                    response.body(),
+                    attempt.as_deref(),
+                )
+            {
+                return Err(HelperError::NotEnqueuedByServer);
+            }
+            Ok(response)
+        }
+        .await;
+        let status = result.as_ref().ok().map(HelperResponse::status);
+        let outcome = match &result {
+            Ok(response) if (200..300).contains(&response.status()) => {
+                crate::ObservationOutcome::Succeeded
+            }
+            Ok(_) => crate::ObservationOutcome::Failed,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish_http(
+            outcome,
+            result.as_ref().err().map(|_| "Transport"),
+            status,
+            None,
+        );
+        result
     }
 
     /// Runs `operation` with the configured backoff.
@@ -782,7 +1145,7 @@ impl HelperClient {
         operation: F,
     ) -> Result<T, HelperError>
     where
-        F: Fn(Option<Duration>) -> Fut,
+        F: Fn(Option<Duration>, HelperClient) -> Fut,
         Fut: std::future::Future<Output = Result<T, HelperError>>,
     {
         let attempts = self.config.retry_delays.len();
@@ -796,7 +1159,25 @@ impl HelperClient {
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 return Err(held_error.take().unwrap_or(HelperError::DeadlineExceeded));
             }
-            match operation(remaining).await {
+            let observations = self
+                .observation_scope()
+                .attempt(u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX));
+            let attempt_stage = observations.stage("helper::attempt");
+            let attempt_result = operation(remaining, self.observing(attempt_stage.scope())).await;
+            let outcome = match &attempt_result {
+                Ok(_) => crate::ObservationOutcome::Succeeded,
+                Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+                Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+                Err(_) => crate::ObservationOutcome::Failed,
+            };
+            attempt_stage.finish(
+                outcome,
+                attempt_result
+                    .as_ref()
+                    .err()
+                    .map(crate::observability::helper_error_kind),
+            );
+            match attempt_result {
                 Ok(value) => return Ok(value),
                 Err(error) => {
                     let retryable = error.retryable_for(retry_ambiguous);
@@ -813,7 +1194,9 @@ impl HelperClient {
                     if deadline.is_some_and(|deadline| wake_at >= deadline) {
                         return Err(error);
                     }
+                    let wait = observations.stage("helper::retry_wait");
                     tokio::time::sleep_until(wake_at).await;
+                    wait.finish(crate::ObservationOutcome::Succeeded, None);
                     if cancel() {
                         return Err(HelperError::Cancelled);
                     }
@@ -1015,6 +1398,8 @@ fn join_helper_url(base_url: &str, segments: &[&str]) -> Result<String, VotingEr
 
 #[cfg(test)]
 mod tests {
+    mod ingress_timeout;
+    mod observability;
     use std::{
         collections::{HashMap, VecDeque},
         sync::Mutex,

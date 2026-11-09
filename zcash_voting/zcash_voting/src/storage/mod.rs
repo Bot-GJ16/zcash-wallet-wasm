@@ -2,16 +2,21 @@ mod migrations;
 pub mod operations;
 pub mod queries;
 
-use std::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::MutexGuard;
 #[cfg(target_arch = "wasm32")]
 use std::{
     cell::{RefCell, RefMut},
     rc::Rc,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use std::{sync::MutexGuard, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::types::{Network, VotingError};
 
@@ -23,9 +28,9 @@ type ConnectionOwner = Mutex<Connection>;
 #[cfg(target_arch = "wasm32")]
 type ConnectionOwner = Rc<RefCell<Connection>>;
 #[cfg(not(target_arch = "wasm32"))]
-type ConnectionGuard<'a> = MutexGuard<'a, Connection>;
+pub type ConnectionGuard<'a> = MutexGuard<'a, Connection>;
 #[cfg(target_arch = "wasm32")]
-type ConnectionGuard<'a> = RefMut<'a, Connection>;
+pub type ConnectionGuard<'a> = RefMut<'a, Connection>;
 
 /// Current phase of a voting round.
 ///
@@ -99,10 +104,152 @@ pub struct KeystoneSignatureBatchResult {
     pub already_present: u32,
 }
 
-/// Database handle for voting state. Wraps a SQLite connection and a
-/// wallet identifier that scopes all round data to a single wallet.
-pub struct VotingDb {
+/// One SQLite connection to a voting database, shared by every [`VotingDb`]
+/// handle opened on the same sidecar path in this process.
+///
+/// In-process writers serialize on the connection mutex, so SQLite reports
+/// `SQLITE_BUSY` only when another process holds the file.
+pub(crate) struct SidecarConnection {
+    /// Identity of the sidecar the connection is open on. Every connection
+    /// to one file gets the same id within the process, so proof
+    /// single-flighting, round locks, and tree caches keyed by it coordinate
+    /// across separately opened handles; each in-memory database gets its
+    /// own. Two sidecars that use the same wallet id stay distinct.
+    id: u64,
+    /// The open span this connection belongs to; see [`OpenSidecar`].
+    epoch: u64,
     conn: ConnectionOwner,
+    /// Chain-submission coordination for the sidecar's open span, shared by
+    /// every connection to the file so in-flight and identity locks hold
+    /// across separately opened handles operating on the same durable rows.
+    chain_submission_coordination:
+        Arc<crate::chain_submission::coordination::SubmissionCoordination>,
+}
+
+static NEXT_SIDECAR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Sidecar ids already assigned to file paths in this process.
+static SIDECAR_IDS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One open span of a sidecar: the connections currently open on it and
+/// the epoch that span was given. A sidecar whose last connection closes and
+/// that is opened again starts a new epoch, so process-local caches that
+/// captured the old epoch see it as closed even though the path-derived id
+/// is the same; the file may have been replaced in between.
+struct OpenSidecar {
+    connections: usize,
+    epoch: u64,
+    /// The chain-submission coordination authority for this open span. It is
+    /// keyed by the sidecar, not the connection: two `VotingDb::open` calls on
+    /// one file operate on the same durable submission rows, so they must
+    /// share in-flight and identity locks or a second caller could mistake
+    /// the first caller's live reservation for an abandoned one.
+    chain_submission_coordination:
+        Arc<crate::chain_submission::coordination::SubmissionCoordination>,
+}
+
+/// Open sidecars by id, so process-local caches keyed by the id can tell
+/// when a sidecar has no handle left through any connection.
+static OPEN_SIDECARS: LazyLock<Mutex<HashMap<u64, OpenSidecar>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_SIDECAR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Records one more connection to sidecar `id` and returns the epoch of the
+/// open span it belongs to together with that span's shared chain-submission
+/// coordination.
+fn note_sidecar_opened(
+    id: u64,
+) -> (
+    u64,
+    Arc<crate::chain_submission::coordination::SubmissionCoordination>,
+) {
+    let mut open = OPEN_SIDECARS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let span = open.entry(id).or_insert_with(|| OpenSidecar {
+        connections: 0,
+        epoch: NEXT_SIDECAR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        chain_submission_coordination: Arc::default(),
+    });
+    span.connections += 1;
+    (span.epoch, Arc::clone(&span.chain_submission_coordination))
+}
+
+impl Drop for SidecarConnection {
+    fn drop(&mut self) {
+        let mut open = OPEN_SIDECARS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(span) = open.get_mut(&self.id) {
+            span.connections -= 1;
+            if span.connections == 0 {
+                open.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Whether the sidecar with `id` is still open in the open span `epoch`,
+/// through any handle. False once its last connection closed, even if the
+/// same path has since been opened again.
+pub(crate) fn sidecar_is_open_in_epoch(id: u64, epoch: u64) -> bool {
+    OPEN_SIDECARS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&id)
+        .is_some_and(|span| span.epoch == epoch)
+}
+
+/// The sidecar id for `path`: the id assigned to its canonical path, or a
+/// fresh one for an in-memory database.
+fn sidecar_id_for(path: &str) -> u64 {
+    let fresh = || NEXT_SIDECAR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if path == ":memory:" {
+        return fresh();
+    }
+    let key = sidecar_registry_key(Path::new(path));
+    *SIDECAR_IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_insert_with(fresh)
+}
+
+/// The canonical identity of a sidecar path, so every spelling of one file
+/// maps to one key. An existing file is canonicalized in full, so a symlink
+/// to the sidecar and its real path share an identity. A file not created
+/// yet has its parent directory canonicalized (symlinks and `..` resolved)
+/// with the file name appended; a parent that cannot be canonicalized keeps
+/// the path as given.
+pub(crate) fn sidecar_registry_key(sidecar_path: &Path) -> PathBuf {
+    if let Ok(existing) = sidecar_path.canonicalize() {
+        return existing;
+    }
+    match (sidecar_path.parent(), sidecar_path.file_name()) {
+        (Some(parent), Some(file_name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            parent
+                .canonicalize()
+                .map(|parent| parent.join(file_name))
+                .unwrap_or_else(|_| sidecar_path.to_path_buf())
+        }
+        _ => sidecar_path.to_path_buf(),
+    }
+}
+
+/// Database handle for voting state: a shared SQLite connection plus a
+/// wallet identifier that scopes all round data to a single wallet.
+///
+/// Handles are cheap to clone through [`VotingDb::scoped`]; each carries its
+/// own wallet id while sharing the connection and the process-local chain
+/// submission coordination.
+pub struct VotingDb {
+    inner: Arc<SidecarConnection>,
     wallet_id: Mutex<String>,
     browser_owner: Option<(String, Network)>,
 }
@@ -111,7 +258,15 @@ impl VotingDb {
     /// Open (or create) the voting database at the given path.
     /// Runs migrations automatically.
     /// Call `set_wallet_id` before performing any round operations.
+    ///
+    /// Every call opens its own connection. Wallet integrations should use
+    /// [`VotingDb::open_wallet_sidecar`], which shares one connection per
+    /// sidecar path.
     pub fn open(path: &str) -> Result<Self, VotingError> {
+        Ok(Self::from_connection(Self::open_connection(path)?, path))
+    }
+
+    pub(crate) fn open_connection(path: &str) -> Result<Connection, VotingError> {
         #[cfg(target_arch = "wasm32")]
         if path != ":memory:" {
             return Err(VotingError::InvalidInput {
@@ -123,32 +278,152 @@ impl VotingDb {
         } else {
             Connection::open(path)
         }
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to open database: {}", e),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("failed to open database", &e))?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to configure database busy timeout: {}", e),
-            })?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(|e| {
+            VotingError::from_sqlite("failed to configure database busy timeout", &e)
+        })?;
         #[cfg(not(target_arch = "wasm32"))]
         conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to set journal mode: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to set journal mode", &e))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to set pragmas: {}", e),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to set pragmas", &e))?;
 
         migrations::migrate(&mut conn)?;
+        Ok(conn)
+    }
 
-        Ok(Self {
-            conn: ConnectionOwner::new(conn.into()),
+    pub(crate) fn from_connection(conn: Connection, path: &str) -> Self {
+        let id = sidecar_id_for(path);
+        let (epoch, chain_submission_coordination) = note_sidecar_opened(id);
+        Self {
+            inner: Arc::new(SidecarConnection {
+                id,
+                epoch,
+                conn: ConnectionOwner::new(conn.into()),
+                chain_submission_coordination,
+            }),
             wallet_id: Mutex::new(String::new()),
             browser_owner: None,
-        })
+        }
+    }
+
+    pub(crate) fn from_shared(inner: Arc<SidecarConnection>, wallet_id: &str) -> Self {
+        Self {
+            inner,
+            wallet_id: Mutex::new(wallet_id.to_string()),
+            browser_owner: None,
+        }
+    }
+
+    pub(crate) fn shared_connection(&self) -> Arc<SidecarConnection> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Returns a handle on the same connection scoped to another wallet.
+    ///
+    /// Use this to read several accounts' state through one open sidecar
+    /// instead of opening a connection per account. An empty `wallet_id` is
+    /// refused with [`VotingError::InvalidInput`]: a handle scoped to no
+    /// wallet would fail on its first wallet-scoped operation.
+    pub fn scoped(&self, wallet_id: &str) -> Result<Self, VotingError> {
+        if wallet_id.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "wallet id must not be empty".to_string(),
+            });
+        }
+        if self
+            .browser_owner
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != wallet_id)
+        {
+            return Err(VotingError::InvalidInput {
+                message: "wallet owner mismatch".to_string(),
+            });
+        }
+        let mut scoped = Self::from_shared(Arc::clone(&self.inner), wallet_id);
+        scoped.browser_owner = self.browser_owner.clone();
+        Ok(scoped)
+    }
+
+    /// Identity of the underlying sidecar: shared by every connection to one
+    /// file within the process, unique per in-memory database.
+    pub(crate) fn sidecar_id(&self) -> u64 {
+        self.inner.id
+    }
+
+    /// The open span of the underlying sidecar; see
+    /// [`sidecar_is_open_in_epoch`].
+    pub(crate) fn sidecar_epoch(&self) -> u64 {
+        self.inner.epoch
+    }
+
+    /// Whether two handles share one underlying connection.
+    pub fn shares_connection_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Whether two handles share one chain-submission coordination authority.
+    /// True for every handle on one sidecar file within one open span, even
+    /// across separately opened connections.
+    #[cfg(test)]
+    pub(crate) fn shares_chain_coordination_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(
+            &self.inner.chain_submission_coordination,
+            &other.inner.chain_submission_coordination,
+        )
+    }
+
+    pub(crate) fn chain_submission_coordination(
+        &self,
+    ) -> &crate::chain_submission::coordination::SubmissionCoordination {
+        &self.inner.chain_submission_coordination
+    }
+
+    /// Runs `body` inside one `BEGIN IMMEDIATE` transaction and commits it.
+    ///
+    /// SQLite waits up to its busy timeout for another process to release the
+    /// write lock; a failure past that timeout surfaces as
+    /// [`VotingError::DbBusy`] so hosts can retry later instead of parsing
+    /// text. `body` must be pure over the database: it must not perform
+    /// network I/O or proof work while the lock is held.
+    pub(crate) fn write_transaction<T>(
+        &self,
+        context: &str,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, VotingError>,
+    ) -> Result<T, VotingError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        let value = body(&tx)?;
+        tx.commit()
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        Ok(value)
+    }
+
+    /// Runs `body` inside one deferred read transaction and rolls it back.
+    ///
+    /// The connection mutex is held for the whole call, so no other handle
+    /// in this process can interleave a write between two of `body`'s reads,
+    /// and the transaction pins one WAL read snapshot against writers in
+    /// other processes. `body` receives only the transaction, so it cannot
+    /// re-enter the (non-reentrant) connection mutex, and it must not write:
+    /// the transaction ends with a rollback whatever `body` did.
+    pub(crate) fn read_transaction<T>(
+        &self,
+        context: &str,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, VotingError>,
+    ) -> Result<T, VotingError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        let value = body(&tx)?;
+        tx.rollback()
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        Ok(value)
     }
 
     /// Opens an account- and network-bound, in-memory database from owned bytes.
@@ -194,11 +469,10 @@ impl VotingDb {
             "INSERT OR IGNORE INTO wallet_metadata (singleton, wallet_id, network) VALUES (1, ?1, ?2)",
             rusqlite::params![wallet_id, queries::network_to_storage(network)],
         ).map_err(browser_storage_error)?;
-        Ok(Self {
-            conn: ConnectionOwner::new(conn.into()),
-            wallet_id: Mutex::new(wallet_id.into()),
-            browser_owner: Some((wallet_id.into(), network)),
-        })
+        let mut db = Self::from_connection(conn, ":memory:");
+        db.set_wallet_id(wallet_id);
+        db.browser_owner = Some((wallet_id.into(), network));
+        Ok(db)
     }
 
     /// Returns an independent snapshot of all durable voting state.
@@ -241,14 +515,14 @@ impl VotingDb {
     }
 
     /// Get a lock on the underlying connection for query execution.
-    pub(crate) fn conn(&self) -> ConnectionGuard<'_> {
+    pub fn conn(&self) -> ConnectionGuard<'_> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.conn.lock().expect("database mutex poisoned")
+            self.inner.conn.lock().expect("database mutex poisoned")
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.conn.borrow_mut()
+            self.inner.conn.borrow_mut()
         }
     }
 
@@ -363,6 +637,8 @@ fn validate_browser_identity(
 
 #[cfg(test)]
 mod tests {
+    mod tree_confirmed_completion;
+
     use super::*;
     use crate::types::VotingRoundParams;
 
@@ -389,7 +665,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, 25);
     }
 
     #[test]
@@ -423,6 +699,75 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
 
         release.join().unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+    }
+
+    #[test]
+    fn scoped_handles_share_one_connection_and_keep_their_own_wallet_id() {
+        let db = test_db();
+        db.set_wallet_id("wallet-a");
+        let other = db.scoped("wallet-b").unwrap();
+        assert!(db.shares_connection_with(&other));
+        assert_eq!(db.wallet_id(), "wallet-a");
+        assert_eq!(other.wallet_id(), "wallet-b");
+
+        db.conn()
+            .execute_batch("CREATE TABLE scoped_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        other
+            .conn()
+            .execute("INSERT INTO scoped_probe (value) VALUES (7)", [])
+            .unwrap();
+        let value: i64 = db
+            .conn()
+            .query_row("SELECT value FROM scoped_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn write_transaction_reports_db_busy_past_the_busy_timeout() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-db-busy-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db = VotingDb::open(&path_string).unwrap();
+        db.conn()
+            .execute_batch("CREATE TABLE busy_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        db.conn().busy_timeout(Duration::from_millis(100)).unwrap();
+
+        let lock = Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let error = db
+            .write_transaction("busy probe", |tx| {
+                tx.execute("INSERT INTO busy_probe (value) VALUES (1)", [])
+                    .map_err(|e| VotingError::from_sqlite("insert", &e))?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::VotingErrorKind::DbBusy, "{error}");
+        assert!(error.retryable());
+        assert!(error.to_string().contains("busy probe"), "{error}");
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        db.write_transaction("busy probe", |tx| {
+            tx.execute("INSERT INTO busy_probe (value) VALUES (1)", [])
+                .map_err(|e| VotingError::from_sqlite("insert", &e))?;
+            Ok(())
+        })
+        .unwrap();
+
+        drop(lock);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path_string}-shm"));

@@ -179,6 +179,16 @@ pub struct PingResponse {
     #[prost(int64, tag = "2")]
     pub exit: i64,
 }
+/// ZIP 317 marginal fee recommended by the backend for the next block.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StandardFee {
+    /// zatoshis per logical action
+    #[prost(uint64, tag = "1")]
+    pub fee_zat: u64,
+    /// 0 = static ZIP 317 marginal fee
+    #[prost(uint32, tag = "2")]
+    pub estimator_version: u32,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Address {
     #[prost(string, tag = "1")]
@@ -1035,6 +1045,33 @@ pub mod compact_tx_streamer_client {
                     GrpcMethod::new(
                         "cash.z.wallet.sdk.rpc.CompactTxStreamer",
                         "GetLightdInfo",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Requires a backend implementing getstandardfee; otherwise returns Unimplemented.
+        pub async fn get_standard_fee(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::StandardFee>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetStandardFee",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "GetStandardFee",
                     ),
                 );
             self.inner.unary(req, path, codec).await

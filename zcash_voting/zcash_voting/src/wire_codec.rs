@@ -20,18 +20,30 @@ use crate::{
     types::{
         validate_32_bytes, validate_encrypted_shares, validate_proposal_id, validate_round_params,
         validate_share_index, validate_vote_chain_id, validate_vote_round_id_hex, Network, NoteRef,
-        RoundBoundVotingHotkeyTarget, SelectedNotes, SharePayload, VotingError, VotingHotkeyTarget,
-        MAX_VOTE_OPTIONS,
+        RoundBoundVotingHotkeyTarget, SelectedNotes, SharePayload, VotingError, VotingErrorKind,
+        VotingHotkeyTarget, MAX_VOTE_OPTIONS,
     },
-    vote::{SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments},
+    vote::{SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VoteSubmission},
     wire::{
-        CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationPirPrecomputeResultView,
-        DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
-        DelegationSubmissionWire, NextStepView, RoundPlanView, RoundRecoveryStateView,
-        ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
+        ChainConfirmationSourceView, ChainDiagnosticKindView, ChainDiagnosticView,
+        ChainSubmissionFailureStateView, ChainSubmissionOutcomeKind, ChainSubmissionOutcomeView,
+        ChainSubmissionStateEvidenceView, ChainSubmissionStateView, CompletedVoteChoiceView,
+        CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationProgressKind,
+        DelegationRecoveryView, DelegationRecoveryWorkView, DelegationSetupFieldView,
+        DelegationStatusView, DelegationSubmissionWire, NextStepView, PendingShareRoundView,
+        PirSnapshotEndpointDiagnosticView, PirSnapshotEndpointStatusView, ResubmittedShareView,
+        RoundChainOutcomeView, RoundDriveEventKind, RoundDriveEventView, RoundPlanView,
+        RoundQuiescenceKind, RoundQuiescenceView, RoundRecoveryStateView, RoundRunReportView,
+        RoundStepDispositionView, RoundStepFailureKindView, RoundStepFailureRecordView,
+        RoundStepFailureView, RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView,
+        RoundWorkTallyView, ShareBatchDeliveryReportView, ShareDelegationRecordView,
+        ShareDeliveryOutcomeView, ShareKeyView, ShareTrackingEventKind, ShareTrackingEventView,
+        ShareTrackingPassReportView, ShareTrackingQuiescenceKind, ShareTrackingQuiescenceView,
+        ShareTrackingRunReportView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
         SignedVoteBatchView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
-        VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView, VoteRecoveryWorkView,
-        VoteShareWire, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
+        SubmissionDiagnosticView, VoteCommitStageKind, VoteCommitmentBatchWire, VoteCommitmentWire,
+        VoteKeyView, VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView,
+        VotingErrorView, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
         VotingRoundParams,
     },
     BundlePolicy,
@@ -389,6 +401,25 @@ impl TryFrom<&SignedVoteCommitment> for VoteCommitmentWire {
     }
 }
 
+/// Encodes the chain-visible fields of a reconstructed vote submission.
+impl TryFrom<&VoteSubmission> for VoteCommitmentWire {
+    type Error = VotingError;
+
+    fn try_from(submission: &VoteSubmission) -> Result<Self, Self::Error> {
+        Ok(Self {
+            van_nullifier: b64(submission.van_nullifier),
+            vote_authority_note_new: b64(submission.vote_authority_note_new),
+            vote_commitment: b64(submission.vote_commitment),
+            proposal_id: submission.proposal_id,
+            proof: b64(&submission.proof),
+            vote_round_id: b64_hex(&submission.vote_round_id, "vote_round_id")?,
+            anchor_height: submission.anchor_height,
+            r_vpk: b64(submission.r_vpk),
+            vote_auth_sig: b64(submission.vote_auth_sig),
+        })
+    }
+}
+
 impl DelegationSubmission {
     pub fn to_wire_json(&self) -> Result<String, VotingError> {
         DelegationSubmissionWire::try_from(self)?.to_json()
@@ -437,12 +468,25 @@ impl VotingNoteSelectionResultView {
     ) -> Result<Self, VotingError> {
         let effective_policy =
             voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
-        Self::from_selected_with_policy(selected, effective_policy)
+        Self::from_selected_with_policy_and_round(
+            selected,
+            effective_policy,
+            Some((voting_db, round_id)),
+        )
     }
 
+    #[cfg(test)]
     fn from_selected_with_policy(
         selected: SelectedNotes,
         bundle_policy: BundlePolicy,
+    ) -> Result<Self, VotingError> {
+        Self::from_selected_with_policy_and_round(selected, bundle_policy, None)
+    }
+
+    fn from_selected_with_policy_and_round(
+        selected: SelectedNotes,
+        bundle_policy: BundlePolicy,
+        round: Option<(&crate::round::VotingDb, &str)>,
     ) -> Result<Self, VotingError> {
         let note_count =
             u32::try_from(selected.notes.len()).map_err(|_| VotingError::InvalidInput {
@@ -455,13 +499,33 @@ impl VotingNoteSelectionResultView {
         // same bundle set; recomputing the weight separately could drift.
         // Malformed note rows report zero weight rather than failing, matching
         // the behavior this view had when it called `voting_power_with_policy`.
-        let plan = crate::note_bundling::canonical_note_bundle_plan_for_notes(
+        // Persisted-prefix inconsistencies still fail: they describe stale or
+        // incomplete round state rather than malformed caller-supplied notes.
+        let canonical_plan = crate::note_bundling::canonical_note_bundle_plan_for_notes(
             &selected.voting_note_infos(),
             bundle_policy,
         )
         .ok();
-        let eligible_weight_zatoshi = plan.as_ref().map_or(0, |plan| plan.eligible_weight);
-        let privacy_trim = plan.map(|plan| plan.privacy_trim).unwrap_or_default();
+        let effective_plan = match (canonical_plan, round) {
+            (Some(plan), Some((voting_db, round_id))) => {
+                Some(voting_db.effective_round_bundle_plan_for_canonical_plan(round_id, plan)?)
+            }
+            (Some(plan), None) => Some(crate::round::EffectiveRoundBundlePlan {
+                plan,
+                skipped_suffix: Default::default(),
+            }),
+            (None, _) => None,
+        };
+        let eligible_weight_zatoshi = effective_plan
+            .as_ref()
+            .map_or(0, |effective_plan| effective_plan.plan.eligible_weight);
+        let privacy_trim = effective_plan
+            .as_ref()
+            .map(|effective_plan| effective_plan.plan.privacy_trim)
+            .unwrap_or_default();
+        let skipped_suffix = effective_plan
+            .map(|effective_plan| effective_plan.skipped_suffix)
+            .unwrap_or_default();
         let snapshot_height = selected.snapshot_height;
         let anchor_height = selected.anchor_tree_state.height;
         let notes = selected.notes.into_iter().map(Into::into).collect();
@@ -472,6 +536,9 @@ impl VotingNoteSelectionResultView {
             anchor_height,
             notes,
             privacy_trim,
+            skipped_suffix_bundles: skipped_suffix.bundles,
+            skipped_suffix_notes: skipped_suffix.notes,
+            skipped_suffix_value_zatoshi: skipped_suffix.value_zatoshi,
         })
     }
 }
@@ -549,13 +616,23 @@ impl TryFrom<SignedVoteBatch> for SignedVoteBatchView {
     }
 }
 
+impl From<crate::chain_submission::ChainSubmissionDiagnostic> for SubmissionDiagnosticView {
+    fn from(diagnostic: crate::chain_submission::ChainSubmissionDiagnostic) -> Self {
+        Self {
+            kind: diagnostic.kind().as_str().to_string(),
+            message: diagnostic.message().to_string(),
+        }
+    }
+}
+
 impl From<recovery::DelegationRecovery> for DelegationRecoveryView {
     fn from(record: recovery::DelegationRecovery) -> Self {
         Self {
             bundle_index: record.bundle_index,
-            phase: record.workflow_phase().as_str().to_string(),
+            phase: record.workflow_phase().into(),
             tx_hash: record.tx_hash,
             van_leaf_position: record.van_leaf_position,
+            submission_diagnostic: record.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -566,10 +643,11 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
             bundle_index: record.bundle_index,
             proposal_id: record.proposal_id,
             choice: record.choice,
-            phase: record.workflow_phase().as_str().to_string(),
+            phase: record.workflow_phase().into(),
             tx_hash: record.tx_hash,
             vc_tree_position: record.vc_tree_position,
             has_commitment_bundle: record.has_commitment_bundle,
+            submission_diagnostic: record.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -591,9 +669,9 @@ impl From<crate::types::ShareDelegationRecord> for ShareDelegationRecordView {
             target_count: record.target_count,
             nullifier: record.nullifier,
             phase: if record.confirmed {
-                WorkflowPhase::Confirmed.as_str().to_string()
+                WorkflowPhase::Confirmed.into()
             } else {
-                WorkflowPhase::SubmittedShare.as_str().to_string()
+                WorkflowPhase::SubmittedShare.into()
             },
             confirmed: record.confirmed,
             submit_at: record.submit_at,
@@ -608,7 +686,7 @@ impl From<recovery::ShareWorkflow> for ShareWorkflowRecoveryView {
             bundle_index: record.bundle_index,
             proposal_id: record.proposal_id,
             share_index: record.share_index,
-            phase: record.workflow_phase().as_str().to_string(),
+            phase: record.workflow_phase().into(),
         }
     }
 }
@@ -640,10 +718,11 @@ impl TryFrom<session::NextStep> for NextStepView {
     type Error = VotingError;
 
     fn try_from(step: session::NextStep) -> Result<Self, Self::Error> {
-        let kind = step.kind().to_string();
+        let kind = step.kind_view();
         match step {
             session::NextStep::Delegate { bundle_index }
-            | session::NextStep::PollDelegation { bundle_index } => Ok(Self {
+            | session::NextStep::AdvanceDelegation { bundle_index }
+            | session::NextStep::AdvanceImportedDelegation { bundle_index } => Ok(Self {
                 kind,
                 bundle_index,
                 proposal_id: 0,
@@ -661,19 +740,11 @@ impl TryFrom<session::NextStep> for NextStepView {
                 choice,
                 share_index: 0,
             }),
-            session::NextStep::SubmitVote {
+            session::NextStep::AdvanceVote {
                 bundle_index,
                 proposal_id,
             }
-            | session::NextStep::SubmitVoteBatch {
-                bundle_index,
-                proposal_id,
-            }
-            | session::NextStep::PollVote {
-                bundle_index,
-                proposal_id,
-            }
-            | session::NextStep::PollVoteBatch {
+            | session::NextStep::AdvanceVoteBatch {
                 bundle_index,
                 proposal_id,
             } => Ok(Self {
@@ -703,14 +774,58 @@ impl TryFrom<session::NextStep> for NextStepView {
     }
 }
 
+impl From<NextStepView> for session::NextStep {
+    /// Rebuilds the planner step a host selected from a plan view.
+    ///
+    /// Fields the kind does not use are ignored, mirroring how the view
+    /// zero-fills them.
+    fn from(view: NextStepView) -> Self {
+        use crate::wire::NextStepKind as Kind;
+        match view.kind {
+            Kind::Delegate => Self::Delegate {
+                bundle_index: view.bundle_index,
+            },
+            Kind::AdvanceDelegation => Self::AdvanceDelegation {
+                bundle_index: view.bundle_index,
+            },
+            Kind::AdvanceImportedDelegation => Self::AdvanceImportedDelegation {
+                bundle_index: view.bundle_index,
+            },
+            Kind::CastVote => Self::CastVote {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+                choice: view.choice,
+            },
+            Kind::AdvanceVote => Self::AdvanceVote {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+            },
+            Kind::AdvanceVoteBatch => Self::AdvanceVoteBatch {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+            },
+            Kind::SubmitShares => Self::SubmitShares {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+                share_index: view.share_index,
+            },
+            Kind::ConfirmShare => Self::ConfirmShare {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+                share_index: view.share_index,
+            },
+        }
+    }
+}
+
 impl From<session::DelegationStatus> for DelegationStatusView {
     fn from(status: session::DelegationStatus) -> Self {
         Self {
             bundle_index: status.bundle_index,
-            phase: WorkflowPhase::for_delegation(status.phase)
-                .as_str()
-                .to_string(),
+            phase: WorkflowPhase::for_delegation(status.phase).into(),
             tx_hash: status.tx_hash,
+            submission_diagnostic: status.submission_diagnostic.map(Into::into),
+            terminal: status.terminal,
         }
     }
 }
@@ -718,11 +833,9 @@ impl From<session::DelegationStatus> for DelegationStatusView {
 impl From<session::DelegationRecoveryWork> for DelegationRecoveryWorkView {
     fn from(work: session::DelegationRecoveryWork) -> Self {
         Self {
-            kind: work.kind.as_str().to_string(),
+            kind: work.kind.into(),
             bundle_index: work.bundle_index,
-            phase: WorkflowPhase::for_delegation(work.phase)
-                .as_str()
-                .to_string(),
+            phase: WorkflowPhase::for_delegation(work.phase).into(),
             tx_hash: work.tx_hash,
         }
     }
@@ -731,7 +844,7 @@ impl From<session::DelegationRecoveryWork> for DelegationRecoveryWorkView {
 impl From<session::VoteRecoveryWork> for VoteRecoveryWorkView {
     fn from(work: session::VoteRecoveryWork) -> Self {
         Self {
-            kind: work.kind.as_str().to_string(),
+            kind: work.kind.into(),
             bundle_index: work.bundle_index,
             proposal_id: work.proposal_id,
             tx_hash: work.tx_hash,
@@ -773,7 +886,16 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
             completed_for_display: plan.completed_for_display,
             completed_vote_display: plan.completed_vote_display.map(Into::into),
             needs_draft_setup: plan.needs_draft_setup,
-            primary_action: plan.primary_action.as_str().to_string(),
+            needs_bundle_setup: plan.needs_bundle_setup,
+            needs_delegation_signing: plan.needs_delegation_signing,
+            delegation_bundles_needing_work: plan.delegation_bundles_needing_work,
+            delegation_bundles_needing_signing: plan.delegation_bundles_needing_signing,
+            has_in_flight_delegation: plan.has_in_flight_delegation,
+            needs_vote_polling: plan.needs_vote_polling,
+            has_remaining_vote_or_share_work: plan.has_remaining_vote_or_share_work,
+            has_recoverable_vote_or_share_work: plan.has_recoverable_vote_or_share_work,
+            has_unconfirmed_shares: plan.has_unconfirmed_shares,
+            primary_action: plan.primary_action.into(),
             next_steps: plan
                 .next_steps
                 .into_iter()
@@ -795,6 +917,7 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
                 .map(Into::into)
                 .collect(),
             open_proposals: plan.open_proposals,
+            unrostered_intents: plan.unrostered_intents,
             immediate_share_key: plan.immediate_share_key,
             immediate_share_confirmed: plan.immediate_share_confirmed,
             all_decided: plan.all_decided,
@@ -834,8 +957,878 @@ fn helper_tree_position(value: u64) -> Result<u64, VotingError> {
     Ok(value)
 }
 
+impl From<crate::ChainSubmissionConfirmationSource> for ChainConfirmationSourceView {
+    fn from(source: crate::ChainSubmissionConfirmationSource) -> Self {
+        match source {
+            crate::ChainSubmissionConfirmationSource::Hash => Self::Hash,
+            crate::ChainSubmissionConfirmationSource::Tree => Self::Tree,
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionDiagnosticKind> for ChainDiagnosticKindView {
+    fn from(kind: crate::ChainSubmissionDiagnosticKind) -> Self {
+        use crate::ChainSubmissionDiagnosticKind as Kind;
+        match kind {
+            Kind::AmbiguousDispatch => Self::AmbiguousDispatch,
+            Kind::AmbiguousAttemptsExhausted => Self::AmbiguousAttemptsExhausted,
+            Kind::NullifierAlreadySpent => Self::NullifierAlreadySpent,
+            Kind::TrackingWindowExpired => Self::TrackingWindowExpired,
+            Kind::ChainRejected => Self::ChainRejected,
+            Kind::ReconciliationPending => Self::ReconciliationPending,
+            Kind::InvalidProtocolResponse => Self::InvalidProtocolResponse,
+            Kind::StorageFailure => Self::StorageFailure,
+            Kind::EndpointUnsupported => Self::EndpointUnsupported,
+            Kind::RouteAnswerReplaced => Self::RouteAnswerReplaced,
+        }
+    }
+}
+
+impl From<&crate::ChainSubmissionDiagnostic> for ChainDiagnosticView {
+    fn from(diagnostic: &crate::ChainSubmissionDiagnostic) -> Self {
+        Self {
+            kind: diagnostic.kind().into(),
+            message: diagnostic.message().to_string(),
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionResult> for ChainSubmissionOutcomeView {
+    fn from(result: crate::ChainSubmissionResult) -> Self {
+        use crate::{ChainSubmissionPending, ChainSubmissionResult};
+        let empty = |kind| Self {
+            kind,
+            confirmation_source: None,
+            transaction_hash: None,
+            candidate_transaction_hash: None,
+            final_van_position: None,
+            vote_commitment_positions: Vec::new(),
+            diagnostic: None,
+        };
+        match result {
+            ChainSubmissionResult::Confirmed(confirmation) => Self {
+                kind: ChainSubmissionOutcomeKind::Confirmed,
+                confirmation_source: Some(confirmation.source().into()),
+                transaction_hash: confirmation.transaction_hash().map(|hash| hash.to_hex()),
+                candidate_transaction_hash: None,
+                final_van_position: Some(confirmation.final_van_position()),
+                vote_commitment_positions: confirmation.vote_commitment_positions().to_vec(),
+                diagnostic: None,
+            },
+            ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking {
+                candidate_transaction_hash,
+            }) => Self {
+                candidate_transaction_hash: Some(candidate_transaction_hash.to_hex()),
+                ..empty(ChainSubmissionOutcomeKind::Tracking)
+            },
+            ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+                candidate_transaction_hash,
+                diagnostic,
+            }) => Self {
+                candidate_transaction_hash: candidate_transaction_hash.map(|hash| hash.to_hex()),
+                diagnostic: Some(ChainDiagnosticView::from(&diagnostic)),
+                ..empty(ChainSubmissionOutcomeKind::Recovering)
+            },
+            ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => Self {
+                diagnostic: Some(ChainDiagnosticView::from(&diagnostic)),
+                ..empty(ChainSubmissionOutcomeKind::SubmittedWithoutHash)
+            },
+            ChainSubmissionResult::Rejected(diagnostic) => Self {
+                diagnostic: Some(ChainDiagnosticView::from(&diagnostic)),
+                ..empty(ChainSubmissionOutcomeKind::Rejected)
+            },
+            ChainSubmissionResult::Cancelled => empty(ChainSubmissionOutcomeKind::Cancelled),
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionState> for ChainSubmissionStateView {
+    fn from(state: crate::ChainSubmissionState) -> Self {
+        use crate::ChainSubmissionState as State;
+        match state {
+            State::Submitting => Self::Submitting,
+            State::Tracking => Self::Tracking,
+            State::Recovering => Self::Recovering,
+            State::SubmittedWithoutHash => Self::SubmittedWithoutHash,
+            State::Confirmed => Self::Confirmed,
+            State::Rejected => Self::Rejected,
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionFailureState> for ChainSubmissionFailureStateView {
+    fn from(state: crate::ChainSubmissionFailureState) -> Self {
+        Self {
+            state: state.state().into(),
+            evidence: match state.evidence() {
+                crate::ChainSubmissionStateEvidence::Durable => {
+                    ChainSubmissionStateEvidenceView::Durable
+                }
+                crate::ChainSubmissionStateEvidence::KnownPossiblyDispatched => {
+                    ChainSubmissionStateEvidenceView::KnownPossiblyDispatched
+                }
+            },
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::VoteRecoveryKey> for VoteKeyView {
+    fn from(key: crate::VoteRecoveryKey) -> Self {
+        Self {
+            bundle_index: key.bundle_index,
+            proposal_id: key.proposal_id,
+        }
+    }
+}
+
+impl From<crate::share_tracking::ShareKey> for ShareKeyView {
+    fn from(key: crate::share_tracking::ShareKey) -> Self {
+        Self {
+            bundle_index: key.bundle_index,
+            proposal_id: key.proposal_id,
+            share_index: key.share_index,
+        }
+    }
+}
+
+impl From<crate::pir_snapshot::PirSnapshotEndpointStatus> for PirSnapshotEndpointStatusView {
+    fn from(status: crate::pir_snapshot::PirSnapshotEndpointStatus) -> Self {
+        use crate::pir_snapshot::PirSnapshotEndpointStatus as Status;
+
+        match status {
+            Status::Matched => Self::Matched,
+            Status::Behind => Self::Behind,
+            Status::Ahead => Self::Ahead,
+            Status::MissingHeight => Self::MissingHeight,
+            Status::MalformedJson => Self::MalformedJson,
+            Status::NonSuccessStatus => Self::NonSuccessStatus,
+            Status::TimeoutOrNetworkError => Self::TimeoutOrNetworkError,
+        }
+    }
+}
+
+impl From<crate::pir_snapshot::PirSnapshotEndpointDiagnostic>
+    for PirSnapshotEndpointDiagnosticView
+{
+    fn from(diagnostic: crate::pir_snapshot::PirSnapshotEndpointDiagnostic) -> Self {
+        Self {
+            endpoint: diagnostic.endpoint,
+            status: diagnostic.status.into(),
+            reported_height: diagnostic.reported_height,
+            http_status_code: diagnostic.http_status_code,
+            message: diagnostic.message,
+        }
+    }
+}
+
+impl From<crate::share_tracking::ResubmittedShare> for ResubmittedShareView {
+    fn from(resubmitted: crate::share_tracking::ResubmittedShare) -> Self {
+        Self {
+            share: resubmitted.share.into(),
+            server_url: resubmitted.server_url,
+        }
+    }
+}
+
+impl From<crate::share_tracking::ShareTrackingReport> for ShareTrackingPassReportView {
+    fn from(report: crate::share_tracking::ShareTrackingReport) -> Self {
+        Self {
+            unconfirmed_at_entry: report.unconfirmed_at_entry,
+            confirmed: report
+                .confirmed
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            resubmitted: report
+                .resubmitted
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            ambiguous: report
+                .ambiguous
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            unrecoverable: report
+                .unrecoverable
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            cancelled: report.cancelled,
+            next_delay_seconds: report.next_delay_seconds,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::share_tracking_drive::ShareTrackingQuiescence> for ShareTrackingQuiescenceView {
+    fn from(quiescence: crate::share_tracking_drive::ShareTrackingQuiescence) -> Self {
+        use crate::share_tracking_drive::ShareTrackingQuiescence as Q;
+
+        let mut view = Self {
+            kind: ShareTrackingQuiescenceKind::NothingToTrack,
+            messages: Vec::new(),
+            unrecoverable: Vec::new(),
+        };
+        match quiescence {
+            Q::NothingToTrack => {}
+            Q::AllConfirmed => view.kind = ShareTrackingQuiescenceKind::AllConfirmed,
+            Q::VoteEndReached => view.kind = ShareTrackingQuiescenceKind::VoteEndReached,
+            Q::Cancelled => view.kind = ShareTrackingQuiescenceKind::Cancelled,
+            Q::AlreadyDriving => view.kind = ShareTrackingQuiescenceKind::AlreadyDriving,
+            Q::Failing { messages } => {
+                view.kind = ShareTrackingQuiescenceKind::Failing;
+                view.messages = messages;
+            }
+            Q::PassBudgetExhausted { unrecoverable } => {
+                view.kind = ShareTrackingQuiescenceKind::PassBudgetExhausted;
+                view.unrecoverable = unrecoverable.into_iter().map(ShareKeyView::from).collect();
+            }
+        }
+        view
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::share_tracking_drive::ShareTrackingEvent> for ShareTrackingEventView {
+    fn from(event: crate::share_tracking_drive::ShareTrackingEvent) -> Self {
+        use crate::share_tracking_drive::ShareTrackingEvent as E;
+
+        let mut view = Self {
+            kind: ShareTrackingEventKind::PassStarted,
+            pass: None,
+            report: None,
+            message: None,
+            delay_seconds: None,
+        };
+        match event {
+            E::PassStarted { pass } => view.pass = Some(pass),
+            E::PassFinished { pass, report } => {
+                view.kind = ShareTrackingEventKind::PassFinished;
+                view.pass = Some(pass);
+                view.report = Some(ShareTrackingPassReportView::from(*report));
+            }
+            E::PassFailed {
+                pass,
+                message,
+                partial,
+            } => {
+                view.kind = ShareTrackingEventKind::PassFailed;
+                view.pass = Some(pass);
+                view.message = Some(message);
+                view.report = Some(ShareTrackingPassReportView::from(*partial));
+            }
+            E::AwaitingNextPass { delay } => {
+                view.kind = ShareTrackingEventKind::AwaitingNextPass;
+                // Fractional, like the round driver's: a policy may set a
+                // subsecond retry, and truncating it would show a host a
+                // boundary the driver is not enforcing.
+                view.delay_seconds = Some(delay.as_secs_f64());
+            }
+        }
+        view
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::share_tracking_drive::ShareTrackingRunReport> for ShareTrackingRunReportView {
+    fn from(report: crate::share_tracking_drive::ShareTrackingRunReport) -> Self {
+        Self {
+            quiescence: ShareTrackingQuiescenceView::from(report.quiescence),
+            passes: report.passes,
+            confirmed: report
+                .confirmed
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            resubmitted: report
+                .resubmitted
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            ambiguous: report
+                .ambiguous
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            unrecoverable: report
+                .unrecoverable
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            failures: report.failures,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::VoteShareDeliveryReport> for ShareBatchDeliveryReportView {
+    fn from(report: crate::VoteShareDeliveryReport) -> Self {
+        let delivery = report.delivery;
+        Self {
+            vote: report.vote.into(),
+            deliveries: delivery
+                .deliveries
+                .into_iter()
+                .map(|outcome| ShareDeliveryOutcomeView {
+                    share_index: outcome.share_index,
+                    accepted_urls: outcome.submission.accepted_urls,
+                    ambiguous_urls: outcome.submission.ambiguous_urls,
+                    target_count: u32::try_from(outcome.submission.target_count)
+                        .unwrap_or(u32::MAX),
+                })
+                .collect(),
+            pending_share_indices: delivery.pending_share_indices,
+            cancelled: delivery.cancelled,
+            legacy_best_effort: matches!(
+                delivery.placement_guarantee,
+                crate::share_tracking::SharePlacementGuarantee::LegacyBestEffort
+            ),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::RoundStepDisposition> for RoundStepDispositionView {
+    fn from(disposition: crate::RoundStepDisposition) -> Self {
+        use crate::RoundStepDisposition as D;
+        match disposition {
+            D::NoWork => Self::NoWork,
+            D::Advanced => Self::Advanced,
+            D::Pending => Self::Pending,
+            D::Cancelled => Self::Cancelled,
+            D::ChainTerminal => Self::ChainTerminal,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::RoundStepFailureKind> for RoundStepFailureKindView {
+    fn from(kind: crate::RoundStepFailureKind) -> Self {
+        use crate::RoundStepFailureKind as K;
+        match kind {
+            K::InvalidInput => Self::InvalidInput,
+            K::InsufficientEligibility => Self::InsufficientEligibility,
+            K::NoSpendableNotes => Self::NoSpendableNotes,
+            K::Busy => Self::Busy,
+            K::Storage => Self::Storage,
+            K::InvariantViolation => Self::InvariantViolation,
+            K::Transport => Self::Transport,
+            K::Protocol => Self::Protocol,
+            K::ProofFailed => Self::ProofFailed,
+            K::Signing => Self::Signing,
+            K::HelperDeliveryIncomplete => Self::HelperDeliveryIncomplete,
+            K::VoteEnded => Self::VoteEnded,
+            K::DelegationTargetMismatch => Self::DelegationTargetMismatch,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::RoundStepOutcome> for RoundStepOutcomeView {
+    type Error = VotingError;
+
+    fn try_from(outcome: crate::RoundStepOutcome) -> Result<Self, Self::Error> {
+        Ok(Self {
+            step: outcome.step.map(NextStepView::try_from).transpose()?,
+            disposition: outcome.disposition.into(),
+            chain_outcome: outcome.chain_outcome.map(Into::into),
+            share_deliveries: outcome
+                .share_deliveries
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            delegation: outcome
+                .delegation
+                .map(SignedDelegationPayloadView::try_from)
+                .transpose()?,
+            plan: outcome.plan.try_into()?,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::RoundStepFailure> for RoundStepFailureView {
+    type Error = VotingError;
+
+    fn try_from(failure: crate::RoundStepFailure) -> Result<Self, Self::Error> {
+        Ok(Self {
+            kind: failure.kind.into(),
+            step: failure.step.map(NextStepView::try_from).transpose()?,
+            strongest_chain_state: failure.strongest_chain_state.map(Into::into),
+            chain_outcome: failure.chain_outcome.map(Into::into),
+            message: failure.message,
+            plan: failure
+                .plan
+                .map(|plan| RoundPlanView::try_from(*plan))
+                .transpose()?,
+            share_deliveries: failure
+                .share_deliveries
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            delegation: failure
+                .delegation
+                .map(SignedDelegationPayloadView::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+fn delegation_progress_kind(
+    progress: crate::delegate::DelegationProgress,
+) -> (DelegationProgressKind, Option<f64>) {
+    use crate::delegate::DelegationProgress as P;
+    match progress {
+        P::SelectingNotes => (DelegationProgressKind::SelectingNotes, None),
+        P::PcztBuilding => (DelegationProgressKind::PcztBuilding, None),
+        P::PcztBuilt => (DelegationProgressKind::PcztBuilt, None),
+        P::ProofStarting => (DelegationProgressKind::ProofStarting, None),
+        P::WaitingForExistingProof => (DelegationProgressKind::WaitingForExistingProof, None),
+        P::ProofProgress(fraction) => (DelegationProgressKind::ProofProgress, Some(fraction)),
+        P::ProofComplete => (DelegationProgressKind::ProofComplete, None),
+        P::SigningPayload => (DelegationProgressKind::SigningPayload, None),
+        P::PayloadReady => (DelegationProgressKind::PayloadReady, None),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::RoundStepProgress> for RoundStepProgressView {
+    type Error = VotingError;
+
+    fn try_from(progress: crate::RoundStepProgress) -> Result<Self, Self::Error> {
+        use crate::vote::VoteCommitStage as Stage;
+        use crate::RoundStepProgress as P;
+        let mut view = Self {
+            kind: RoundStepProgressKind::Selected,
+            step: None,
+            bundle_index: None,
+            proposal_id: None,
+            delegation_progress: None,
+            vote_commit_stage: None,
+            proof_progress: None,
+            tree_height: None,
+            vote_keys: Vec::new(),
+            chain_outcome: None,
+            share_delivery: None,
+            share: None,
+            share_confirmed: None,
+        };
+        match progress {
+            P::Selected(step) => {
+                view.step = Some(step.try_into()?);
+            }
+            P::Delegation {
+                bundle_index,
+                progress,
+            } => {
+                let (kind, fraction) = delegation_progress_kind(progress);
+                view.kind = RoundStepProgressKind::Delegation;
+                view.bundle_index = Some(bundle_index);
+                view.delegation_progress = Some(kind);
+                view.proof_progress = fraction;
+            }
+            P::DelegateAndVoteBatchPersisted { bundle_index } => {
+                view.kind = RoundStepProgressKind::DelegateAndVoteBatchPersisted;
+                view.bundle_index = Some(bundle_index);
+            }
+            P::TreeSynced { height } => {
+                view.kind = RoundStepProgressKind::TreeSynced;
+                view.tree_height = Some(height);
+            }
+            P::VoteCommit(stage) => {
+                view.kind = RoundStepProgressKind::VoteCommit;
+                let (kind, bundle_index, proposal_id, fraction) = match stage {
+                    Stage::ProofStarting {
+                        proposal_id,
+                        bundle_index,
+                    } => (
+                        VoteCommitStageKind::ProofStarting,
+                        bundle_index,
+                        proposal_id,
+                        None,
+                    ),
+                    Stage::ProofProgress {
+                        proposal_id,
+                        bundle_index,
+                        progress,
+                    } => (
+                        VoteCommitStageKind::ProofProgress,
+                        bundle_index,
+                        proposal_id,
+                        Some(progress),
+                    ),
+                    Stage::SharePayloadsBuilding {
+                        proposal_id,
+                        bundle_index,
+                    } => (
+                        VoteCommitStageKind::SharePayloadsBuilding,
+                        bundle_index,
+                        proposal_id,
+                        None,
+                    ),
+                    Stage::Signing {
+                        proposal_id,
+                        bundle_index,
+                    } => (
+                        VoteCommitStageKind::Signing,
+                        bundle_index,
+                        proposal_id,
+                        None,
+                    ),
+                };
+                view.vote_commit_stage = Some(kind);
+                view.bundle_index = Some(bundle_index);
+                view.proposal_id = Some(proposal_id);
+                view.proof_progress = fraction;
+            }
+            P::HelperPlansPrepared(keys) => {
+                view.kind = RoundStepProgressKind::HelperPlansPrepared;
+                view.vote_keys = keys.into_iter().map(Into::into).collect();
+            }
+            P::ChainOutcome(result) => {
+                view.kind = RoundStepProgressKind::ChainOutcome;
+                view.chain_outcome = Some(result.into());
+            }
+            P::ShareOutcome(report) => {
+                view.kind = RoundStepProgressKind::ShareOutcome;
+                view.share_delivery = Some(report.into());
+            }
+            P::ShareConfirmed { share, confirmed } => {
+                view.kind = RoundStepProgressKind::ShareConfirmed;
+                view.share = Some(share.into());
+                view.share_confirmed = Some(confirmed);
+            }
+        }
+        Ok(view)
+    }
+}
+
+impl From<crate::share::PendingShareRoundForAccount> for PendingShareRoundView {
+    fn from(round: crate::share::PendingShareRoundForAccount) -> Self {
+        Self {
+            wallet_id: round.wallet_id,
+            round_id: round.round_id,
+            session_json: round.session_json,
+        }
+    }
+}
+
+impl From<&VotingError> for VotingErrorView {
+    fn from(error: &VotingError) -> Self {
+        let mut view = VotingErrorView {
+            kind: error.kind().into(),
+            retryable: error.retryable(),
+            message: error.to_string(),
+            bundle_index: None,
+            setup_field: None,
+            snapshot_height: None,
+            required_weight_zatoshi: None,
+            selected_weight_zatoshi: None,
+            bundle_note_slots: None,
+            selected_notes: None,
+            http_status: None,
+            endpoint: None,
+        };
+        match error {
+            VotingError::KeystoneSignatureConflict { bundle_index }
+            | VotingError::DelegationPcztUnavailable { bundle_index, .. } => {
+                view.bundle_index = Some(*bundle_index);
+            }
+            VotingError::InsufficientEligibility {
+                required_weight_zatoshi,
+                selected_weight_zatoshi,
+                snapshot_height,
+                bundle_note_slots,
+                selected_notes,
+            } => {
+                view.required_weight_zatoshi = Some(*required_weight_zatoshi);
+                view.selected_weight_zatoshi = Some(*selected_weight_zatoshi);
+                view.snapshot_height = *snapshot_height;
+                view.bundle_note_slots = Some(*bundle_note_slots);
+                view.selected_notes = Some(*selected_notes);
+            }
+            VotingError::NoSpendableNotes { snapshot_height } => {
+                view.snapshot_height = Some(*snapshot_height);
+            }
+            VotingError::SetupAlreadyPersisted {
+                bundle_index,
+                field,
+                ..
+            } => {
+                view.bundle_index = Some(*bundle_index);
+                view.setup_field = Some((*field).into());
+            }
+            VotingError::PirUnavailable {
+                endpoint,
+                http_status,
+                ..
+            } => {
+                view.http_status = *http_status;
+                view.endpoint = endpoint.clone();
+            }
+            VotingError::DelegationTargetMismatch { bundle_index, .. }
+            | VotingError::DelegationAlreadyBroadcast { bundle_index, .. } => {
+                view.bundle_index = Some(*bundle_index);
+            }
+            _ => {}
+        }
+        view
+    }
+}
+
+impl From<crate::types::DelegationSetupField> for DelegationSetupFieldView {
+    fn from(field: crate::types::DelegationSetupField) -> Self {
+        use crate::types::DelegationSetupField as F;
+        match field {
+            F::PaddedNoteSecrets => Self::PaddedNoteSecrets,
+            F::PcztSighash => Self::PcztSighash,
+            F::Tx1Effects => Self::Tx1Effects,
+            F::DelegationPczt => Self::DelegationPczt,
+        }
+    }
+}
+
+impl From<VotingError> for VotingErrorView {
+    fn from(error: VotingError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<VotingErrorKind> for VotingErrorKindView {
+    fn from(kind: VotingErrorKind) -> Self {
+        match kind {
+            VotingErrorKind::InvalidInput => Self::InvalidInput,
+            VotingErrorKind::KeystoneSignatureConflict => Self::KeystoneSignatureConflict,
+            VotingErrorKind::ProofFailed => Self::ProofFailed,
+            VotingErrorKind::Busy => Self::Busy,
+            VotingErrorKind::Storage => Self::Storage,
+            VotingErrorKind::Internal => Self::Internal,
+            VotingErrorKind::InsufficientEligibility => Self::InsufficientEligibility,
+            VotingErrorKind::NoSpendableNotes => Self::NoSpendableNotes,
+            VotingErrorKind::SetupAlreadyPersisted => Self::SetupAlreadyPersisted,
+            VotingErrorKind::DelegationPcztUnavailable => Self::DelegationPcztUnavailable,
+            VotingErrorKind::DbBusy => Self::DbBusy,
+            VotingErrorKind::PirUnavailable => Self::PirUnavailable,
+            VotingErrorKind::DelegationTargetMismatch => Self::DelegationTargetMismatch,
+            VotingErrorKind::DelegationAlreadyBroadcast => Self::DelegationAlreadyBroadcast,
+        }
+    }
+}
+
+impl VotingError {
+    /// Wallet-facing view of this error.
+    pub fn to_view(&self) -> VotingErrorView {
+        VotingErrorView::from(self)
+    }
+}
+
+impl std::fmt::Display for VotingErrorView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VotingErrorView {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::round_drive::RoundWorkTally> for RoundWorkTallyView {
+    fn from(tally: crate::round_drive::RoundWorkTally) -> Self {
+        Self {
+            completed_proposals: tally.completed_proposals,
+            total_proposals: tally.total_proposals,
+            remaining_obligations: tally.remaining_obligations,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::round_drive::RoundQuiescence> for RoundQuiescenceView {
+    type Error = VotingError;
+
+    fn try_from(quiescence: crate::round_drive::RoundQuiescence) -> Result<Self, Self::Error> {
+        use crate::round_drive::RoundQuiescence as Q;
+        let mut view = Self {
+            kind: RoundQuiescenceKind::NoWorkLeft,
+            open_proposals: Vec::new(),
+            unrostered_intents: Vec::new(),
+            bundles: Vec::new(),
+            shares: Vec::new(),
+            step: None,
+            chain_outcome: None,
+            remaining: Vec::new(),
+        };
+        match quiescence {
+            Q::NoWorkLeft => {}
+            Q::NeedsBundleSetup => view.kind = RoundQuiescenceKind::NeedsBundleSetup,
+            Q::PersistedChainTerminal => view.kind = RoundQuiescenceKind::PersistedChainTerminal,
+            Q::NeedsBallot {
+                open_proposals,
+                unrostered_intents,
+            } => {
+                view.kind = RoundQuiescenceKind::NeedsBallot;
+                view.open_proposals = open_proposals;
+                view.unrostered_intents = unrostered_intents;
+            }
+            Q::NeedsDelegationSignatures { bundles } => {
+                view.kind = RoundQuiescenceKind::NeedsDelegationSignatures;
+                view.bundles = bundles;
+            }
+            Q::BackgroundShareWorkOnly { shares } => {
+                view.kind = RoundQuiescenceKind::BackgroundShareWorkOnly;
+                view.shares = shares.into_iter().map(ShareKeyView::from).collect();
+            }
+            Q::Cancelled => view.kind = RoundQuiescenceKind::Cancelled,
+            Q::ChainTerminal { step, outcome } => {
+                view.kind = RoundQuiescenceKind::ChainTerminal;
+                view.step = Some(step.try_into()?);
+                view.chain_outcome = Some(outcome.into());
+            }
+            Q::ChainRecoveryStalled { step, outcome } => {
+                view.kind = RoundQuiescenceKind::ChainRecoveryStalled;
+                view.step = Some(step.try_into()?);
+                view.chain_outcome = Some(outcome.into());
+            }
+            Q::Failures => view.kind = RoundQuiescenceKind::Failures,
+            Q::PassBudgetExhausted { remaining } => {
+                view.kind = RoundQuiescenceKind::PassBudgetExhausted;
+                view.remaining = remaining
+                    .into_iter()
+                    .map(NextStepView::try_from)
+                    .collect::<Result<_, _>>()?;
+            }
+        }
+        Ok(view)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::round_drive::RoundStepFailureRecord> for RoundStepFailureRecordView {
+    type Error = VotingError;
+
+    fn try_from(record: crate::round_drive::RoundStepFailureRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            step: record.step.map(NextStepView::try_from).transpose()?,
+            bundle_index: record.bundle_index,
+            failure: record.failure.try_into()?,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::round_drive::RoundRunReport> for RoundRunReportView {
+    type Error = VotingError;
+
+    fn try_from(report: crate::round_drive::RoundRunReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            quiescence: report.quiescence.try_into()?,
+            plan: report.plan.map(RoundPlanView::try_from).transpose()?,
+            tally: report.tally.into(),
+            failures: report
+                .failures
+                .into_iter()
+                .map(RoundStepFailureRecordView::try_from)
+                .collect::<Result<_, _>>()?,
+            skipped_bundles: report.skipped_bundles,
+            chain_outcomes: report
+                .chain_outcomes
+                .into_iter()
+                .map(|(step, outcome)| {
+                    Ok(RoundChainOutcomeView {
+                        step: step.try_into()?,
+                        outcome: outcome.into(),
+                    })
+                })
+                .collect::<Result<_, VotingError>>()?,
+            share_deliveries: report
+                .share_deliveries
+                .into_iter()
+                .map(ShareBatchDeliveryReportView::from)
+                .collect(),
+            delegations: report
+                .delegations
+                .into_iter()
+                .map(SignedDelegationPayloadView::try_from)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TryFrom<crate::round_drive::RoundDriveEvent> for RoundDriveEventView {
+    type Error = VotingError;
+
+    fn try_from(event: crate::round_drive::RoundDriveEvent) -> Result<Self, Self::Error> {
+        use crate::round_drive::RoundDriveEvent as E;
+        let mut view = Self {
+            kind: RoundDriveEventKind::StepSelected,
+            step: None,
+            plan: None,
+            tally: None,
+            progress: None,
+            disposition: None,
+            failure_kind: None,
+            message: None,
+            delay_seconds: None,
+            bundle_index: None,
+        };
+        match event {
+            E::PlanRefreshed { plan, tally } => {
+                view.kind = RoundDriveEventKind::PlanRefreshed;
+                view.plan = Some((*plan).try_into()?);
+                view.tally = Some(tally.into());
+            }
+            E::StepSelected { step } => {
+                view.step = Some(step.try_into()?);
+            }
+            E::StepProgress { step, progress } => {
+                view.kind = RoundDriveEventKind::StepProgress;
+                view.step = Some(step.try_into()?);
+                view.progress = Some(progress.try_into()?);
+            }
+            E::StepFinished { step, disposition } => {
+                view.kind = RoundDriveEventKind::StepFinished;
+                view.step = Some(step.try_into()?);
+                view.disposition = Some(disposition.into());
+            }
+            E::StepFailed {
+                step,
+                kind,
+                message,
+            } => {
+                view.kind = RoundDriveEventKind::StepFailed;
+                view.step = Some(step.try_into()?);
+                view.failure_kind = Some(kind.into());
+                view.message = Some(message);
+            }
+            E::AwaitingRepoll { step, delay } => {
+                view.kind = RoundDriveEventKind::AwaitingRepoll;
+                view.step = Some(step.try_into()?);
+                view.delay_seconds = Some(delay.as_secs_f64());
+            }
+            E::BundleSkipped {
+                bundle_index,
+                after,
+            } => {
+                view.kind = RoundDriveEventKind::BundleSkipped;
+                view.bundle_index = Some(bundle_index);
+                view.step = Some(after.try_into()?);
+            }
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod chain_diagnostic_view;
+    mod error_view;
+    mod pir_snapshot_view;
+    mod round_drive_view;
+    mod share_tracking_drive_view;
+    mod step_failure_view;
+
     use super::*;
     use crate::vote::SignedVoteCommitment;
     use crate::VotingHotkey;
@@ -1345,6 +2338,9 @@ mod tests {
             privacy_trim_dropped_bundles: 1,
             privacy_trim_dropped_notes: 4,
             privacy_trim_dropped_value_zatoshi: 900,
+            skipped_suffix_bundles: 2,
+            skipped_suffix_notes: 7,
+            skipped_suffix_value_zatoshi: 1_100,
         };
         assert_eq!(view.bundle_count, 2);
         assert_eq!(view.eligible_weight, 50);
@@ -1358,6 +2354,9 @@ mod tests {
         assert_eq!(json["privacy_trim_dropped_bundles"], 1);
         assert_eq!(json["privacy_trim_dropped_notes"], 4);
         assert_eq!(json["privacy_trim_dropped_value_zatoshi"], 900);
+        assert_eq!(json["skipped_suffix_bundles"], 2);
+        assert_eq!(json["skipped_suffix_notes"], 7);
+        assert_eq!(json["skipped_suffix_value_zatoshi"], 1_100);
         assert!(json.get("privacy_trim").is_none());
     }
 
@@ -1540,7 +2539,10 @@ mod tests {
         let empty_error = VoteCommitmentBatchWire { votes: vec![] }
             .to_json()
             .unwrap_err();
-        assert!(empty_error.to_string().contains("between 1 and 15 actions"));
+        assert!(empty_error.to_string().contains(&format!(
+            "between 1 and {} actions",
+            crate::vote::MAX_VOTE_BATCH_ACTIONS
+        )));
 
         let maximum = VoteCommitmentBatchWire {
             votes: vec![vote.clone(); crate::vote::MAX_VOTE_BATCH_ACTIONS],
@@ -1560,9 +2562,10 @@ mod tests {
         }
         .to_json()
         .unwrap_err();
-        assert!(oversized_error
-            .to_string()
-            .contains("between 1 and 15 actions"));
+        assert!(oversized_error.to_string().contains(&format!(
+            "between 1 and {} actions",
+            crate::vote::MAX_VOTE_BATCH_ACTIONS
+        )));
     }
 
     #[test]
@@ -1625,8 +2628,23 @@ mod tests {
         // Results cached before privacy trimming shipped must still decode.
         let mut legacy_json = serde_json::to_value(&view).unwrap();
         legacy_json.as_object_mut().unwrap().remove("privacy_trim");
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped_suffix_bundles");
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped_suffix_notes");
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped_suffix_value_zatoshi");
         let decoded: VotingNoteSelectionResultView = serde_json::from_value(legacy_json).unwrap();
         assert_eq!(decoded.privacy_trim, Default::default());
+        assert_eq!(decoded.skipped_suffix_bundles, 0);
+        assert_eq!(decoded.skipped_suffix_notes, 0);
+        assert_eq!(decoded.skipped_suffix_value_zatoshi, 0);
     }
 
     #[test]
@@ -1670,13 +2688,135 @@ mod tests {
             2 * divisor
         );
 
+        voting_db
+            .delete_skipped_bundles(&params.vote_round_id, 1)
+            .unwrap();
         let resumed_round_view = VotingNoteSelectionResultView::from_selected_for_round(
-            selected,
+            selected.clone(),
             &voting_db,
             &params.vote_round_id,
         )
         .unwrap();
-        assert_eq!(resumed_round_view.eligible_weight_zatoshi, 2 * divisor);
+        assert_eq!(resumed_round_view.eligible_weight_zatoshi, divisor);
+        assert_eq!(resumed_round_view.skipped_suffix_bundles, 1);
+        assert_eq!(resumed_round_view.skipped_suffix_notes, 2);
+        assert_eq!(
+            resumed_round_view.skipped_suffix_value_zatoshi,
+            2 * note_value
+        );
+        assert_eq!(
+            crate::voting_power_for_round(&selected, &voting_db, &params.vote_round_id,).unwrap(),
+            divisor
+        );
+    }
+
+    #[test]
+    fn voting_note_selection_result_view_rejects_an_incomplete_persisted_plan() {
+        let divisor = crate::governance::BALLOT_DIVISOR;
+        let note_value = divisor * 3 / 5;
+        let selected = SelectedNotes {
+            notes: (1..=4)
+                .map(|position| test_note_ref(note_value, note_value, position))
+                .collect(),
+            snapshot_height: 100,
+            anchor_tree_state: test_tree_state(100),
+        };
+        let params = target_round_params(42);
+        let voting_db = crate::round::VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("selection-view-incomplete-plan");
+        voting_db
+            .ensure_round(Network::Regtest, &params, None)
+            .unwrap();
+        let policy = BundlePolicy::new(2).unwrap().with_max_privacy_bundles(None);
+        voting_db
+            .ensure_bundles_with_policy(
+                &params.vote_round_id,
+                &selected.voting_note_infos(),
+                policy,
+            )
+            .unwrap();
+
+        let incomplete_selection = SelectedNotes {
+            notes: selected.notes[..2].to_vec(),
+            snapshot_height: selected.snapshot_height,
+            anchor_tree_state: selected.anchor_tree_state,
+        };
+        let power_error =
+            crate::voting_power_for_round(&incomplete_selection, &voting_db, &params.vote_round_id)
+                .unwrap_err();
+        let error = VotingNoteSelectionResultView::from_selected_for_round(
+            incomplete_selection,
+            &voting_db,
+            &params.vote_round_id,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("produces 1 delegation bundles, but 2 bundle rows are already persisted"),
+            "{error}"
+        );
+        assert!(
+            power_error
+                .to_string()
+                .contains("produces 1 delegation bundles, but 2 bundle rows are already persisted"),
+            "{power_error}"
+        );
+    }
+
+    #[test]
+    fn round_reports_reject_a_reordered_persisted_prefix() {
+        let divisor = crate::governance::BALLOT_DIVISOR;
+        let note_value = divisor * 3 / 5;
+        let selected = SelectedNotes {
+            notes: (1..=4)
+                .map(|position| test_note_ref(note_value, note_value, position))
+                .collect(),
+            snapshot_height: 100,
+            anchor_tree_state: test_tree_state(100),
+        };
+        let params = target_round_params(42);
+        let voting_db = crate::round::VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("selection-view-reordered-prefix");
+        voting_db
+            .ensure_round(Network::Regtest, &params, None)
+            .unwrap();
+        let policy = BundlePolicy::new(2).unwrap().with_max_privacy_bundles(None);
+        voting_db
+            .ensure_bundles_with_policy(
+                &params.vote_round_id,
+                &selected.voting_note_infos(),
+                policy,
+            )
+            .unwrap();
+
+        let mut reordered_selection = selected;
+        reordered_selection
+            .notes
+            .push(test_note_ref(2 * divisor, 2 * divisor, 99));
+        let power_error =
+            crate::voting_power_for_round(&reordered_selection, &voting_db, &params.vote_round_id)
+                .unwrap_err();
+        let view_error = VotingNoteSelectionResultView::from_selected_for_round(
+            reordered_selection,
+            &voting_db,
+            &params.vote_round_id,
+        )
+        .unwrap_err();
+
+        assert!(
+            power_error
+                .to_string()
+                .contains("notes do not match persisted setup"),
+            "{power_error}"
+        );
+        assert!(
+            view_error
+                .to_string()
+                .contains("notes do not match persisted setup"),
+            "{view_error}"
+        );
     }
 
     #[test]
@@ -1686,6 +2826,7 @@ mod tests {
             pending_recovery: true,
             blocking_recovery: true,
             blocking_share_work: false,
+            has_unconfirmed_shares: true,
             hotkey_bound: true,
             completed_vote_artifact: true,
             completed_for_display: false,
@@ -1697,28 +2838,36 @@ mod tests {
                 voted_at: Some(123),
             }),
             needs_draft_setup: false,
+            needs_bundle_setup: false,
+            needs_delegation_signing: true,
+            delegation_bundles_needing_work: Vec::new(),
+            delegation_bundles_needing_signing: Vec::new(),
+            has_in_flight_delegation: true,
+            needs_vote_polling: true,
+            has_remaining_vote_or_share_work: true,
+            has_recoverable_vote_or_share_work: true,
             primary_action: session::RoundPlanAction::Vote,
             next_steps: vec![
                 session::NextStep::Delegate { bundle_index: 1 },
-                session::NextStep::PollDelegation { bundle_index: 2 },
+                session::NextStep::AdvanceDelegation { bundle_index: 2 },
                 session::NextStep::CastVote {
                     bundle_index: 3,
                     proposal_id: 11,
                     choice: 1,
                 },
-                session::NextStep::SubmitVote {
+                session::NextStep::AdvanceVote {
                     bundle_index: 4,
                     proposal_id: 12,
                 },
-                session::NextStep::SubmitVoteBatch {
+                session::NextStep::AdvanceVoteBatch {
                     bundle_index: 5,
                     proposal_id: 13,
                 },
-                session::NextStep::PollVote {
+                session::NextStep::AdvanceVote {
                     bundle_index: 6,
                     proposal_id: 14,
                 },
-                session::NextStep::PollVoteBatch {
+                session::NextStep::AdvanceVoteBatch {
                     bundle_index: 7,
                     proposal_id: 15,
                 },
@@ -1732,21 +2881,32 @@ mod tests {
                     proposal_id: 15,
                     share_index: 1,
                 },
+                session::NextStep::AdvanceImportedDelegation { bundle_index: 10 },
             ],
             delegation_statuses: vec![session::DelegationStatus {
                 bundle_index: 2,
                 phase: crate::phases::DelegationPhase::Submitted,
                 tx_hash: Some("delegation-tx".to_string()),
+                submission_diagnostic: None,
+                terminal: false,
             }],
-            recovered_delegation_work: vec![session::DelegationRecoveryWork {
-                kind: session::DelegationRecoveryWorkKind::PollDelegation,
-                bundle_index: 2,
-                phase: crate::phases::DelegationPhase::Submitted,
-                tx_hash: Some("delegation-tx".to_string()),
-            }],
+            recovered_delegation_work: vec![
+                session::DelegationRecoveryWork {
+                    kind: session::DelegationRecoveryWorkKind::AdvanceDelegation,
+                    bundle_index: 2,
+                    phase: crate::phases::DelegationPhase::Submitted,
+                    tx_hash: Some("delegation-tx".to_string()),
+                },
+                session::DelegationRecoveryWork {
+                    kind: session::DelegationRecoveryWorkKind::AdvanceImportedDelegation,
+                    bundle_index: 10,
+                    phase: crate::phases::DelegationPhase::SubmissionManaged,
+                    tx_hash: Some("imported-delegation-tx".to_string()),
+                },
+            ],
             recovered_vote_work: vec![
                 session::VoteRecoveryWork {
-                    kind: session::VoteRecoveryWorkKind::SubmitVoteBatch,
+                    kind: session::VoteRecoveryWorkKind::AdvanceVoteBatch,
                     bundle_index: 4,
                     proposal_id: 12,
                     tx_hash: None,
@@ -1754,7 +2914,7 @@ mod tests {
                     share_indexes: Vec::new(),
                 },
                 session::VoteRecoveryWork {
-                    kind: session::VoteRecoveryWorkKind::PollVoteBatch,
+                    kind: session::VoteRecoveryWorkKind::AdvanceVoteBatch,
                     bundle_index: 5,
                     proposal_id: 13,
                     tx_hash: Some("batch-tx".to_string()),
@@ -1771,6 +2931,7 @@ mod tests {
                 },
             ],
             open_proposals: vec![11, 12],
+            unrostered_intents: Vec::new(),
             immediate_share_key: Some(crate::share_policy::ImmediateShareKey {
                 bundle_index: 7,
                 proposal_id: 11,
@@ -1803,7 +2964,7 @@ mod tests {
             Some(123)
         );
         assert!(!view.needs_draft_setup);
-        assert_eq!(view.primary_action, "vote");
+        assert_eq!(view.primary_action, crate::wire::RoundPlanActionKind::Vote);
         assert_eq!(view.open_proposals, vec![11, 12]);
         assert_eq!(
             view.immediate_share_key,
@@ -1818,35 +2979,61 @@ mod tests {
         let kinds = view
             .next_steps
             .iter()
-            .map(|step| step.kind.as_str())
+            .map(|step| {
+                serde_json::to_value(step.kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
             vec![
                 "delegate",
-                "poll_delegation",
+                "advance_delegation",
                 "cast_vote",
-                "submit_vote",
-                "submit_vote_batch",
-                "poll_vote",
-                "poll_vote_batch",
+                "advance_vote",
+                "advance_vote_batch",
+                "advance_vote",
+                "advance_vote_batch",
                 "submit_shares",
-                "confirm_share"
+                "confirm_share",
+                "advance_imported_delegation"
             ]
         );
         assert_eq!(view.next_steps[0].bundle_index, 1);
         assert_eq!(view.next_steps[2].proposal_id, 11);
         assert_eq!(view.next_steps[2].choice, 1);
         assert_eq!(view.next_steps[8].share_index, 1);
-        assert_eq!(view.delegation_statuses[0].phase, "submitted_delegation");
-        assert_eq!(view.recovered_delegation_work[0].kind, "poll_delegation");
-        assert_eq!(view.recovered_vote_work[0].kind, "submit_vote_batch");
-        assert_eq!(view.recovered_vote_work[1].kind, "poll_vote_batch");
+        assert_eq!(
+            view.delegation_statuses[0].phase,
+            crate::wire::WorkflowPhaseView::SubmittedDelegation
+        );
+        assert_eq!(
+            view.recovered_delegation_work[0].kind,
+            crate::wire::DelegationRecoveryWorkKindView::AdvanceDelegation
+        );
+        assert_eq!(
+            view.recovered_delegation_work[1].kind,
+            crate::wire::DelegationRecoveryWorkKindView::AdvanceImportedDelegation
+        );
+        assert_eq!(
+            view.recovered_vote_work[0].kind,
+            crate::wire::VoteRecoveryWorkKindView::AdvanceVoteBatch
+        );
+        assert_eq!(
+            view.recovered_vote_work[1].kind,
+            crate::wire::VoteRecoveryWorkKindView::AdvanceVoteBatch
+        );
         assert_eq!(
             view.recovered_vote_work[1].tx_hash.as_deref(),
             Some("batch-tx")
         );
-        assert_eq!(view.recovered_vote_work[2].kind, "submit_shares");
+        assert_eq!(
+            view.recovered_vote_work[2].kind,
+            crate::wire::VoteRecoveryWorkKindView::SubmitShares
+        );
         assert_eq!(view.recovered_vote_work[2].vc_tree_position, Some(99));
         assert_eq!(view.recovered_vote_work[2].share_indexes, vec![0, 1]);
     }

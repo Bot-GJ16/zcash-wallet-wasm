@@ -4,23 +4,35 @@
 //! prelude intentionally contains the setup, precompute, and delegation types
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
-pub use crate::confirmation::{
-    confirm_delegation_submission, confirm_vote_batch_submission, confirm_vote_submission,
-    DelegationConfirmation, TxEvent, TxEventAttribute, VoteBatchConfirmation, VoteConfirmation,
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::chain_submission::{
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
+    ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
+    ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
+    ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::delegate::gather_delegation_lwd_inputs;
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
-    branch_id_for_height, display_memo, pczt_sighash, record_submission, record_van_position,
-    setup as setup_delegation, signing_request as delegation_signing_request, spend_auth_signature,
-    submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
-    DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
-    DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
+    branch_id_for_height, display_memo, pczt_sighash, setup as setup_delegation,
+    signing_request as delegation_signing_request, spend_auth_signature, BranchIdProvider,
+    DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
+    DelegationProofCompletion, DelegationProofStatus, DelegationSetup, DelegationSigningRequest,
+    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner,
+    SignedDelegationBundle,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::delegate::{
-    gather_delegation_lwd_inputs, load_account_keys, prepare_delegation_bundle,
-    prepare_delegation_bundle_for_target,
+    load_account_keys, prepare_delegation_bundle, prepare_delegation_bundle_for_target,
 };
 pub use crate::delegate::{
     PrepareDelegationBundleForTargetParams, PrepareDelegationBundleParams, PreparedDelegationBundle,
@@ -31,7 +43,15 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
-pub use crate::error::VotingError;
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::delegation_pipeline::{
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
+};
+pub use crate::error::{
+    DelegationSetupField, VotingError, VotingErrorKind, VotingErrorKindView, VotingErrorView,
+};
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
@@ -58,6 +78,8 @@ pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::connect_pir_blocking;
 pub use crate::pir::{connect_pir, negotiated_pir_layout, select_pir_endpoint, PirEndpoint};
 #[cfg(not(target_arch = "wasm32"))]
+pub use crate::pir::{PirFleet, PirProofSource, PirSession};
+#[cfg(not(target_arch = "wasm32"))]
 pub use crate::precompute::{note_witnesses, stored_note_witnesses, sync_vote_tree};
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::precompute::{precompute_pir_proofs, precompute_snapshot_bundles};
@@ -65,14 +87,20 @@ pub use crate::precompute::{
     validate_cached_pir_proofs, verify_witness, PirPrecomputeReport, SnapshotBundlePrecomputeReport,
 };
 pub use crate::recovery::{
-    clear as clear_recovery, recoverable_commitment_bundle, round_snapshot, DelegationRecovery,
-    RecoverableCommitmentBundle, RoundRecoverySnapshot, ShareWorkflow, VoteRecovery,
+    recoverable_commitment_bundle, round_snapshot, DelegationRecovery, RecoverableCommitmentBundle,
+    RoundRecoverySnapshot, ShareWorkflow, VoteRecovery,
 };
 pub use crate::round::{
     bundle_notes_for_index_for_round, bundle_notes_for_index_with_policy, delegation_round_name,
     note_bundles, note_bundles_for_round, note_bundles_with_policy, quantized_bundle_set_weight,
     quantized_bundle_weight, raw_bundle_weight, validate_bundle_index, BundleLayout, RoundInfo,
     RoundParams, VotingDb,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::round_drive::{
+    FailureIsolation, NoopRoundDriveReporter, ProgressBaseline, RoundDriveEvent, RoundDrivePolicy,
+    RoundDriveReporter, RoundDriveReporterBridge, RoundDriver, RoundHostSource,
+    RoundHostSourceBridge, RoundQuiescence, RoundRunReport, RoundStepFailureRecord, RoundWorkTally,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::selection::select_notes_with_lwd;
@@ -100,6 +128,13 @@ pub use crate::share_tracking::{
     ShareDeliverySubmissionParams, ShareKey, SharePlacementGuarantee, ShareSubmissionReport,
     ShareTrackingFlags, ShareTrackingParams, ShareTrackingReport,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::share_tracking_drive::{
+    NoopShareTrackingReporter, ShareTrackingDrivePolicy, ShareTrackingDriver, ShareTrackingEvent,
+    ShareTrackingHostContext, ShareTrackingHostSource, ShareTrackingHostSourceBridge,
+    ShareTrackingQuiescence, ShareTrackingReporter, ShareTrackingReporterBridge,
+    ShareTrackingRunReport,
+};
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,
     DelegationProgressReporter, Network, NoopProgressReporter, NoteInfo, NoteRef,
@@ -111,15 +146,24 @@ pub use crate::types::{
 pub use crate::vote::{
     commit as commit_vote, commit_atomic_vote_batch, commit_batch, parse_recovery,
     persist_prepared_atomic_vote_batch, persist_prepared_commit, persist_prepared_commit_batch,
-    prepare_atomic_vote_batch, prepare_commit, prepare_commit_batch,
-    record_batch_submission as record_vote_batch_submission,
-    record_submission as record_vote_submission, record_vc_position, recover_atomic_vote_batch,
-    recover_signed_commitments, recovery_bundle, serialize_recovery, submission as vote_submission,
-    validate_draft_vote, validate_draft_votes, AtomicVoteBatch, CommittedVote, DraftVote,
-    PreparedAtomicVoteBatch, PreparedVoteCommit, PreparedVoteCommitments, SignedVoteBatch,
-    SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit,
-    VoteCommitBatch, VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
+    prepare_atomic_vote_batch, prepare_commit, prepare_commit_batch, recover_atomic_vote_batch,
+    recover_signed_commitments, recovery_bundle, serialize_recovery, validate_draft_vote,
+    validate_draft_votes, AtomicVoteBatch, CommittedVote, DraftVote, PreparedAtomicVoteBatch,
+    PreparedVoteCommit, PreparedVoteCommitments, SignedVoteBatch, SignedVoteCommitment,
+    SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit, VoteCommitBatch,
+    VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
     DEFAULT_BATCH_PROOF_CONCURRENCY, MAX_VOTE_BATCH_ACTIONS,
+};
+pub use crate::vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::vote_work::{
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter, ProposalRosterEntry,
+    RoundBinding, RoundExecutor, RoundHostContext, RoundStepDisposition, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge,
+    RoundStepProgressReporter, VoteRecoveryKey, VoteShareDeliveryReport,
 };
 pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,
@@ -135,4 +179,18 @@ pub use crate::precompute::{reset_vote_tree, reset_voting_session_state, van_wit
 pub use crate::selection::{
     gather_delegation_wallet_inputs_from_parts, GatherDelegationWalletInputs,
 };
+// Optional invocation diagnostics.
+pub use crate::observability::{
+    ObservabilityOptions, ObservationAttribution, ObservationOutcome, ObservationRecord,
+    ObservationSummary, OperationObservability, OperationReport,
+};
+
+/// Atomic delegation-and-cast preparation for upgraded vote chains.
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::delegate_and_vote_batch::{
+    persist_delegate_and_vote_batch, prepare_delegate_and_vote_batch,
+    recover_delegate_and_vote_batch, DelegateAndVoteBatchRequest,
+};
+
 pub use crate::witness::store_tree_state_and_witnesses;
+pub use crate::{configure_proving_runtime, ProvingConfigurationError, ProvingPolicy};

@@ -16,10 +16,7 @@ pub(crate) use crate::backend::pasta_curves;
 pub(crate) use crate::backend::zcash_client_sqlite;
 use std::borrow::Borrow;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use zcash_client_sqlite::WalletDb;
@@ -35,6 +32,15 @@ use crate::{
 use crate::{delegate::PreparedDelegationReport, round::BundleLayout, types::Network};
 
 pub use crate::vote::VanWitness;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod vote_tree_registry;
+#[cfg(target_arch = "wasm32")]
+#[path = "vote_tree_registry_browser.rs"]
+mod vote_tree_registry;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use vote_tree_registry::vote_tree_for;
 
 /// Validate public snapshot identity before gathering private wallet inputs.
 pub fn validate_snapshot_tree_state(
@@ -55,9 +61,6 @@ pub fn validate_snapshot_tree_state(
     }
     Ok(())
 }
-
-static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, Arc<crate::tree_sync::VoteTreeSync>>>> =
-    OnceLock::new();
 
 /// Result of PIR precomputation for one delegation bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,14 +95,63 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    crate::witness::store_tree_state_and_generate_note_witnesses(
+    observe_note_witnesses(
         db,
         round_id,
         bundle_index,
         tree_state_bytes,
         notes,
         wallet_db,
+        &crate::ObservationScope::disabled(),
     )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    tree_state_bytes: &[u8],
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::note_witnesses");
+    let observations = observation_stage.scope();
+    let operation_result: Result<Vec<WitnessData>, VotingError> = (|| {
+        crate::witness::observe_store_tree_state_and_generate_note_witnesses(
+            db,
+            round_id,
+            bundle_index,
+            tree_state_bytes,
+            notes,
+            wallet_db,
+            observations,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Loads a round's cached tree state, generates shielded note witnesses, and caches them.
@@ -119,9 +171,61 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    let witnesses = crate::witness::generate_note_witnesses(db, round_id, notes, wallet_db)?;
-    db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
-    Ok(witnesses)
+    observe_stored_note_witnesses(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        wallet_db,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_stored_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::stored_note_witnesses");
+    let observations = observation_stage.scope();
+    let operation_result: Result<Vec<WitnessData>, VotingError> = (|| {
+        let witnesses = crate::witness::observe_generate_note_witnesses(
+            db,
+            round_id,
+            notes,
+            wallet_db,
+            observations,
+        )?;
+        db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
+        Ok(witnesses)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Verifies a shielded note witness against its stored root.
@@ -145,24 +249,111 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
 ///
 /// For each confirmed bundle that has not yet submitted a vote, this also
 /// verifies that the confirmed event position contains its delegation VAN.
+///
+/// This asks for no particular route. It continues on whichever of the
+/// wallet's tree clients already holds the round, so incremental state is
+/// kept, and otherwise on the client most recently used: a wallet a host
+/// routed over its own transport is never downgraded to the direct HTTP
+/// transport. Use [`sync_vote_tree_with`] to require a specific route.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
-    vote_tree_sync_for(db)?.sync(db, round_id, node_url)
+    vote_tree_registry::vote_tree_for_round(db, round_id)?.sync(db, round_id, node_url)
+}
+
+/// Same as [`sync_vote_tree`], but the wallet's tree client routes over
+/// `transport`.
+///
+/// The process keeps one tree client per wallet and transport. A sync over a
+/// transport the wallet has not used before gets its own client and resyncs
+/// from scratch; the clients of other transports, and their synced state,
+/// are untouched. Pass the same transport on every call for a wallet to keep
+/// the incremental state; hosts that clone one `Arc` per wallet already do.
+///
+/// A routed client is retained after every caller-owned clone of its
+/// transport is gone for as long as it holds any round's tree state, so a
+/// sync followed by [`van_witness`] works even when the transport was moved
+/// into the call. Until that state is dropped, an unrouted [`sync_vote_tree`]
+/// for one of its rounds continues on it. To release the route, reset its
+/// rounds with [`reset_vote_tree`] (a round id, or `""` for the wallet); the
+/// client is also dropped when the last connection to the sidecar closes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sync_vote_tree_with(
+    db: &VotingDb,
+    round_id: &str,
+    node_url: &str,
+    transport: Arc<dyn vote_commitment_tree_client::transport::Transport>,
+) -> Result<u32, VotingError> {
+    vote_tree_for(db, Some(transport))?.sync(db, round_id, node_url)
 }
 
 /// Generates the VAN witness needed by `vote::commit`.
+///
+/// Served by the wallet's tree client that holds the round, synced furthest,
+/// so a witness after [`sync_vote_tree`] uses that sync's state even when
+/// another executor for the wallet synced over a different transport in
+/// between.
 pub fn van_witness(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     anchor_height: u32,
 ) -> Result<VanWitness, VotingError> {
-    vote_tree_sync_for(db)?.generate_van_witness(db, round_id, bundle_index, anchor_height)
+    observe_van_witness(
+        db,
+        round_id,
+        bundle_index,
+        anchor_height,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_van_witness(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    anchor_height: u32,
+    observations: &crate::ObservationScope,
+) -> Result<VanWitness, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::van_witness");
+    let operation_result: Result<VanWitness, VotingError> = (|| {
+        vote_tree_registry::vote_tree_for_round(db, round_id)?.generate_van_witness(
+            db,
+            round_id,
+            bundle_index,
+            anchor_height,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Drops cached vote tree state for one round, or all rounds when `round_id` is empty.
+///
+/// A round-scoped reset drops the round on every tree client the wallet has,
+/// whatever transport each is bound to. An account-wide reset also forgets
+/// the clients and their transports, so the next sync binds afresh.
 pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError> {
-    vote_tree_sync_for(db)?.reset(round_id)
+    if round_id.is_empty() {
+        return vote_tree_registry::forget_wallet(db);
+    }
+    vote_tree_registry::reset_round(db, round_id)
 }
 
 /// Drops cached vote tree state and, for round-scoped resets, clears locally
@@ -170,14 +361,10 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
 /// can be rebuilt safely. Imported delegation capabilities and bundles with a
 /// successful persisted proof are preserved.
 ///
-/// Round-scoped cleanup is mainly for the restart mid-signing case: if the app
-/// dies after `build_governance_pczt` persisted `pczt_sighash` (and related
-/// setup columns) but before the user finishes signing, the next startup tries
-/// to rebuild the Keystone request and `store_delegation_data` refuses to
-/// overwrite those fields. Clearing unsigned setup for that round lets setup
-/// run again without touching bundles that already have a successful proof,
-/// Keystone signatures, or a stored `delegation_tx_hash`. Proved bundles retain
-/// the setup fields that later signing must reproduce.
+/// Use [`reset_vote_tree`] for ordinary navigation or session disposal. The
+/// exact signing transaction is durable and can be reused after restart.
+/// This stronger reset explicitly abandons unfinished setup. It does not stop
+/// a running proof, but that proof cannot persist after its setup is cleared.
 ///
 /// When `round_id` is empty, only the process-local vote tree cache is reset
 /// account-wide; no persisted delegation setup columns are cleared.
@@ -189,18 +376,14 @@ pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), V
     Ok(())
 }
 
-fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
-    let wallet_id = db.wallet_id();
-    let mut guard = VOTE_TREE_SYNCS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|e| VotingError::Internal {
-            message: format!("vote tree sync registry lock poisoned: {e}"),
-        })?;
-    Ok(guard
-        .entry(wallet_id)
-        .or_insert_with(|| Arc::new(crate::tree_sync::VoteTreeSync::new()))
-        .clone())
+/// Rounds whose vote tree the wallet currently holds in memory, on any of
+/// its tree clients.
+///
+/// Observes only; it never creates a client. A round appears from its first
+/// sync attempt until [`reset_vote_tree`] drops it, so a host can see what a
+/// reset would discard.
+pub fn cached_vote_tree_rounds(db: &VotingDb) -> Vec<String> {
+    vote_tree_registry::cached_rounds(db)
 }
 
 /// Fetches and persists PIR-backed IMT non-membership proofs for one bundle.
@@ -212,15 +395,58 @@ pub fn delegation_pir(
     round_id: &str,
     bundle_index: u32,
     notes: &[NoteInfo],
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
-    let result =
-        db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network)?;
-    Ok(PirPrecomputeReport {
-        cached: result.cached_count,
-        fetched: result.fetched_count,
-    })
+    observe_delegation_pir(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        pir_client,
+        network,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_delegation_pir(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    pir_client: &dyn crate::pir::PirProofSource,
+    network: Network,
+    observations: &crate::ObservationScope,
+) -> Result<PirPrecomputeReport, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::delegation_pir");
+    let operation_result: Result<PirPrecomputeReport, VotingError> = (|| {
+        let result =
+            db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network)?;
+        Ok(PirPrecomputeReport {
+            cached: result.cached_count,
+            fetched: result.fetched_count,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Fetches and persists PIR proofs for notes that survive `bundle_policy`.
@@ -248,9 +474,75 @@ pub fn precompute_pir_proofs(
     notes: &[NoteInfo],
     bundle_policy: crate::note_bundling::BundlePolicy,
     network: Network,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
 ) -> Result<PirCachePrecomputeResult, VotingError> {
-    db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client)
+    observe_precompute_pir_proofs(
+        db,
+        notes,
+        bundle_policy,
+        network,
+        pir_client,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+/// Warms the round-independent PIR proof cache with optional per-call diagnostics.
+///
+/// Uses the same cache pruning, validation, fetches, and errors as
+/// [`precompute_pir_proofs`]. Diagnostics survive failed fetches. No round or
+/// bundle attribution is assigned because this cache can be warmed before either exists.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn precompute_pir_proofs_with_report(
+    db: &VotingDb,
+    notes: &[NoteInfo],
+    bundle_policy: crate::note_bundling::BundlePolicy,
+    network: Network,
+    pir_client: &dyn crate::pir::PirProofSource,
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<PirCachePrecomputeResult, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let result = observe_precompute_pir_proofs(
+        db,
+        notes,
+        bundle_policy,
+        network,
+        pir_client,
+        invocation.scope(),
+    );
+    let outcome = if result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    invocation.complete("precompute::mod::precompute_pir_proofs", outcome, result)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_precompute_pir_proofs(
+    db: &VotingDb,
+    notes: &[NoteInfo],
+    bundle_policy: crate::note_bundling::BundlePolicy,
+    network: Network,
+    pir_client: &dyn crate::pir::PirProofSource,
+    observations: &crate::ObservationScope,
+) -> Result<PirCachePrecomputeResult, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("precompute::mod::precompute_pir_proofs");
+    let operation_result: Result<PirCachePrecomputeResult, VotingError> =
+        (|| db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Classifies the cached PIR proofs for the given nullifiers against an
@@ -263,7 +555,42 @@ pub fn validate_cached_pir_proofs(
     network: Network,
     expected_root: &[u8],
 ) -> Result<PirCacheValidationReport, VotingError> {
-    db.validate_pir_proof_cache(notes, extra_nullifiers, network, expected_root)
+    observe_validate_cached_pir_proofs(
+        db,
+        notes,
+        extra_nullifiers,
+        network,
+        expected_root,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_validate_cached_pir_proofs(
+    db: &VotingDb,
+    notes: &[NoteInfo],
+    extra_nullifiers: &[Vec<u8>],
+    network: Network,
+    expected_root: &[u8],
+    observations: &crate::ObservationScope,
+) -> Result<PirCacheValidationReport, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage =
+        attributed_observations.stage("precompute::mod::validate_cached_pir_proofs");
+    let operation_result: Result<PirCacheValidationReport, VotingError> =
+        (|| db.validate_pir_proof_cache(notes, extra_nullifiers, network, expected_root))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Persists the canonical bundle plan for a snapshot-stable note set, samples
@@ -301,47 +628,119 @@ pub fn precompute_snapshot_bundles(
     round_id: &str,
     notes: &[NoteInfo],
     bundle_policy: BundlePolicy,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<SnapshotBundlePrecomputeReport, VotingError> {
-    db.require_round_network(round_id, network, "snapshot bundle precompute")?;
-    let layout = db.ensure_bundles_with_policy(round_id, notes, bundle_policy)?;
-    if layout.bundle_count == 0 {
-        return Ok(SnapshotBundlePrecomputeReport {
-            layout,
-            bundles: Vec::new(),
-        });
-    }
+    observe_precompute_snapshot_bundles(
+        db,
+        round_id,
+        notes,
+        bundle_policy,
+        pir_client,
+        network,
+        &crate::ObservationScope::disabled(),
+    )
+}
 
-    let policy = db.effective_bundle_policy(round_id, bundle_policy)?;
-    let planned = crate::round::note_bundles_with_policy(notes, policy)?;
-    if planned.len() as u32 != layout.bundle_count {
-        return Err(VotingError::Internal {
-            message: format!(
-                "planned bundle count {} does not match persisted layout {}",
-                planned.len(),
-                layout.bundle_count
-            ),
-        });
-    }
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_precompute_snapshot_bundles(
+    db: &VotingDb,
+    round_id: &str,
+    notes: &[NoteInfo],
+    bundle_policy: BundlePolicy,
+    pir_client: &dyn crate::pir::PirProofSource,
+    network: Network,
+    observations: &crate::ObservationScope,
+) -> Result<SnapshotBundlePrecomputeReport, VotingError> {
+    observations.bind_round_id(round_id);
 
-    for (bundle_index, bundle_notes) in planned.iter().enumerate() {
-        db.ensure_padded_secrets(round_id, bundle_index as u32, bundle_notes)?;
-    }
+    let attributed_observations = observations.clone();
+    let observation_stage =
+        attributed_observations.stage("precompute::mod::precompute_snapshot_bundles");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SnapshotBundlePrecomputeReport, VotingError> = (|| {
+        db.require_round_network(round_id, network, "snapshot bundle precompute")?;
+        let layout = db.ensure_bundles_with_policy(round_id, notes, bundle_policy)?;
+        if layout.bundle_count == 0 {
+            return Ok(SnapshotBundlePrecomputeReport {
+                layout,
+                bundles: Vec::new(),
+            });
+        }
 
-    let mut bundles = Vec::with_capacity(planned.len());
-    for (bundle_index, bundle_notes) in planned.iter().enumerate() {
-        bundles.push(delegation_pir(
-            db,
-            round_id,
-            bundle_index as u32,
-            bundle_notes,
-            pir_client,
-            network,
-        )?);
-    }
+        let policy = db.effective_bundle_policy(round_id, bundle_policy)?;
+        let planned = crate::round::note_bundles_with_policy(notes, policy)?;
+        if planned.len() as u32 != layout.bundle_count {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "planned bundle count {} does not match persisted layout {}",
+                    planned.len(),
+                    layout.bundle_count
+                ),
+            });
+        }
 
-    Ok(SnapshotBundlePrecomputeReport { layout, bundles })
+        for (bundle_index, bundle_notes) in planned.iter().enumerate() {
+            db.ensure_padded_secrets(round_id, bundle_index as u32, bundle_notes)?;
+        }
+
+        let mut bundles = Vec::with_capacity(planned.len());
+        for (bundle_index, bundle_notes) in planned.iter().enumerate() {
+            bundles.push(observe_delegation_pir(
+                db,
+                round_id,
+                bundle_index as u32,
+                bundle_notes,
+                pir_client,
+                network,
+                observations,
+            )?);
+        }
+
+        Ok(SnapshotBundlePrecomputeReport { layout, bundles })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn precompute_snapshot_bundles_with_report(
+    db: &VotingDb,
+    round_id: &str,
+    notes: &[NoteInfo],
+    bundle_policy: BundlePolicy,
+    pir_client: &dyn crate::pir::PirProofSource,
+    network: Network,
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<SnapshotBundlePrecomputeReport, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let operation_result = observe_precompute_snapshot_bundles(
+        db,
+        round_id,
+        notes,
+        bundle_policy,
+        pir_client,
+        network,
+        invocation.scope(),
+    );
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    invocation.complete("precompute_snapshot_bundles", outcome, operation_result)
 }
 
 /// Initializes padded-note secrets and runs PIR precompute.
@@ -360,11 +759,20 @@ pub(crate) fn warm_delegation_pir(
     bundle_index: u32,
     notes: &[NoteInfo],
     layout: BundleLayout,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
+    observations: &crate::ObservationScope,
 ) -> Result<PreparedDelegationReport, VotingError> {
     db.ensure_padded_secrets(round_id, bundle_index, notes)?;
-    let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
+    let report = observe_delegation_pir(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        pir_client,
+        network,
+        observations,
+    )?;
 
     Ok(PreparedDelegationReport {
         report,
@@ -486,6 +894,9 @@ mod pir_tests {
             privacy_trim_dropped_bundles: 0,
             privacy_trim_dropped_notes: 0,
             privacy_trim_dropped_value_zatoshi: 0,
+            skipped_suffix_bundles: 0,
+            skipped_suffix_notes: 0,
+            skipped_suffix_value_zatoshi: 0,
         };
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
@@ -494,6 +905,9 @@ mod pir_tests {
         )
         .unwrap();
 
+        let owner =
+            crate::ObservationScope::new(Some(crate::ObservabilityOptions::default())).invocation();
+        let parent = owner.stage("delegation.precompute");
         let err = warm_delegation_pir(
             &db,
             ROUND_ID,
@@ -502,9 +916,22 @@ mod pir_tests {
             layout,
             &pir_client,
             Network::Testnet,
+            parent.scope(),
         )
         .unwrap_err();
 
+        parent.finish(crate::ObservationOutcome::Failed, None);
+        let diagnostics = owner
+            .finish(
+                "precompute",
+                Some(ROUND_ID),
+                crate::ObservationOutcome::Failed,
+            )
+            .unwrap();
+        assert!(diagnostics
+            .records
+            .iter()
+            .any(|record| record.stage.ends_with("delegation_pir") && record.parent_id == Some(0)));
         let message = err.to_string();
         assert!(
             message.contains("failed to decode UFVK while deriving padded nullifiers")
@@ -819,16 +1246,13 @@ mod pir_tests {
     #[test]
     fn precompute_snapshot_bundles_reuses_cached_real_note_proofs_for_a_full_bundle() {
         use crate::backend::{orchard, pasta_curves, zcash_keys};
-        use orchard::{
-            note::{NoteVersion, Rho},
-            value::NoteValue,
-        };
+        use orchard::{note::NoteVersion, value::NoteValue};
         use pasta_curves::group::ff::PrimeField;
         use pasta_curves::pallas;
         use voting_circuits::delegation::ImtProvider;
         use voting_crypto_deps::rand::rngs::OsRng;
+        use voting_crypto_deps::zip32::{AccountId, Scope};
         use zcash_keys::keys::UnifiedSpendingKey;
-        use zip32::{AccountId, Scope};
 
         let seed = [0x42u8; 32];
         let account = AccountId::try_from(0u32).unwrap();
@@ -840,11 +1264,12 @@ mod pir_tests {
         let mut rng = OsRng;
         let mut notes = Vec::new();
         for position in 0..crate::governance::BUNDLE_NOTE_SLOTS {
-            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V2);
-            let note = orchard::Note::new(
+            let (_, _, parent_note) =
+                voting_crypto_deps::dummy_note(&mut rng, None, NoteVersion::V2);
+            let note = voting_crypto_deps::new_note(
                 address,
                 NoteValue::from_raw(13_000_000),
-                Rho::from_nf_old(parent_note.nullifier(&fvk)),
+                voting_crypto_deps::rho_from_nullifier(parent_note.nullifier(&fvk)),
                 NoteVersion::V3,
                 &mut rng,
             );
@@ -1181,6 +1606,7 @@ mod session_reset_tests {
         conn.execute(
             "UPDATE bundles
              SET pczt_sighash = :sighash,
+                 rk = :rk,
                  tx1_effects = :tx1_effects,
                  padded_note_secrets = :secrets,
                  padded_note_data = :padded
@@ -1192,6 +1618,7 @@ mod session_reset_tests {
                 ":wallet_id": WALLET_ID,
                 ":bundle_index": bundle_index,
                 ":sighash": vec![0xAAu8; 32],
+                ":rk": vec![0x22u8; 32],
                 ":tx1_effects": crate::tx1::placeholder_tx1_effects(),
                 ":secrets": vec![0xBBu8; 64],
                 ":padded": vec![0xCCu8; 32],
@@ -1280,6 +1707,34 @@ mod session_reset_tests {
     }
 
     #[test]
+    fn reset_voting_session_state_scopes_submission_protection_to_its_bundle() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(crate::Network::Testnet, &round_params(ROUND_ID), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        seed_unsigned_setup_fields(&db, ROUND_ID, 0);
+        seed_unsigned_setup_fields(&db, ROUND_ID, 1);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, proposal_id, generation_digest, state, committed_post_reservations,
+                  diagnostic_kind, diagnostic, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 0, 'reconciliation_pending',
+                         'possible dispatch awaits tree recovery', 10, 10)",
+                rusqlite::params![vec![0x31_u8; 32], ROUND_ID, WALLET_ID, vec![0x32_u8; 32]],
+            )
+            .unwrap();
+
+        reset_voting_session_state(&db, ROUND_ID).unwrap();
+
+        assert!(has_unsigned_setup_fields(&db, ROUND_ID, 0));
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 1));
+    }
+
+    #[test]
     fn confirmed_local_delegation_survives_recovery_and_session_cleanup() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
@@ -1322,7 +1777,6 @@ mod session_reset_tests {
         // position guard when a standalone confirmation write preceded its hash.
         db.store_delegation_tx_hash(ROUND_ID, 0, "confirmed-delegation")
             .unwrap();
-        db.clear_recovery_state(ROUND_ID).unwrap();
         assert_eq!(
             db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
             Some("confirmed-delegation")
@@ -1388,3 +1842,10 @@ mod session_reset_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "tests/observability.rs"]
+mod observability_tests;

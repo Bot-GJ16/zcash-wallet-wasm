@@ -15,7 +15,7 @@ exports `pkg/` with its SHA-256 manifest. It does not build the browser extensio
   the Dockerfile.
 
 The container uses Linux amd64, pinned Rust and Node image digests,
-`nightly-2025-11-15`, `wasm-pack 0.15.0`, `wasm-bindgen 0.2.122`, and
+`nightly-2026-10-20`, `wasm-pack 0.15.0`, `wasm-bindgen 0.2.122`, and
 `wasm-opt 117`. Clang 19 comes from the 2025-12-08 Debian snapshot. Cargo
 must accept the checked-in `Cargo.lock` without changes.
 

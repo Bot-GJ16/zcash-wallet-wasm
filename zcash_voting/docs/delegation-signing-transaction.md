@@ -111,7 +111,7 @@ The wallet MUST fix the following inputs before building TX1:
 | --- | --- |
 | Network | The network stored for the voting round. |
 | Snapshot height | The height at which eligible notes and witnesses were selected. |
-| Consensus branch ID | The branch active at the snapshot height. It MUST match the network and height. |
+| Consensus branch ID | The branch active at the snapshot height. It MUST match the network and height, and MUST be NU6.3 or NU7. It selects note eligibility only, not the TX1 signing branch. |
 | Account FVK | The 96-byte Ironwood-capable full viewing key for the account that owns the eligible notes. |
 | Seed fingerprint | The ZIP-32 fingerprint used by an external signer to select the correct seed. |
 | Account index | The ZIP-32 account index for the spending key. |
@@ -270,8 +270,8 @@ The wallet MUST construct the PCZT global fields as follows:
 
 | Field | Value |
 | --- | --- |
-| Transaction version | `TxVersion::suggested_for_branch(branch_id)` |
-| Consensus branch ID | Branch active at the voting snapshot height |
+| Transaction version | V6 |
+| Consensus branch ID | NU6.3 (`0x37a5165b`), for every eligible snapshot |
 | Lock time | `0` |
 | Expiry height | `0` |
 | Transparent bundle | Absent |
@@ -279,8 +279,12 @@ The wallet MUST construct the PCZT global fields as follows:
 | Orchard bundle | Absent |
 | Ironwood bundle | Present, V3 |
 
-The current library accepts only the NU6.3 branch, so the suggested
-transaction version resolves to V6.
+The signing branch is fixed rather than taken from the snapshot height.
+Vote-chain verifiers rebuild the sighash from the submitted effecting data
+with this fixed profile and no branch input, so a TX1 built on the NU7 branch
+would carry a signature the chain rejects. TX1 never reaches consensus, so the
+branch ID only separates the signature domain. A different signing branch
+needs a new TX1 effects version that the chain accepts first.
 
 The zero expiry height is part of the PCZT signing digest only; TX1 never
 becomes a transaction whose expiry could be evaluated by consensus.
@@ -311,7 +315,7 @@ The real output is:
 | --- | --- |
 | Recipient | Voting hotkey address |
 | Value | `0` zatoshi |
-| OVK | `None` (no account outgoing viewing key) |
+| OVK | `None` by default; account external OVK with Ledger output review |
 | Memo | 512-byte delegation display memo |
 | `rseed_output` | Fresh randomness sampled by the builder |
 
@@ -323,14 +327,37 @@ The zero-value output is protocol-relevant: ZKP #1 reconstructs `cmx_new` for
 that same output value. Implementations MUST NOT change it to a 1-zatoshi
 output without changing and versioning the proof statement.
 
+### Ledger output review
+
+Call `DelegationPipeline::with_ledger_output_review()` or
+`DelegationKeys::with_ledger_output_review()` before the first delegation
+setup to enable Ledger output review. The synthetic spend remains 1 zatoshi
+and the hotkey output remains zero. The account's external outgoing viewing
+key (OVK) encrypts the output recovery data so Ledger can recover and display
+the hotkey output instead of omitting it as a dummy output.
+
+Anyone holding that OVK can recover the hotkey address and delegation memo
+from the submitted action. This does not grant authority to sign a delegation,
+spend funds, or vote as the hotkey. Existing callers keep `OVK=None` unless
+they opt in. The option does not change the circuit, vote-chain verification,
+or database format.
+
+Saved delegation requests are reused byte for byte, including after restart.
+Enabling this option after setup does not rebuild an existing request or make
+an earlier request compatible with Ledger.
+
 ### Memo
 
-The current display memo is:
+The default display memo is:
 
 ```text
 I am authorizing this hotkey managed by my wallet to vote on {round_name}.
 Amount: {whole}.{fraction:08} ZEC.
 ```
+
+Ledger output review escapes non-ASCII and control characters in the round
+title and replaces the line break before `Amount` with a space. The title is
+truncated as needed to retain the amount within the 512-byte memo limit.
 
 The memo is informational. It is covered by the transaction sighash, but the
 vote-chain verifier does not parse it. Wallets SHOULD show the same round,
@@ -347,13 +374,16 @@ After the bundle is built, the wallet MUST:
 4. serialize the full PCZT;
 5. compute `Signer::shielded_sighash()` from the finalized PCZT;
 6. encode the finalized Ironwood action's effecting data; and
-7. persist the effecting data, sighash, `rk`, `alpha`, `nf_signed`, `cmx_new`,
-   both rseeds, and proof inputs before requesting a signature, while retaining
-   the action index with the active signing request.
+7. atomically persist the full finalized PCZT with the effecting data, sighash,
+   `rk`, `alpha`, `nf_signed`, `cmx_new`, both rseeds, and proof inputs before
+   requesting a signature, while retaining the action index with the active
+   signing request.
 
 The caller MUST retain the exact full PCZT for the active signing session.
-The current voting database persists the binding fields, but not the full PCZT
-bytes.
+The current voting database stores those bytes in `bundles.delegation_pczt`
+alongside the binding fields. `PreparedDelegationBundle::keystone_request`
+reloads and validates the request from that durable setup, including after
+restart; callers do not need a separate persistent copy of the request.
 
 The sighash is the 32-byte ZIP-244 shielded signature digest. It is not a
 custom voting hash.
@@ -453,16 +483,20 @@ controller retains its account keys. The delivery receipt and validation
 contract is documented in
 [delegation capability handoff](exporting-to-external-software.md).
 
-Signing state is one-shot. After a restart, the wallet MAY resume only if it
-retained the exact signing request, including the full PCZT. Otherwise it MUST
-clear the unsigned setup and build a fresh one. It MUST NOT combine `alpha`,
-`rk`, action fields, rseeds, a sighash, or a signature from different setup
-attempts.
+Signing state is bound to one setup. To resume a Keystone signing session after
+a restart, the wallet MUST reload and validate the exact persisted signing
+request. Losing the in-memory request MUST NOT trigger a setup reset or a newly
+randomized PCZT.
+If the original PCZT is absent from legacy setup, request creation fails with
+`DelegationPcztUnavailable`; automatic legacy repair is outside this contract.
+The wallet MUST NOT combine `alpha`, `rk`, action fields, rseeds, a sighash, or
+a signature from different setup attempts. See [Durable Keystone
+requests](#durable-keystone-requests) for reuse and concurrency behavior.
 
 ## Rust example
 
 The caller first prepares a [`PreparedDelegationBundle`][prepared] using the
-wallet and round state. TX1 construction itself is then:
+wallet and round state. TX1 construction or recovery is then:
 
 ```rust
 use anyhow::{ensure, Context, Result};
@@ -478,7 +512,7 @@ fn build_tx1(
     let progress = NoopProgressReporter;
     let request = prepared
         .keystone_request(voting_db, &progress)
-        .context("build TX1 and persist its binding fields")?;
+        .context("build or reload TX1 signing request")?;
 
     let recomputed = pczt_sighash(&request.pczt_bytes)?;
     ensure!(
@@ -542,3 +576,61 @@ The complete caller-oriented flows are implemented in
 
 [prepared]: ../zcash_voting/src/delegate.rs
 [example]: ../wallet-example/src/example_delegation.rs
+
+## Durable Keystone requests
+
+Setup stores the exact finalized PCZT atomically with its signing fields.
+Keystone request creation reloads those bytes, including after background ZKP1
+or restart, and validates the selected notes, hotkey target, sighash, and unique
+matching randomized key. It never substitutes newly randomized bytes for an
+existing setup. Schema 22 adds this nullable field; legacy rows without the
+original transaction fail with `DelegationPcztUnavailable`.
+
+The display memo is recovered from the stored governance output. If the host
+supplies a different round name after restart, the request still displays the
+original signed memo. Missing recovery metadata or a non-text memo fails request
+creation instead of substituting caller-provided text.
+
+Note and target validation and transaction loading share one database read
+snapshot. A concurrent setup replacement cannot substitute a different target's
+transaction between validation and loading. The returned request belongs to
+that snapshot; later signing and submission still check the current setup.
+
+Proof generation captures the setup's transaction hash before starting. The
+proof persistence transaction requires that same hash to still be present, so
+a reset or replacement cannot leave a late proof attached to missing or different
+setup. If persistence wins before cleanup, cleanup preserves the proved bundle.
+Hosts should use the cache-only `reset_vote_tree` for normal navigation so
+background proofs and later signing can reuse the durable transaction.
+
+Signature retention rechecks the bundle's current sighash and randomized key
+inside the same immediate write transaction as insertion or idempotent replay.
+A missing or replaced signing context returns `KeystoneSignatureConflict` and
+rolls back the entire batch. This prevents a signature validated before a
+replacement from being stored against the replacement and blocking its signer.
+
+Concurrent initial setup can return `Busy` while another caller holds the
+bundle setup lease. A retry loads that caller's persisted transaction without
+waiting for its full proof generation.
+
+Regression coverage lives in `delegate/tests/keystone.rs`: request reuse after
+setup and restart with a changed title, Unicode memo recovery, concurrent request
+creation, legacy rejection without rebuilding, and changed-note, changed-target,
+corrupt-PCZT, and unrecoverable-memo rejection.
+`storage/operations/tests/keystone_snapshot.rs` covers another connection
+committing a target replacement while the request snapshot remains open.
+`storage/operations/tests/proof_persistence.rs` covers reset and replacement
+from a second connection before proof completion, retry after reset, and cleanup
+after successful proof persistence.
+`storage/operations/tests/keystone_signatures.rs` covers replacement from a
+second connection after signature validation, rejection of missing or changed
+signing context, and atomic rollback including stale idempotent replays.
+
+## Shared proving execution
+
+Concurrent bundle pipelines do not change the finalized-PCZT-before-signing
+contract above. Proof/key CPU work executes in the shared SDK proving pool;
+wallet reads, PCZT persistence, and software/device signing remain outside CPU
+workers. Captured cancellation and operation epochs are rechecked before signing
+and persistence after proving. A running non-interruptible proof keeps its
+bundle exclusion through completion even if the awaiting future is dropped.

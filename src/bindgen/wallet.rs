@@ -115,11 +115,11 @@ export interface CompactBlockCdnOptions {
     maxConcurrentChunkRequests?: number;
 }
 
-/** Runtime broadcast endpoints; supply again when restoring wallet bytes. */
+/** Runtime Orchard broadcast and transaction lookup endpoints; supply again when restoring wallet bytes. */
 export interface ZeroIndexerOptions {
-    /** Ordered endpoints used only for transactions containing an Orchard bundle. */
+    /** Ordered endpoints for Orchard transaction broadcast and status lookup. */
     urls: string[];
-    /** Positive per-endpoint timeout in milliseconds. Defaults to 30000. */
+    /** Positive per-endpoint timeout for send and GetTransaction, in milliseconds. Defaults to 30000. */
     sendTimeoutMs?: number;
 }
 "#;
@@ -150,6 +150,7 @@ export interface TransferResult {
 export interface TransferEstimate {
     amountZats: string;
     feeZats: string;
+    marginalFeeZats: string;
     transactionCount: number;
     stepFeesZats: string[];
 }

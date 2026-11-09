@@ -150,6 +150,7 @@ migration_modules!(
     orchard_shardtree,
     received_notes_nullable_nf,
     receiving_key_scopes,
+    restore_ua_transparent_receivers,
     sapling_memo_consistency,
     sent_notes_to_internal,
     shardtree_support,
@@ -159,6 +160,7 @@ migration_modules!(
     support_legacy_sqlite,
     support_zcashd_wallet_import,
     transparent_gap_limit_handling,
+    transparent_spend_locator_map,
     tree_retained_checkpoints,
     tx_observation_height,
     tx_retrieval_queue,
@@ -178,6 +180,7 @@ migration_modules!(
     v_transactions_transparent_history,
     v_migration_transactions,
     v_transactions_zip318_kind,
+    v_tx_outputs_diversifier_index,
     v_tx_outputs_key_scopes,
     v_tx_outputs_return_addrs,
     v_tx_outputs_transparent_addresses,
@@ -189,7 +192,7 @@ migration_modules!(
 
 use std::{rc::Rc, sync::Mutex};
 
-use rand_core::RngCore;
+use rand_core::Rng;
 use rusqlite::named_params;
 use schemerz_rusqlite::RusqliteMigration;
 use secrecy::SecretVec;
@@ -204,13 +207,16 @@ use super::WalletMigrationError;
 pub(super) fn all_migrations<
     P: consensus::Parameters + 'static,
     C: Clock + Clone + 'static,
-    R: RngCore + Clone + 'static,
+    R: Rng + Clone + 'static,
 >(
     params: &P,
     clock: C,
     rng: R,
     seed: Option<Rc<SecretVec<u8>>>,
 ) -> Vec<Box<dyn RusqliteMigration<Error = WalletMigrationError>>> {
+    // Edges implied by transitivity may be omitted. A node whose parents cannot be reached by a
+    // drawn edge names them in `(<- parent, ...)`.
+    //
     //                                   initial_setup
     //                                   /           \
     //                          utxos_table         ufvk_support
@@ -233,55 +239,77 @@ pub(super) fn all_migrations<
     //   |   v_sapling_shard_unscanned_ranges    \           |       v_tx_outputs_use_legacy_false           |
     //   |                    |                   \          |                     |                         |
     //   |            wallet_summaries             \         |      v_transactions_shielding_balance         /
-    //   \                    \                     \        |                     |                        /
-    //    \                    \                     \       |      v_transactions_note_uniqueness         /
-    //     \                    \                     \      |        /                                   /
-    //      \                    `------------------- full_account_ids                                   /
-    //       \                                        /               \                                 /
-    //        \                         orchard_received_notes        spend_key_available              /
-    //         \                            /          \                      /                       /
-    //          \     ensure_orchard_ua_receiver     utxos_to_txos           /                       /
-    //           \                          \              |                /                       /
-    //            \                          \     ephemeral_addresses     /                       /
-    //             \                          \            |              /                       /
-    //              `----------------------------- tx_retrieval_queue ---------------------------'
-    //                                                  /    \
-    //                              support_legacy_sqlite    tx_retrieval_queue_expiry ----------------.
-    //                                 /              \                                                 \
-    //            fix_broken_commitment_trees         add_account_uuids                                  \
-    //                       /                                /        \                                  \
-    //    fix_bad_change_flagging      transparent_gap_limit_handling   v_transactions_additional_totals   \
-    //                       \                       |                      /                               \
-    //                        \      ensure_default_transparent_address    /                                 \
-    //                         \                     |                    /                                   \
-    //                          `---- fix_transparent_received_outputs --'                                     \
-    //                                    /         /           \                                              |
-    //                                   /         /             \                                             |
-    //                                  /         /               \                                            |
-    //           support_zcashd_wallet_import    /             fix_v_transactions_expired_unmined              |
-    //                \                         /                    /        |         \                      |
-    //                 \      tx_observation_height                 /         |          \                     |
-    //                  \                       \                  /          |           \                    /
-    //                   \                   add_transaction_trust_marker     |  v_tx_outputs_return_addrs    /
-    //                    \                       \                           |                     /        /
-    //                     \                       \         v_received_output_spends_account      /        /
-    //                      \                       \               /                             /        /
-    //                       `------------------- account_delete_cascade ---------------------------------'
-    //                              /               /                  |              \
-    //     add_transparent_value_index  v_tx_outputs_key_scopes  standalone_p2sh    witness_stabilized_notes
-    //                                     /        |             /            \
-    //                               ivk_item_cache |            /           orchard_note_version
-    //                             .----------------'           /                  \
+    //   \              /     \                     \        |                     |                        /
+    //  / \            /       \                     \       |      v_transactions_note_uniqueness         /
+    //  |  \          /         \                     \      |        /                                   /
+    //  |   \        /           `------------------- full_account_ids                                   /
+    //  |    \      /                                 /               \                                 /
+    //  |     \    /                    orchard_received_notes        spend_key_available              /
+    //  |      \  /                         /          \                      /                       /
+    //  |       \.    ensure_orchard_ua_receiver     utxos_to_txos           /                       /
+    //  |       .\                          \              |                /                       /
+    //  |      /  \                          \     ephemeral_addresses     /                       /
+    //  |     /    \                          \            |              /                       /
+    //  |     |     `----------------------------- tx_retrieval_queue ---------------------------'
+    //  |     |                                         /    \      \---------------------------------------.
+    //  |     |                                        /      \      \                                       \
+    //  |     |                     support_legacy_sqlite    tx_retrieval_queue_expiry ----------------.    transparent_spend_locator_map
+    //  |     |                        /              \                                                 \
+    //  |     |   fix_broken_commitment_trees         add_account_uuids                                  \
+    //  |     .              /                                /        \                                  \
+    //  | fix_bad_change_flagging      transparent_gap_limit_handling   v_transactions_additional_totals   \
+    //  |     .              \                       |                      /                               \
+    //  |     |               \      ensure_default_transparent_address    /                                 \
+    //  |     |                \                     |                    /                                   \
+    //  |     |                 `---- fix_transparent_received_outputs --'                                     \
+    //  |     |                           /         /           \                                              |
+    //  |     |                          /         /             \                                             |
+    //  |     |                         /         /               \                                            |
+    //  |     |  support_zcashd_wallet_import    /             fix_v_transactions_expired_unmined              |
+    //  |     |       \                         /                    /        |         \                      |
+    //  |     |        \      tx_observation_height                 /         |          \                     |
+    //  |     .         \                       \                  /          |           \                    /
+    // orchard_shardtree \                   add_transaction_trust_marker     |  v_tx_outputs_return_addrs    /
+    //  |     .           \                       \                           |                     /        /
+    //  |     |            \                       \         v_received_output_spends_account      /        /
+    // ironwood_shardtree   \                       \               /                             /        /
+    //      \                `------------------- account_delete_cascade ---------------------------------'
+    //       \                      /               /                 |               \
+    //        \                    /               /                  |                \
+    //         \                  /               /                   |                 \
+    //      witness_stabilized_notes    v_tx_outputs_key_scopes  standalone_p2sh      add_transparent_value_index
+    //               /                     /        |             /            \
+    //  tree_retained_checkpoints   ivk_item_cache  |            /      orchard_note_version
+    //                                              |           /                \
+    //                             .----------------'          /                  \
+    //                             |                          /                    \
     //                             |  add_transparent_receiver_address_index        \
     //                             |               |                                 \
-    //                             |      standalone_address               ironwood_received_notes ----------------
-    //                             |                                        /         |          \                  \
-    //                             |                     ironwood_pool_code_views     |      note_locking  fix_bad_ironwood_change_flagging
-    //                             |                             |          \         |
-    //                             |                             |           \ v_address_uses_ironwood
-    //                             |                             |            \
-    //                             |              v_transactions_pool_crossing \
-    //                             `------------------------------------------- v_tx_outputs_transparent_addresses
+    //                             |      standalone_address               ironwood_received_notes -----------------------------------------.
+    //                             |               |                         /        |        \                  \                         |
+    //                             |      restore_ua_transparent_receivers  /         |         \                  \                        |
+    //                             |                     ironwood_pool_code_views     |     note_locking  fix_bad_ironwood_change_flagging  |
+    //                             |                             |         \          |                |                                    |
+    //                             |                             |          \  v_address_uses_ironwood |                   orchard_ironwood_migration_tables
+    //                             |                             |           \                         |                                    |
+    //                             |                             |            \                 tx_status_observation_intent                |
+    //                             |                             |             \                                                            |
+    //                             `------ v_tx_outputs_transparent_addresses   \                                          orchard_ironwood_migration_anchor_interval
+    //                                                      |                    |                                                          |
+    //                                       v_tx_outputs_diversifier_index      |                                                          |
+    //                                                                           \                                                          |
+    //                                                                      v_transactions_pool_crossing                                    |
+    //                                                                                   |                           orchard_ironwood_migration_unsatisfiability
+    //                                                                         zip318_classification                                        |
+    //                                                                                   |                               orchard_ironwood_migration_history
+    //                                                                      v_transactions_zip318_kind                                      |
+    //                                                                          /                    \                   orchard_ironwood_broadcast_binding
+    //                                                                         /                      \                                     |
+    //                                                                        /                        \                orchard_ironwood_migration_txid_blob
+    //                                                                       /                          \                  /
+    //                                                                      /                          v_migration_transactions
+    //                                                                     /                            /
+    //                                                                 fix_v_transactions_multi_account_totals
     //
     let rng = Rc::new(Mutex::new(rng));
     vec![
@@ -389,6 +417,7 @@ pub(super) fn all_migrations<
         Box::new(v_address_uses_ironwood::Migration),
         Box::new(v_transactions_pool_crossing::Migration),
         Box::new(zip318_classification::Migration),
+        Box::new(transparent_spend_locator_map::Migration),
         Box::new(v_transactions_zip318_kind::Migration),
         Box::new(orchard_ironwood_migration_tables::Migration),
         Box::new(tree_retained_checkpoints::Migration),
@@ -396,6 +425,7 @@ pub(super) fn all_migrations<
         Box::new(tx_status_observation_intent::Migration),
         Box::new(orchard_ironwood_migration_anchor_interval::Migration),
         Box::new(v_tx_outputs_transparent_addresses::Migration),
+        Box::new(v_tx_outputs_diversifier_index::Migration),
         Box::new(orchard_ironwood_migration_unsatisfiability::Migration),
         Box::new(orchard_ironwood_migration_history::Migration),
         Box::new(orchard_ironwood_broadcast_binding::Migration),
@@ -403,6 +433,9 @@ pub(super) fn all_migrations<
         Box::new(v_migration_transactions::Migration),
         Box::new(standalone_address::Migration),
         Box::new(fix_v_transactions_multi_account_totals::Migration),
+        Box::new(restore_ua_transparent_receivers::Migration {
+            params: params.clone(),
+        }),
     ]
 }
 
@@ -703,7 +736,7 @@ pub(super) fn verify_network_compatibility<P: consensus::Parameters>(
             let ufvk_parsed = row
                 .get::<_, Option<String>>(1)?
                 .map(|ufvk_str| {
-                    let (network, _) = Ufvk::decode(&ufvk_str).map_err(|e| {
+                    let (network, _, _) = Ufvk::decode(&ufvk_str).map_err(|e| {
                         WalletMigrationError::CorruptedData(format!(
                             "Unable to parse UFVK for account {account_id}: {e}"
                         ))
@@ -715,7 +748,7 @@ pub(super) fn verify_network_compatibility<P: consensus::Parameters>(
             let uivk_parsed = row
                 .get::<_, Option<String>>(2)?
                 .map(|uivk_str| {
-                    let (network, _) = Uivk::decode(&uivk_str).map_err(|e| {
+                    let (network, _, _) = Uivk::decode(&uivk_str).map_err(|e| {
                         WalletMigrationError::CorruptedData(format!(
                             "Unable to parse UIVK for account {account_id}: {e}"
                         ))
@@ -741,7 +774,7 @@ pub(super) fn verify_network_compatibility<P: consensus::Parameters>(
         while let Some(row) = rows.next()? {
             let account_id: i64 = row.get(0)?;
             let ufvk_str = row.get::<_, String>(1)?;
-            let (network, _) = Ufvk::decode(&ufvk_str).map_err(|e| {
+            let (network, _, _) = Ufvk::decode(&ufvk_str).map_err(|e| {
                 WalletMigrationError::CorruptedData(format!(
                     "Unable to parse UFVK for account {account_id}: {e}"
                 ))
@@ -1130,7 +1163,7 @@ pub(crate) mod tests {
             .conn
             .execute(
                 "INSERT INTO accounts (account, ufvk, birthday_height) VALUES (0, :ufvk, 0)",
-                named_params![":ufvk": ufvk.encode(&Network::TestNetwork)],
+                named_params![":ufvk": ufvk.encode(&Network::TestNetwork).unwrap()],
             )
             .unwrap();
 
@@ -1170,7 +1203,7 @@ pub(crate) mod tests {
                 ":name": "uivk-only",
                 ":uuid": &uuid[..],
                 ":account_kind": 1,
-                ":uivk": uivk.encode(uivk_network),
+                ":uivk": uivk.encode(uivk_network).unwrap(),
                 ":birthday_height": u32::from(birthday_height),
             ],
             |row| row.get(0),

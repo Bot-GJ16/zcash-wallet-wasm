@@ -3,11 +3,19 @@
 //! Wallet SDKs should import [`prelude`] and follow the lifecycle:
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
 //! data, build a delegation PCZT, prove delegation, sync the vote commitment
-//! tree, cast votes with `vote::commit`, confirm chain submissions through
-//! `confirmation`, then recover helper-share payloads through `share`. New
-//! integrations should use `round`, `precompute`, `delegate`, `vote`,
-//! `confirmation`, `share`, and `session` rather than writing storage rows
-//! directly.
+//! tree, cast votes with `vote::commit`, drive chain submission through
+//! [`ChainSubmissionClient`], then recover helper-share payloads through
+//! `share`. New integrations should use `round`, `precompute`, `delegate`,
+//! `vote`, `chain_submission`, `share`, and `session` rather than writing
+//! storage rows directly. Exact commitment-tree recovery is explicit per
+//! advancement call; status-only advancement remains the default.
+//!
+//! [`ChainSubmissionClient`] is the sole authority for submitting, polling,
+//! recovering, and confirming delegation and cast-vote transactions. Hosts
+//! supply an HTTP transport, scheduling, and cancellation; they do not build
+//! chain requests, interpret chain events, or record transaction hashes and
+//! tree positions. See [`chain_submission`] for the removed version-17
+//! mutation APIs and the compile-time checks that keep them removed.
 
 // The upstream unit harness uses native wallet/network adapters. WASM runtime
 // coverage lives in integration tests, which compile the normal library.
@@ -29,16 +37,25 @@ compile_error!("the browser integration supports only the `lrz` backend");
 #[cfg(not(any(feature = "lrz", feature = "zakura")))]
 compile_error!("enable exactly one of the `lrz` or `zakura` features");
 
+// LRZ selects crates.io `zcash_protocol` under a renamed dependency key. Alias
+// it back so the rest of the crate can keep `use zcash_protocol::...`.
+#[cfg(feature = "lrz")]
+extern crate lrz_zcash_protocol as zcash_protocol;
+
 pub mod action;
 pub mod backend;
 #[cfg(all(feature = "browser", feature = "test-fixtures"))]
 #[doc(hidden)]
 pub mod browser_proof_fixture;
+pub mod chain_submission;
 mod clock;
 pub mod config;
 pub mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod delegation_pipeline;
+mod delegation_proof_coordination;
 pub mod delegation_submission;
 pub mod error;
 pub mod governance;
@@ -49,6 +66,13 @@ mod http_transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lwd;
 pub mod note_bundling;
+pub mod observability;
+pub(crate) use observability::ObservationScope;
+pub use observability::{
+    ObservabilityOptions, ObservationAttribution, ObservationOutcome, ObservationRecord,
+    ObservationSummary, OperationObservability, OperationReport,
+};
+pub mod delegate_and_vote_batch;
 pub mod phases;
 pub mod pir;
 pub mod pir_snapshot;
@@ -58,11 +82,16 @@ pub mod prelude;
 pub mod recovery;
 pub mod round;
 pub mod round_auth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod round_drive;
+mod round_planning;
 pub mod selection;
 pub mod session;
 pub mod share;
 pub mod share_policy;
 pub mod share_tracking;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod share_tracking_drive;
 mod shielded_protocol;
 pub mod storage;
 pub mod transport;
@@ -72,6 +101,16 @@ pub mod types;
 mod van_blinding;
 pub mod vote;
 pub mod vote_commitment;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod vote_work;
+/// Whether a bundle's due proposals are cast as one atomic batch.
+///
+/// Enabled for chains serving `cast-vote-batch`. Multiple due proposals in a
+/// bundle form one atomic transaction; one proposal still uses `cast-vote`.
+/// Persisted work retains its singleton or batch shape across upgrades.
+/// Chains must support the batch route before adopting this SDK version.
+pub const ATOMIC_VOTE_BATCHES_ENABLED: bool = true;
+
 pub mod vote_submission;
 pub mod wire;
 mod wire_codec;
@@ -79,6 +118,38 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use chain_submission::{
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
+    ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
+    ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
+    ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+};
+#[cfg(target_arch = "wasm32")]
+pub use chain_submission::{
+    CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionConfirmation,
+    ChainSubmissionConfirmationError, ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use delegation_pipeline::{
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
+};
+pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
     ShareSubmissionStatus,
@@ -88,13 +159,44 @@ pub use helper::transport::{
     HelperFuture, HelperResponse, HelperTransport, HelperTransportError, MAX_HELPER_RESPONSE_BYTES,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use http_transport::HyperTransport;
+pub use http_transport::{HttpObservationContext, HttpObservationPhase, HyperTransport};
 pub use pir::{
     connect_pir, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout, PirClient, Transport,
     TransportFuture, TransportResponse,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use pir::{connect_pir_blocking, PirClientBlocking};
+#[cfg(not(target_arch = "wasm32"))]
+pub use pir::{PirFleet, PirProofSource, PirSession};
+#[cfg(not(target_arch = "wasm32"))]
+pub use round_drive::{
+    FailureIsolation, NoopRoundDriveReporter, ProgressBaseline, RoundDriveEvent, RoundDrivePolicy,
+    RoundDriveReporter, RoundDriveReporterBridge, RoundDriver, RoundHostSource,
+    RoundHostSourceBridge, RoundQuiescence, RoundRunReport, RoundStepFailureRecord, RoundWorkTally,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use share_tracking_drive::{
+    NoopShareTrackingReporter, ShareTrackingDrivePolicy, ShareTrackingDriver, ShareTrackingEvent,
+    ShareTrackingHostContext, ShareTrackingHostSource, ShareTrackingHostSourceBridge,
+    ShareTrackingQuiescence, ShareTrackingReporter, ShareTrackingReporterBridge,
+    ShareTrackingRunReport,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::{
+    DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
+    RoutePhase, RouteRequest, RouteResponse,
+};
+pub use vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use vote_work::{
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter, ProposalRosterEntry,
+    RoundBinding, RoundExecutor, RoundHostContext, RoundStepDisposition, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge,
+    RoundStepProgressReporter, VoteRecoveryKey, VoteShareDeliveryReport,
+};
 
 pub use delegation_capability::{
     export_delegation_capability, import_delegation_capability, DelegationCapabilityBundleV1,
@@ -129,63 +231,32 @@ pub use types::{
     MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
 };
 
-/// Warms the process-lifetime ZKP #2 proving-key cache.
-///
-/// The warm-up runs on a large-stack thread and is safe to call repeatedly.
+#[cfg(not(target_arch = "wasm32"))]
+mod proving_runtime;
+#[cfg(target_arch = "wasm32")]
+#[path = "proving_runtime/browser.rs"]
+mod proving_runtime;
+pub use proving_runtime::{configure_proving_runtime, ProvingConfigurationError, ProvingPolicy};
+
+/// Warms the shared ZKP2 cache through the process proving budget.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn warm_zkp2_proving_cache() -> Result<(), VotingError> {
-    const KEYGEN_STACK_BYTES: usize = 64 * 1024 * 1024;
-
-    std::thread::Builder::new()
-        .name("voting-vote-proof-cache-warmup".to_string())
-        .stack_size(KEYGEN_STACK_BYTES)
-        .spawn(|| {
-            voting_circuits::vote_proof::warm_vote_proof_keys().map_err(|e| {
-                VotingError::ProofFailed {
-                    message: format!("ZKP2 proving cache warm-up failed: {e}"),
-                }
-            })
-        })
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to spawn ZKP2 proving cache warm-up thread: {e}"),
-        })?
-        .join()
-        .map_err(|_| VotingError::Internal {
-            message: "ZKP2 proving cache warm-up thread panicked".to_string(),
-        })?
+    proving_runtime::ensure_cache(
+        proving_runtime::CacheKind::Vote,
+        &ObservationScope::disabled(),
+    )
 }
 
-/// Warm process-lifetime proving-key caches used by on-device voting proofs.
-///
-/// This is intentionally best-effort at the cache layer: callers should invoke
-/// it from a background task before the first proof is needed.
+/// Best-effort initialization of both shared caches through the proving budget.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn warm_proving_caches() {
-    const KEYGEN_STACK_BYTES: usize = 64 * 1024 * 1024;
-
-    let handles = [
-        std::thread::Builder::new()
-            .name("voting-delegation-cache-warmup".to_string())
-            .stack_size(KEYGEN_STACK_BYTES)
-            .spawn(|| {
-                let _ = voting_circuits::delegation::warm_delegation_keys();
-            })
-            .expect("spawn delegation proving cache warm-up thread"),
-        std::thread::Builder::new()
-            .name("voting-vote-proof-cache-warmup".to_string())
-            .stack_size(KEYGEN_STACK_BYTES)
-            .spawn(|| {
-                let _ = voting_circuits::vote_proof::warm_vote_proof_keys();
-            })
-            .expect("spawn vote proof cache warm-up thread"),
-    ];
-
-    for handle in handles {
-        handle
-            .join()
-            .expect("proving cache warm-up thread panicked");
-    }
+    let _ = proving_runtime::ensure_cache(
+        proving_runtime::CacheKind::Delegation,
+        &ObservationScope::disabled(),
+    );
+    let _ = warm_zkp2_proving_cache();
 }
+mod ingress_timeout;
 pub use selection::{gather_delegation_wallet_inputs_from_parts, GatherDelegationWalletInputs};
 pub use witness::store_tree_state_and_witnesses;
 pub mod proof_executor;

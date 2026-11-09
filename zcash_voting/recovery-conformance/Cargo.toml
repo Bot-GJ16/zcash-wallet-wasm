@@ -1,0 +1,43 @@
+[package]
+name = "recovery-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Staging crash-recovery conformance for `zcash_voting`.
+#
+# Deliberately outside the workspace `default-members`: this package drives a
+# real staging round over the network and kills its own child processes, so it
+# must never be pulled into `make check` or `make test`.
+
+[features]
+default = ["zakura"]
+lrz = ["zcash_voting/lrz", "voting-crypto-deps/lrz", "dep:lrz_zcash_protocol"]
+zakura = ["zcash_voting/zakura", "voting-crypto-deps/default", "dep:zcash_protocol"]
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false }
+rusqlite = "0.37"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+voting-crypto-deps = { workspace = true }
+zcash_protocol = { workspace = true, optional = true }
+lrz_zcash_protocol = { workspace = true, optional = true }
+zcash_voting = { path = "../zcash_voting", default-features = false }
+secrecy = "0.8"
+tonic = { version = "0.14", default-features = false }
+zeroize = "1"
+
+[dev-dependencies]
+# Only the tests build a `RouteRequest` by hand, to drive the fault wrappers
+# without a network. The SDK exposes the type but not the `Method` it carries.
+http = "1"
+
+[[bin]]
+name = "recovery-conformance-worker"
+path = "src/bin/worker.rs"

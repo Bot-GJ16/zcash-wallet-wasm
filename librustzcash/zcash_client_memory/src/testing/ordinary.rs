@@ -55,13 +55,14 @@ impl DataStoreFactory for ExpiryTestDbFactory {
     }
 }
 
-fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
+fn explicit_expiry_crossing(on_boundary: bool, send_max: bool, nu7: bool) {
     let activation = BlockHeight::from_u32(100_000);
     let network = LocalNetwork {
         nu6: Some(activation),
         nu6_1: Some(activation),
         nu6_2: Some(activation),
         nu6_3: Some(activation),
+        nu7: nu7.then_some(activation),
         ..TestBuilder::<(), ()>::DEFAULT_NETWORK
     };
     let mut st = TestDsl::from(
@@ -83,9 +84,8 @@ fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
         Zatoshis::const_from_u64(10_000_000)
     };
     let (received, _, _) = st.add_a_single_note_checking_balance(funding);
-    let interval = st.wallet().pool_migration_params().anchor_bucket_interval();
-    let tip = interval.boundary_at_or_above(received)
-        + 2 * interval.block_count().get()
+    let grid = st.wallet().pool_migration_params(&network).anchor_grid();
+    let tip = grid.boundary_after(grid.boundary_after(grid.boundary_at_or_above(received)))
         + if on_boundary { 0 } else { 5 };
     let filler_count = u32::from(tip) - u32::from(received);
     let not_ours = OrchardPoolTester::sk_to_fvk(&OrchardPoolTester::sk(&[0xe5; 32]));
@@ -102,7 +102,7 @@ fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
         .get_target_and_anchor_heights(NonZeroU32::MIN)
         .unwrap()
         .unwrap();
-    assert_eq!(interval.is_boundary(normal_anchor), on_boundary);
+    assert_eq!(grid.is_boundary(normal_anchor), on_boundary);
     let selector = GreedyInputSelector::new();
     let change =
         single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Orchard);
@@ -152,7 +152,7 @@ fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
         canonical
             .steps()
             .first()
-            .is_canonical_crossing(&st.wallet().pool_migration_params(), canonical_fee),
+            .is_canonical_crossing(&st.wallet().pool_migration_params(&network), canonical_fee),
         canonical_expected
     );
     let expiry = BlockHeight::from(canonical.min_target_height()) + 12;
@@ -179,7 +179,8 @@ fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
         assert_eq!(
             *default_pczt.global().expiry_height(),
             u32::from(zcash_protocol::zip318::expiry_height(
-                canonical.min_target_height().into()
+                &zcash_protocol::zip318::BlockSpacing::for_network(&network),
+                canonical.min_target_height().into(),
             ))
         );
     }
@@ -234,7 +235,7 @@ fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
         !ordinary
             .steps()
             .first()
-            .is_canonical_crossing(&st.wallet().pool_migration_params(), canonical_fee)
+            .is_canonical_crossing(&st.wallet().pool_migration_params(&network), canonical_fee)
     );
     let txids = st
         .create_proposed_transactions_with_expiry_height::<Infallible, _, Infallible, _>(
@@ -256,20 +257,30 @@ fn explicit_expiry_crossing(on_boundary: bool, send_max: bool) {
 
 #[test]
 fn explicit_expiry_crossing_at_boundary() {
-    explicit_expiry_crossing(true, false);
+    explicit_expiry_crossing(true, false, false);
 }
 
 #[test]
 fn explicit_expiry_crossing_off_boundary() {
-    explicit_expiry_crossing(false, false);
+    explicit_expiry_crossing(false, false, false);
 }
 
 #[test]
 fn explicit_expiry_send_max_at_boundary() {
-    explicit_expiry_crossing(true, true);
+    explicit_expiry_crossing(true, true, false);
 }
 
 #[test]
 fn explicit_expiry_send_max_off_boundary() {
-    explicit_expiry_crossing(false, true);
+    explicit_expiry_crossing(false, true, false);
+}
+
+#[test]
+fn nu7_explicit_expiry_transfer_at_boundary() {
+    explicit_expiry_crossing(true, false, true);
+}
+
+#[test]
+fn nu7_explicit_expiry_send_max_at_boundary() {
+    explicit_expiry_crossing(true, true, true);
 }

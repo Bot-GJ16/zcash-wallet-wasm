@@ -226,32 +226,23 @@ use rusqlite::TransactionBehavior;
 
 pub use crate::types::ShareDelegationRecord as ShareRecord;
 
-/// One persisted round that still has unconfirmed helper shares.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingShareRound {
-    /// Stable vote-round identifier.
-    pub round_id: String,
-    /// Opaque caller context stored when the round was first created.
-    pub session_json: Option<String>,
-}
-
 /// Share scheduling and retry policy helpers.
 pub mod policy {
     pub use crate::share_policy::{
-        is_last_moment, is_share_ready_for_status_check, last_moment_buffer_seconds,
-        last_moment_deadline_seconds, next_tracking_delay_seconds, overdue_threshold_seconds,
-        plan_share_submission, plan_share_submission_from_order, plan_share_submissions,
-        plan_share_submissions_with_preferred_servers, resubmission_server_order,
-        resubmission_server_order_from_configured_order, resubmission_server_order_from_groups,
-        resubmission_server_order_random_bytes_required, scheduled_share_submit_at_from_entropy,
-        scheduled_share_submit_at_from_random_unit, select_share_submission_targets,
-        select_share_submission_targets_from_order, share_recovery_base_time,
-        share_server_order_random_bytes_required, share_server_selection_policy,
-        share_submission_random_bytes_required, share_submission_target_count,
-        share_submit_at_random_bytes_required, should_resubmit_share, shuffled_share_server_order,
-        summarize_share_tracking, ImmediateShareKey, ShareServerSelectionPolicy,
-        ShareSubmissionPlan, ShareSubmissionRandomBytesRequired, ShareTimingPolicy,
-        ShareTrackingSummary, IMMEDIATE_SHARE_INDEX, LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR,
+        is_last_moment, last_moment_buffer_seconds, last_moment_deadline_seconds,
+        overdue_threshold_seconds, plan_share_submission, plan_share_submission_from_order,
+        plan_share_submissions, plan_share_submissions_with_preferred_servers,
+        resubmission_server_order, resubmission_server_order_from_configured_order,
+        resubmission_server_order_from_groups, resubmission_server_order_random_bytes_required,
+        scheduled_share_submit_at_from_entropy, scheduled_share_submit_at_from_random_unit,
+        select_share_submission_targets, select_share_submission_targets_from_order,
+        share_recovery_base_time, share_server_order_random_bytes_required,
+        share_server_selection_policy, share_submission_random_bytes_required,
+        share_submission_target_count, share_submit_at_random_bytes_required,
+        should_resubmit_share, shuffled_share_server_order, summarize_share_tracking,
+        ImmediateShareKey, ShareServerSelectionPolicy, ShareSubmissionPlan,
+        ShareSubmissionRandomBytesRequired, ShareTimingPolicy, ShareTrackingSummary,
+        IMMEDIATE_SHARE_INDEX, LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR,
         LAST_MOMENT_BUFFER_FRACTION_NUMERATOR, LAST_MOMENT_BUFFER_MAX_SECONDS,
         SHARE_HELPER_INITIAL_MAX_FRACTION_DENOMINATOR, SHARE_HELPER_INITIAL_MAX_FRACTION_NUMERATOR,
         SHARE_HELPER_MAX_CONCURRENT_POSTS, SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER,
@@ -320,9 +311,7 @@ fn record_impl(
     let wallet_id = db.wallet_id();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin recovered share transaction failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin recovered share transaction failed", &e))?;
     let bundle =
         crate::vote::recovery_bundle_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?
             .ok_or_else(|| VotingError::InvalidInput {
@@ -347,15 +336,14 @@ fn record_impl(
         &nullifier,
         submit_at,
     )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit recovered share transaction failed: {e}"),
-    })
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit recovered share transaction failed", &e))
 }
 
 /// Records a helper-share submission for integration-test fixture setup.
 ///
 /// Production callers submit through
-/// [`crate::vote::CommittedVote::submit_prepared_shares`], which owns the
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`], which owns the
 /// journal-before-dispatch lifecycle. This lower-level entry point exists only
 /// for the `test-fixtures` feature so integration tests can seed durable state
 /// without opening a network connection.
@@ -487,7 +475,7 @@ pub(crate) fn record_delivery(
 ///
 /// This bypasses network dispatch and is unavailable without the
 /// `test-fixtures` feature. Production callers must use
-/// [`crate::vote::CommittedVote::submit_prepared_shares`].
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`].
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
@@ -760,14 +748,6 @@ pub fn list(db: &VotingDb, round_id: &str) -> Result<Vec<ShareDelegationRecord>,
     db.get_share_delegations(round_id)
 }
 
-pub(crate) fn list_for_scope(
-    db: &VotingDb,
-    scope: &ShareOperationScope,
-    round_id: &str,
-) -> Result<Vec<ShareDelegationRecord>, VotingError> {
-    db.get_share_delegations_for_wallet(round_id, scope.wallet_id())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_delegation_for_scope(
     db: &VotingDb,
@@ -802,12 +782,25 @@ pub(crate) fn unconfirmed_for_scope(
     db.get_unconfirmed_delegations_for_wallet(round_id, scope.wallet_id())
 }
 
-/// Lists rounds with at least one unconfirmed helper share.
+/// One persisted round that still has unconfirmed helper shares.
 ///
-/// Each round is returned once in newest-first order. The persisted
-/// `session_json` lets wallet integrations restore caller-owned round timing
-/// without reading the voting database schema directly.
-pub fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingError> {
+/// Private: [`pending_rounds_for_accounts`] is the crate's only reader, and a
+/// round without the wallet it belongs to is not something a multi-account
+/// host can act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingShareRound {
+    /// Stable vote-round identifier.
+    round_id: String,
+    /// Opaque caller context stored when the round was first created.
+    session_json: Option<String>,
+}
+
+/// Lists rounds with at least one unconfirmed helper share, newest first.
+///
+/// Scoped to whatever wallet `db` is already scoped to; the persisted
+/// `session_json` carries caller-owned round timing without exposing the
+/// voting database schema.
+fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingError> {
     db.pending_share_rounds().map(|rounds| {
         rounds
             .into_iter()
@@ -817,6 +810,47 @@ pub fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingErr
             })
             .collect()
     })
+}
+
+/// One pending share round together with the wallet it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingShareRoundForAccount {
+    /// Wallet identifier the round is scoped to.
+    pub wallet_id: String,
+    /// Stable vote-round identifier.
+    pub round_id: String,
+    /// Opaque caller context stored when the round was first created.
+    pub session_json: Option<String>,
+}
+
+/// Lists pending share rounds for several wallets through one open sidecar.
+///
+/// `wallet_ids` are deduplicated and visited in sorted order; within one
+/// wallet rounds keep their newest-first order. The handle's own wallet id is
+/// not consulted.
+pub fn pending_rounds_for_accounts(
+    db: &VotingDb,
+    wallet_ids: &[&str],
+) -> Result<Vec<PendingShareRoundForAccount>, VotingError> {
+    let mut wallet_ids: Vec<&str> = wallet_ids
+        .iter()
+        .copied()
+        .filter(|wallet_id| !wallet_id.is_empty())
+        .collect();
+    wallet_ids.sort_unstable();
+    wallet_ids.dedup();
+    let mut rounds = Vec::new();
+    for wallet_id in wallet_ids {
+        let scoped = db.scoped(wallet_id)?;
+        for round in pending_rounds(&scoped)? {
+            rounds.push(PendingShareRoundForAccount {
+                wallet_id: wallet_id.to_string(),
+                round_id: round.round_id,
+                session_json: round.session_json,
+            });
+        }
+    }
+    Ok(rounds)
 }
 
 /// Re-reads whether one helper-share record is durably confirmed.
@@ -909,56 +943,111 @@ pub fn recover_payload(
     bundle: &VoteRecoveryBundle,
     share_index: u32,
 ) -> Result<SharePayload, VotingError> {
-    recover_payloads(bundle)?
-        .into_iter()
-        .find(|payload| payload.enc_share.share_index == share_index)
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!("share_index {share_index} not found in vote recovery bundle"),
-        })
+    observe_recover_payload(bundle, share_index, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_recover_payload(
+    bundle: &VoteRecoveryBundle,
+    share_index: u32,
+    observations: &crate::ObservationScope,
+) -> Result<SharePayload, VotingError> {
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        share_index: Some(share_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("share::recover_payload");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SharePayload, VotingError> = (|| {
+        observe_recover_payloads(bundle, observations)?
+            .into_iter()
+            .find(|payload| payload.enc_share.share_index == share_index)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: format!("share_index {share_index} not found in vote recovery bundle"),
+            })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Reconstructs all helper-server payloads from a persisted vote recovery bundle.
 pub fn recover_payloads(bundle: &VoteRecoveryBundle) -> Result<Vec<SharePayload>, VotingError> {
-    validate_recovery_bundle_vote_fields(bundle)?;
+    observe_recover_payloads(bundle, &crate::ObservationScope::disabled())
+}
 
-    let all_enc_shares = bundle
-        .encrypted_shares
-        .iter()
-        .map(WireEncryptedShare::from)
-        .collect::<Vec<_>>();
-    let iter_shares: &[WireEncryptedShare] = if bundle.single_share {
-        &all_enc_shares[..1.min(all_enc_shares.len())]
-    } else {
-        &all_enc_shares
-    };
-    iter_shares
-        .iter()
-        .enumerate()
-        .map(|(idx, share)| {
-            let primary_blind =
-                bundle
-                    .share_blinds
-                    .get(idx)
-                    .ok_or_else(|| VotingError::InvalidInput {
-                        message: format!("missing primary blind for encrypted share index {idx}"),
-                    })?;
-            Ok(SharePayload {
-                vote_round_id: bundle.vote_round_id.clone(),
-                shares_hash: bundle.shares_hash.to_vec(),
-                proposal_id: bundle.proposal_id,
-                vote_decision: bundle.vote_decision,
-                enc_share: share.clone(),
-                tree_position: bundle.vc_tree_position,
-                all_enc_shares: all_enc_shares.clone(),
-                share_comms: bundle
-                    .share_comms
-                    .iter()
-                    .map(|comm| comm.to_vec())
-                    .collect(),
-                primary_blind: primary_blind.to_vec(),
+pub(crate) fn observe_recover_payloads(
+    bundle: &VoteRecoveryBundle,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<SharePayload>, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("share::recover_payloads");
+    let operation_result: Result<Vec<SharePayload>, VotingError> = (|| {
+        validate_recovery_bundle_vote_fields(bundle)?;
+
+        let all_enc_shares = bundle
+            .encrypted_shares
+            .iter()
+            .map(WireEncryptedShare::from)
+            .collect::<Vec<_>>();
+        let iter_shares: &[WireEncryptedShare] = if bundle.single_share {
+            &all_enc_shares[..1.min(all_enc_shares.len())]
+        } else {
+            &all_enc_shares
+        };
+        iter_shares
+            .iter()
+            .enumerate()
+            .map(|(idx, share)| {
+                let primary_blind =
+                    bundle
+                        .share_blinds
+                        .get(idx)
+                        .ok_or_else(|| VotingError::InvalidInput {
+                            message: format!(
+                                "missing primary blind for encrypted share index {idx}"
+                            ),
+                        })?;
+                Ok(SharePayload {
+                    vote_round_id: bundle.vote_round_id.clone(),
+                    shares_hash: bundle.shares_hash.to_vec(),
+                    proposal_id: bundle.proposal_id,
+                    vote_decision: bundle.vote_decision,
+                    enc_share: share.clone(),
+                    tree_position: bundle.vc_tree_position,
+                    all_enc_shares: all_enc_shares.clone(),
+                    share_comms: bundle
+                        .share_comms
+                        .iter()
+                        .map(|comm| comm.to_vec())
+                        .collect(),
+                    primary_blind: primary_blind.to_vec(),
+                })
             })
-        })
-        .collect()
+            .collect()
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Reconstructs one helper-server payload from persisted recovery JSON and
@@ -970,10 +1059,50 @@ pub fn recover_wire_json(
     vc_tree_position: u64,
     submit_at: u64,
 ) -> Result<String, VotingError> {
-    let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
-    ensure_recovery_proposal(&bundle, proposal_id)?;
-    let payload = recover_payload(&bundle, share_index)?;
-    payload.to_wire_json(Some(vc_tree_position), submit_at)
+    observe_recover_wire_json(
+        commitment_bundle_json,
+        proposal_id,
+        share_index,
+        vc_tree_position,
+        submit_at,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_recover_wire_json(
+    commitment_bundle_json: &str,
+    proposal_id: u32,
+    share_index: u32,
+    vc_tree_position: u64,
+    submit_at: u64,
+    observations: &crate::ObservationScope,
+) -> Result<String, VotingError> {
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        proposal_id: Some(proposal_id),
+        share_index: Some(share_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("share::recover_wire_json");
+    let observations = observation_stage.scope();
+    let operation_result: Result<String, VotingError> = (|| {
+        let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
+        ensure_recovery_proposal(&bundle, proposal_id)?;
+        let payload = observe_recover_payload(&bundle, share_index, observations)?;
+        payload.to_wire_json(Some(vc_tree_position), submit_at)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {
@@ -1395,6 +1524,29 @@ mod tests {
 
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(pending_rounds(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_rounds_for_accounts_scopes_each_wallet_through_one_handle() {
+        let session_json = r#"{"vote_end_time":4102444800}"#;
+        let db = db_with_vote_recovery_and_session(Some(session_json));
+        let urls = vec!["https://helper.example".to_string()];
+        record(&db, ROUND_ID, 0, 1, 0, &urls, 99).unwrap();
+
+        let rounds =
+            pending_rounds_for_accounts(&db, &["zzz-wallet", WALLET_ID, WALLET_ID, ""]).unwrap();
+        assert_eq!(
+            rounds,
+            vec![PendingShareRoundForAccount {
+                wallet_id: WALLET_ID.to_string(),
+                round_id: ROUND_ID.to_string(),
+                session_json: Some(session_json.to_string()),
+            }]
+        );
+        assert_eq!(db.wallet_id(), WALLET_ID);
+        assert!(pending_rounds_for_accounts(&db, &["zzz-wallet"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

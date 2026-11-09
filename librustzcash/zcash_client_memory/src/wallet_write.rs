@@ -7,8 +7,11 @@ use rayon::prelude::*;
 use secrecy::{ExposeSecret, SecretVec};
 
 use ::transparent::bundle::OutPoint;
-use incrementalmerkletree::{Marking, Position, Retention};
-use shardtree::store::ShardStore;
+use incrementalmerkletree::{Hashable, Marking, Position, Retention};
+use shardtree::{
+    ShardTree,
+    store::{ShardStore, TreeState, memory::MemoryShardStore},
+};
 use zcash_client_backend::{
     TransferType,
     address::UnifiedAddress,
@@ -37,6 +40,30 @@ use crate::{
     AccountId, MemoryWalletBlock, MemoryWalletDb, Nullifier, PRUNING_DEPTH, ReceivedNote,
     VERIFY_LOOKAHEAD, error::Error,
 };
+
+fn checkpoint_can_be_truncated<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &ShardTree<MemoryShardStore<H, BlockHeight>, DEPTH, SHARD_HEIGHT>,
+    height: BlockHeight,
+) -> Result<bool, Error>
+where
+    H: Hashable + Clone + PartialEq,
+{
+    let Some(checkpoint) = tree.store().get_checkpoint(&height)? else {
+        return Ok(false);
+    };
+    Ok(match checkpoint.tree_state() {
+        TreeState::Empty => true,
+        TreeState::AtPosition(position) => tree
+            .store()
+            .get_shard(ShardTree::<
+                MemoryShardStore<H, BlockHeight>,
+                DEPTH,
+                SHARD_HEIGHT,
+            >::subtree_addr(position))?
+            .and_then(|shard| shard.truncate_to_position(position))
+            .is_some(),
+    })
+}
 
 #[cfg(feature = "orchard")]
 use {
@@ -102,6 +129,14 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
     fn delete_account(&mut self, account: AccountId) -> Result<(), Error> {
         self.accounts.accounts.remove(&account);
         todo!("remove all transactions associated with the account")
+    }
+
+    fn set_account_name(&mut self, account: AccountId, name: &str) -> Result<(), Error> {
+        self.accounts
+            .get_mut(account)
+            .ok_or(Error::AccountUnknown(account))?
+            .set_name(name);
+        Ok(())
     }
 
     fn get_next_available_address(
@@ -320,6 +355,17 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
         ranges.extend(untouched);
         self.scan_queue.0 = ranges;
         Ok(changed)
+    }
+
+    fn queue_rescan(&mut self, range: Range<BlockHeight>) -> Result<(), Error> {
+        if !range.is_empty() {
+            self.scan_queue.replace_queue_entries(
+                &range,
+                Some(ScanRange::from_parts(range.clone(), ScanPriority::Historic)).into_iter(),
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     /// Adds a sequence of blocks to the data store.
@@ -1223,16 +1269,25 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             }
             // All the checkpoints that are greater than the truncation height
             let over = checkpoint_heights.split_off(&(u32::from(max_height + 1)));
-            if let Some(height) = checkpoint_heights.last().copied() {
-                Ok(BlockHeight::from(height))
-            } else {
-                // If there are no checkpoints that are less than or equal to the truncation height
-                // then we can't truncate the tree.
-                Err(Error::RequestedRewindInvalid(
-                    over.first().copied().map(Into::into),
-                    max_height,
-                ))
+            let mut rewindable_height = None;
+            for height in checkpoint_heights.iter().rev().copied() {
+                let height = BlockHeight::from(height);
+                if !checkpoint_can_be_truncated(&self.sapling_tree, height)? {
+                    continue;
+                }
+                #[cfg(feature = "orchard")]
+                if !checkpoint_can_be_truncated(&self.orchard_tree, height)?
+                    || !checkpoint_can_be_truncated(&self.ironwood_tree, height)?
+                {
+                    continue;
+                }
+                rewindable_height = Some(height);
+                break;
             }
+            rewindable_height.ok_or(Error::RequestedRewindInvalid(
+                over.first().copied().map(Into::into),
+                max_height,
+            ))
         }?;
 
         // Recall where we synced up to previously.
@@ -1490,10 +1545,9 @@ Instead derive the ufvk in the calling code and import it using `import_account_
                 }
             }
 
-            // Add the transaction to the set to be queried for transaction status. This is only necessary
-            // at present for fully transparent transactions, because any transaction with a shielded
-            // component will be detected via ordinary chain scanning and/or nullifier checking.
-            if !detectable_via_scanning {
+            // Orchard transactions may be broadcast through zero-indexer before the
+            // ordinary chain scanner sees them, so query their status as well.
+            if !detectable_via_scanning || sent_tx.tx().orchard_bundle().is_some() {
                 self.transaction_data_request_queue
                     .queue_status_retrieval(&sent_tx.tx().txid());
             }
@@ -1745,6 +1799,25 @@ mod tests {
     use zcash_protocol::consensus::{Parameters, TxIndex};
 
     use super::*;
+
+    #[test]
+    fn queue_rescan_reopens_scanned_range_without_touching_neighbors() {
+        let mut wallet = MemoryWalletDb::new(consensus::Network::TestNetwork, 100);
+        wallet.scan_queue.0 = vec![(10.into(), 30.into(), ScanPriority::Scanned)];
+
+        wallet.queue_rescan(15.into()..25.into()).unwrap();
+        assert_eq!(
+            wallet.scan_queue.0,
+            vec![
+                (10.into(), 15.into(), ScanPriority::Scanned),
+                (15.into(), 25.into(), ScanPriority::Historic),
+                (25.into(), 30.into(), ScanPriority::Scanned),
+            ]
+        );
+        let before = wallet.scan_queue.clone();
+        wallet.queue_rescan(20.into()..20.into()).unwrap();
+        assert_eq!(wallet.scan_queue, before);
+    }
 
     #[test]
     fn prune_scan_queue_preserves_bookkeeping_and_counts_ranges() {

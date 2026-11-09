@@ -4,14 +4,17 @@ use transparent::{
 };
 use zcash_client_backend::{
     data_api::{
-        Account as _, WalletRead as _, WalletWrite as _, testing::TestBuilder,
+        Account as _, TransactionStatus, WalletRead as _, WalletWrite as _, testing::TestBuilder,
         wallet::ConfirmationsPolicy,
     },
-    wallet::WalletTransparentOutput,
+    wallet::{WalletTransparentOutput, WalletTx},
 };
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_primitives::{block::BlockHash, transaction::TxId};
-use zcash_protocol::{consensus::BlockHeight, value::Zatoshis};
+use zcash_protocol::{
+    consensus::{BlockHeight, TxIndex},
+    value::Zatoshis,
+};
 
 use crate::testing::{MemBlockCache, TestMemDbFactory};
 
@@ -19,6 +22,111 @@ use crate::testing::{MemBlockCache, TestMemDbFactory};
 fn put_received_transparent_utxo() {
     zcash_client_backend::data_api::testing::transparent::put_received_transparent_utxo(
         TestMemDbFactory::new(),
+    );
+}
+
+#[test]
+fn scan_maps_known_receivers_and_unspent_outpoints() {
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(TestMemDbFactory::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    let account_id = st.test_account().unwrap().id();
+    let birthday = st.test_account().unwrap().birthday().height();
+    st.wallet_mut().update_chain_tip(birthday + 10).unwrap();
+    let external = *st
+        .wallet()
+        .get_last_generated_address_matching(account_id, UnifiedAddressRequest::AllAvailableKeys)
+        .unwrap()
+        .unwrap()
+        .transparent()
+        .unwrap();
+    let internal = st
+        .wallet_mut()
+        .reserve_next_n_internal_addresses(account_id, 1)
+        .unwrap()[0]
+        .0;
+    let ephemeral = st
+        .wallet_mut()
+        .reserve_next_n_ephemeral_addresses(account_id, 1)
+        .unwrap()[0]
+        .0;
+
+    let receivers = st.wallet().get_transparent_receiver_accounts().unwrap();
+    assert_eq!(
+        receivers.get(&external),
+        Some(&(account_id, Some(TransparentKeyScope::EXTERNAL)))
+    );
+    assert_eq!(
+        receivers.get(&internal),
+        Some(&(account_id, Some(TransparentKeyScope::INTERNAL)))
+    );
+    assert_eq!(
+        receivers.get(&ephemeral),
+        Some(&(account_id, Some(TransparentKeyScope::EPHEMERAL)))
+    );
+
+    let outpoint = OutPoint::new([31; 32], 0);
+    let output = WalletTransparentOutput::from_parts(
+        outpoint.clone(),
+        TxOut::new(Zatoshis::const_from_u64(20_000), external.script().into()),
+        Some(birthday + 1),
+        Some(account_id),
+        Some(TransparentKeyScope::EXTERNAL),
+        None,
+    )
+    .unwrap();
+    st.wallet_mut()
+        .put_received_transparent_utxo(&output)
+        .unwrap();
+    assert_eq!(
+        st.wallet()
+            .get_unspent_transparent_outpoints()
+            .unwrap()
+            .get(&outpoint),
+        Some(&account_id)
+    );
+
+    let spending_txid = TxId::from_bytes([32; 32]);
+    st.wallet_mut().tx_table.put_tx_meta(
+        WalletTx::new(
+            spending_txid,
+            TxIndex::from(0u16),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            #[cfg(feature = "orchard")]
+            vec![],
+            #[cfg(feature = "orchard")]
+            vec![],
+            #[cfg(feature = "orchard")]
+            vec![],
+            #[cfg(feature = "orchard")]
+            vec![],
+        ),
+        birthday + 2,
+    );
+    st.wallet_mut()
+        .transparent_received_output_spends
+        .insert(outpoint.clone(), spending_txid);
+    assert!(
+        !st.wallet()
+            .get_unspent_transparent_outpoints()
+            .unwrap()
+            .contains_key(&outpoint)
+    );
+
+    st.wallet_mut()
+        .tx_table
+        .set_transaction_status(&spending_txid, TransactionStatus::NotInMainChain)
+        .unwrap();
+    assert_eq!(
+        st.wallet()
+            .get_unspent_transparent_outpoints()
+            .unwrap()
+            .get(&outpoint),
+        Some(&account_id)
     );
 }
 
@@ -194,8 +302,6 @@ fn transparent_test_transaction(
         BranchId::Sapling,
         0,
         expiry_height,
-        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-        Zatoshis::ZERO,
         Some(Bundle {
             vin: vec![TxIn::from_parts(prevout, Script::default(), u32::MAX)],
             vout: outputs,

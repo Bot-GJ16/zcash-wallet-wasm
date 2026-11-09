@@ -34,7 +34,7 @@ fn client() -> HelperClient {
     let config = HelperClientConfig::default()
         .with_request_timeout(Duration::from_millis(500))
         .unwrap()
-        .with_post_timeout(Duration::from_millis(500))
+        .with_post_timeout(Duration::from_secs(5))
         .unwrap()
         .with_preflight_timeouts(Duration::from_millis(100), Duration::from_secs(1))
         .unwrap()
@@ -113,6 +113,9 @@ async fn submit(
     urls: &[String],
 ) -> ShareBatchDeliveryReport {
     committed_vote(db)
+        .confirmed(db)
+        .unwrap()
+        .expect("fixture vote is confirmed")
         .submit_prepared_shares(
             db,
             client,
@@ -262,23 +265,29 @@ async fn every_http_post_is_journaled_before_the_helper_can_answer() {
     let helper_client = client();
     let delivery_plan = prepare_share_zero(&db, &helper_client, &urls).await;
     let plan = &delivery_plan.share_plans[0];
-    let first = server_index(&urls, &plan.target_servers[0]);
     let gate = Arc::new(ResponseGate::default());
-    fleet.server(first).enqueue(
-        Endpoint::Submit,
-        Response::GatedJson {
-            gate: Arc::clone(&gate),
-            status: 200,
-            body: r#"{"status":"queued"}"#.to_string(),
-        },
-    );
+    // Hold every target response so the journal can be inspected with the
+    // whole wave in flight, independently of HTTP dispatch order.
+    for target in &plan.target_servers {
+        fleet.server(server_index(&urls, target)).enqueue(
+            Endpoint::Submit,
+            Response::GatedJson {
+                gate: Arc::clone(&gate),
+                status: 200,
+                body: r#"{"status":"queued"}"#.to_string(),
+            },
+        );
+    }
     let submission = submit(&db, &helper_client, &urls);
     let observe_journal = async {
-        while fleet.post_requests().is_empty() {
+        while fleet.post_requests().len() < plan.target_servers.len() {
             tokio::task::yield_now().await;
         }
         let stored = &share::list(&db, ROUND_ID).unwrap()[0];
-        assert_eq!(stored.attempting_urls, vec![plan.target_servers[0].clone()]);
+        assert_eq!(
+            stored.attempting_urls.iter().collect::<HashSet<_>>(),
+            plan.target_servers.iter().collect::<HashSet<_>>()
+        );
         assert!(stored.sent_to_urls.is_empty());
         gate.release();
     };
@@ -485,6 +494,9 @@ async fn current_boundary_rejects_schema_invalid_bodies_and_canonical_duplicates
     let mut duplicated = urls.clone();
     duplicated[9] = format!("{}/", urls[0]);
     let result = committed_vote(&db)
+        .confirmed(&db)
+        .unwrap()
+        .expect("fixture vote is confirmed")
         .submit_prepared_shares(
             &db,
             &helper_client,

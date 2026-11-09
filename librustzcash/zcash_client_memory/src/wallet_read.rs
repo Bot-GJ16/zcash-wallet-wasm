@@ -40,7 +40,11 @@ use zip32::fingerprint::SeedFingerprint;
 #[cfg(feature = "transparent-inputs")]
 use {
     crate::input_source::TransparentOutputStatus,
-    transparent::{address::TransparentAddress, keys::NonHardenedChildIndex},
+    transparent::{
+        address::TransparentAddress,
+        bundle::OutPoint,
+        keys::{NonHardenedChildIndex, TransparentKeyScope},
+    },
     zcash_client_backend::wallet::{Exposure, TransparentAddressMetadata},
     zip32::Scope,
 };
@@ -602,8 +606,6 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
                             branch_id,
                             tx_data.lock_time(),
                             expiry_height,
-                            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-                            tx_data.zip233_amount(),
                             tx_data.transparent_bundle().cloned(),
                             tx_data.sapling_bundle().cloned(),
                             tx_data.orchard_bundle().cloned(),
@@ -616,8 +618,6 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
                             branch_id,
                             tx_data.lock_time(),
                             expiry_height,
-                            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-                            tx_data.zip233_amount(),
                             tx_data.transparent_bundle().cloned(),
                             tx_data.sprout_bundle().cloned(),
                             tx_data.sapling_bundle().cloned(),
@@ -736,6 +736,85 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
                 })
                 .collect(),
         })
+    }
+
+    #[cfg(feature = "transparent-inputs")]
+    fn get_unspent_transparent_outpoints(
+        &self,
+    ) -> Result<HashMap<OutPoint, Self::AccountId>, Self::Error> {
+        Ok(self
+            .transparent_received_outputs
+            .iter()
+            .filter(|(outpoint, _)| {
+                self.transparent_received_output_spends
+                    .get(outpoint)
+                    .and_then(|txid| self.tx_table.get_transaction(txid))
+                    .is_none_or(|tx| !matches!(tx.status(), TransactionStatus::Mined(_)))
+            })
+            .map(|(outpoint, output)| (outpoint.clone(), output.account_id))
+            .collect())
+    }
+
+    #[cfg(feature = "transparent-inputs")]
+    fn get_transparent_receiver_accounts(
+        &self,
+    ) -> Result<
+        HashMap<TransparentAddress, (Self::AccountId, Option<TransparentKeyScope>)>,
+        Self::Error,
+    > {
+        let mut receivers = HashMap::new();
+        for (account_id, account) in self.accounts.iter() {
+            for address in account
+                .addresses()
+                .values()
+                .filter_map(|ua| ua.transparent())
+            {
+                receivers
+                    .entry(*address)
+                    .or_insert((*account_id, Some(TransparentKeyScope::EXTERNAL)));
+            }
+        }
+        for (account_id, account) in self.accounts.iter() {
+            for address in account
+                .internal_addresses
+                .values()
+                .map(|entry| entry.address)
+                .chain(
+                    account
+                        .internal_address_discovery
+                        .values()
+                        .map(|entry| entry.address),
+                )
+            {
+                receivers
+                    .entry(address)
+                    .or_insert((*account_id, Some(TransparentKeyScope::INTERNAL)));
+            }
+        }
+        for (account_id, account) in self.accounts.iter() {
+            for address in account
+                .ephemeral_addresses
+                .values()
+                .map(|entry| entry.address)
+            {
+                receivers
+                    .entry(address)
+                    .or_insert((*account_id, Some(TransparentKeyScope::EPHEMERAL)));
+            }
+        }
+        for (account_id, account) in self.accounts.iter() {
+            if let Some((address, _)) = account.get_legacy_transparent_address()? {
+                receivers
+                    .entry(address)
+                    .or_insert((*account_id, Some(TransparentKeyScope::EXTERNAL)));
+            }
+        }
+        for output in self.transparent_received_outputs.values() {
+            receivers
+                .entry(output.address)
+                .or_insert((output.account_id, Some(output.key_scope)));
+        }
+        Ok(receivers)
     }
 
     #[cfg(feature = "transparent-inputs")]

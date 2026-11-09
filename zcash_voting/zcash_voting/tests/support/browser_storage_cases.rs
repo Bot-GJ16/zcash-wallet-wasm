@@ -28,7 +28,7 @@ fn read_snapshot(bytes: &[u8]) -> Connection {
 
 fn legacy_bytes(sql: &str) -> Vec<u8> {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(include_str!("../../src/storage/migrations/001_init.sql"))
+    conn.execute_batch(include_str!("../fixtures/browser_v17.sql"))
         .unwrap();
     conn.execute_batch("PRAGMA user_version = 17; PRAGMA foreign_keys = OFF;")
         .unwrap();
@@ -77,6 +77,8 @@ fn browser_db_round_trip_preserves_resume_plan_and_owns_bytes() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn browser_db_rejects_another_owner_and_network() {
     let db = VotingDb::open_browser("wallet-a", Network::Testnet, None).unwrap();
+    assert!(db.scoped("wallet-b").is_err());
+    assert!(db.scoped("wallet-a").is_ok());
     let bytes = db.serialize_bytes().unwrap();
     assert_rejected(
         "wallet-b",
@@ -111,7 +113,7 @@ fn browser_db_empty_input_and_metadata() {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            22
+            25
         );
     }
     assert!(VotingDb::open_browser("", Network::Testnet, None).is_err());
@@ -136,7 +138,7 @@ fn browser_db_upgrades_v17_preserving_round_and_intent() {
         read_snapshot(&db.serialize_bytes().unwrap())
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        22
+        25
     );
     assert_rejected(
         "wallet-b",
@@ -205,8 +207,10 @@ fn browser_db_upgrade_preserves_helper_journal_and_cascades() {
         .unwrap(),
         "{\"vc_tree_position\":1}"
     );
-    db.clear_round(ROUND_ID).unwrap();
-    let cleared = read_snapshot(&db.serialize_bytes().unwrap());
+    assert!(db.clear_round(ROUND_ID).is_err());
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute("DELETE FROM rounds WHERE round_id=?1", [ROUND_ID])
+        .unwrap();
     for table in [
         "helper_share_plans",
         "share_delegations",
@@ -214,9 +218,8 @@ fn browser_db_upgrade_preserves_helper_journal_and_cascades() {
         "bundles",
     ] {
         assert_eq!(
-            cleared
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
-                    .get::<_, i64>(0))
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
                 .unwrap(),
             0
         );

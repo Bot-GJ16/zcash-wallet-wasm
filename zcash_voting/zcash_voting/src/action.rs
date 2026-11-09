@@ -17,16 +17,16 @@ use orchard::pczt::Zip32Derivation;
 use orchard::value::NoteValue;
 use orchard::Address;
 use voting_circuits::delegation::synthetic_padding_note_parts;
-use zcash_keys::address::UnifiedAddress;
+use voting_crypto_deps::zip32::Scope;
 use zcash_primitives::transaction::builder::PcztParts;
 use zcash_primitives::transaction::TxVersion;
 use zcash_protocol::consensus::{
     BlockHeight, BranchId, Network as ConsensusNetwork, NetworkConstants, Parameters,
 };
-use zip32::Scope;
 
 use crate::governance::{self, BUNDLE_NOTE_SLOTS};
 use crate::shielded_protocol::VotingShieldedProtocol;
+use crate::tx1::TX1_CONSENSUS_BRANCH_ID;
 use crate::types::{
     validate_notes, validate_round_params, GovernancePczt, Network as VotingNetwork, NoteInfo,
     VotingError, VotingRoundParams,
@@ -112,6 +112,58 @@ pub fn derive_hotkey_x_coords_from_raw_address(
     let g_d_x: [u8; 32] = point_x_bytes(&g_d_point)?;
 
     Ok((g_d_x, pk_d_x))
+}
+
+/// Reconstructs the commitment of the zero-value governance output sent to a
+/// full Orchard receiver.
+///
+/// Unlike the VAN, this commitment binds the complete encoded transmission key,
+/// including its y-coordinate sign bit.
+///
+/// `output_rho` is the spend's **nullifier** — the bundle's `nf_signed` — and
+/// not the spend's own rho. An Orchard output note takes its rho from the
+/// nullifier of the spend beside it, so passing `rho_signed` here reconstructs
+/// a different note. The commitment then disagrees with every bundle the PCZT
+/// builder has ever written, which surfaces as "the voting hotkey does not
+/// match" however right the hotkey is. Both values are 32 bytes and neither
+/// type nor arity catches the swap, so read the note beside `rho_signed` in
+/// `build_governance_pczt` before changing this call.
+pub(crate) fn derive_governance_output_cmx(
+    hotkey_raw_address: &[u8; 43],
+    output_rho: &[u8; 32],
+    rseed_output: &[u8; 32],
+    network: VotingNetwork,
+    snapshot_height: u64,
+) -> Result<[u8; 32], VotingError> {
+    let hotkey_address = Address::from_raw_address_bytes(hotkey_raw_address)
+        .into_option()
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: "hotkey_raw_address is not a valid Orchard address".to_string(),
+        })?;
+    let rho = Rho::from_bytes(output_rho)
+        .into_option()
+        .ok_or_else(|| VotingError::Internal {
+            message: "stored nf_signed is not a valid Orchard Rho".to_string(),
+        })?;
+    let rseed = RandomSeed::from_bytes(*rseed_output, &rho)
+        .into_option()
+        .ok_or_else(|| VotingError::Internal {
+            message: "stored rseed_output is not valid for nf_signed".to_string(),
+        })?;
+    let height = u32::try_from(snapshot_height).map_err(|_| VotingError::InvalidInput {
+        message: "snapshot height does not fit in u32".into(),
+    })?;
+    let branch_id = BranchId::for_height(&network, BlockHeight::from_u32(height));
+    let note_version = VotingShieldedProtocol::for_branch_id(branch_id)?.note_version();
+    let output_note =
+        orchard::Note::from_parts(hotkey_address, NoteValue::ZERO, rho, rseed, note_version)
+            .into_option()
+            .ok_or_else(|| VotingError::Internal {
+                message: "failed to reconstruct stored governance output note".to_string(),
+            })?;
+    let output_cmx: orchard::note::ExtractedNoteCommitment = output_note.commitment().into();
+
+    Ok(output_cmx.to_bytes())
 }
 
 /// Generate a random valid Rho (retries until the random bytes are a valid Pallas field element).
@@ -279,7 +331,9 @@ fn validate_consensus_branch_id(
 /// - `network`: network that owns the persisted voting round snapshot.
 /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
 /// - `hotkey_raw_address`: 43-byte hotkey raw orchard address
-/// - `consensus_branch_id`: network consensus branch ID active at the snapshot height.
+/// - `consensus_branch_id`: network consensus branch ID active at the snapshot
+///   height. It selects note eligibility only. The PCZT itself always uses
+///   [`TX1_CONSENSUS_BRANCH_ID`].
 /// - `coin_type`: BIP-44 coin type (133 for mainnet, 1 for testnet/regtest)
 /// - `seed_fingerprint`: 32-byte ZIP-32 seed fingerprint (Keystone needs this to
 ///   identify which seed to derive the spending key from)
@@ -299,6 +353,7 @@ pub(crate) fn build_governance_pczt(
     round_name: &str,
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     van_blinding: Option<&VanBlinding>,
+    ledger_output_review: bool,
 ) -> Result<GovernancePczt, VotingError> {
     validate_notes(notes)?;
     validate_round_params(params)?;
@@ -461,7 +516,25 @@ pub(crate) fn build_governance_pczt(
         });
     }
 
-    // Compute constrained rho
+    // `rho_signed` and `nf_signed` are the two halves of one action, and the
+    // difference between them decides which note a later reader can rebuild.
+    //
+    //   rho_signed  the *input* rho of the spend note below, constrained to
+    //               Poseidon(cmx_1..cmx_5, van_comm, vote_round_id) so the
+    //               spend cannot be lifted into another bundle or round.
+    //   nf_signed   the *nullifier* the builder derives from that spend note
+    //               and the account's nullifier key, captured further down
+    //               from the finished action. It is public, it is what the
+    //               chain checks for a double spend, and — because Orchard
+    //               gives an output note the rho of the spend beside it — it
+    //               is also the governance output note's rho.
+    //
+    // So reconstructing the spend note needs `rho_signed`; reconstructing the
+    // governance output note needs `nf_signed`. Neither derives from the other
+    // without `nk`, which is why both are persisted. Reaching for the wrong one
+    // rebuilds a different note, and its commitment then disagrees with every
+    // bundle ever written — which surfaces as "the voting hotkey does not
+    // match" no matter how right the hotkey is.
     let rho_signed = governance::compute_rho_binding(
         &all_cmx[0],
         &all_cmx[1],
@@ -489,7 +562,11 @@ pub(crate) fn build_governance_pczt(
     // Add output to hotkey address. The circuit commits to a zero-value output
     // note for cmx_new, so Phase 1 must use the same value and rseed.
     let memo = {
-        let memo_str = crate::delegate::display_memo(round_name, total_weight);
+        let memo_str = if ledger_output_review {
+            crate::delegate::ledger_display_memo(round_name, total_weight)
+        } else {
+            crate::delegate::display_memo(round_name, total_weight)
+        };
         let mut buf = [0u8; 512];
         let bytes = memo_str.as_bytes();
         let len = bytes.len().min(512);
@@ -500,7 +577,7 @@ pub(crate) fn build_governance_pczt(
     // Use Creator::build_from_parts to construct the PCZT with the selected
     // Orchard or Ironwood bundle, matching the wallet transaction builder path.
     let consensus_network = consensus_network_for_voting_network(network);
-    let hotkey_user_address = UnifiedAddress::from_receivers(Some(hotkey_addr.clone()), None, None)
+    let hotkey_user_address = crate::backend::orchard_unified_address(hotkey_addr.clone())
         .expect("an Orchard receiver forms a valid Unified Address")
         .encode(&consensus_network);
 
@@ -523,7 +600,12 @@ pub(crate) fn build_governance_pczt(
             })?;
 
         builder
-            .add_output(None, hotkey_addr.clone(), NoteValue::ZERO, memo)
+            .add_output(
+                ledger_output_review.then(|| fvk.to_ovk(Scope::External)),
+                hotkey_addr.clone(),
+                NoteValue::ZERO,
+                memo,
+            )
             .map_err(|e| VotingError::Internal {
                 message: format!("Builder::add_output failed: {:?}", e),
             })?;
@@ -556,6 +638,8 @@ pub(crate) fn build_governance_pczt(
 
         let action_index = spend_idx;
         let governance_action = &pczt_bundle.actions()[action_index];
+        // The spend's nullifier. This is the governance output note's rho —
+        // see the note beside `rho_signed` above before using either.
         let nf_signed_bytes: [u8; 32] = governance_action.spend().nullifier().to_bytes();
         let rk_bytes: [u8; 32] = governance_action.spend().rk().into();
         let alpha = governance_action
@@ -564,7 +648,7 @@ pub(crate) fn build_governance_pczt(
             .ok_or_else(|| VotingError::Internal {
                 message: "PCZT spend missing alpha".to_string(),
             })?;
-        let alpha_bytes: [u8; 32] = alpha.to_repr();
+        let alpha_bytes: [u8; 32] = crate::backend::spend_auth_randomizer_bytes(&alpha);
         let rseed_signed_from_pczt =
             governance_action
                 .spend()
@@ -617,10 +701,12 @@ pub(crate) fn build_governance_pczt(
         let ironwood_bundle = Some(pczt_bundle);
         let orchard_bundle = None;
 
+        // The snapshot branch only selects note eligibility above. TX1 signs
+        // under the fixed profile that vote-chain verifiers reconstruct.
         let parts = PcztParts {
             params: consensus_network,
-            version: TxVersion::suggested_for_branch(branch_id),
-            consensus_branch_id: branch_id,
+            version: TxVersion::suggested_for_branch(TX1_CONSENSUS_BRANCH_ID),
+            consensus_branch_id: TX1_CONSENSUS_BRANCH_ID,
             // Keystone's determine_lock_time returns global.lock_time() for shielded-only PCZTs
             // (no transparent inputs). Without a lock_time, it returns None → error.
             lock_time: 0,
@@ -638,11 +724,14 @@ pub(crate) fn build_governance_pczt(
         })?;
 
         // Run IO Finalizer so the Signer (Keystone) can compute the sighash.
-        let pczt = pczt::roles::io_finalizer::IoFinalizer::new(pczt)
-            .finalize_io()
-            .map_err(|e| VotingError::Internal {
-                message: format!("IoFinalizer::finalize_io failed: {:?}", e),
-            })?;
+        let finalizer = pczt::roles::io_finalizer::IoFinalizer::new(pczt);
+        #[cfg(feature = "zakura")]
+        let finalized = finalizer.finalize_io();
+        #[cfg(feature = "lrz")]
+        let finalized = finalizer.finalize_io(voting_crypto_deps::rand::rngs::OsRng);
+        let pczt = finalized.map_err(|e| VotingError::Internal {
+            message: format!("IoFinalizer::finalize_io failed: {:?}", e),
+        })?;
 
         let pczt_bytes = pczt.serialize().map_err(|e| VotingError::Internal {
             message: format!("PCZT serialization failed: {:?}", e),
@@ -730,6 +819,37 @@ pub fn extract_pczt_sighash(pczt_bytes: &[u8]) -> Result<[u8; 32], VotingError> 
     Ok(signer.shielded_sighash())
 }
 
+/// Locate the persisted governance action bound to `expected_rk`.
+pub(crate) fn delegation_pczt_action_index(
+    pczt_bytes: &[u8],
+    expected_rk: &[u8; 32],
+) -> Result<usize, VotingError> {
+    let pczt = pczt::Pczt::parse(pczt_bytes).map_err(|e| VotingError::Internal {
+        message: format!("failed to parse persisted delegation PCZT: {e:?}"),
+    })?;
+    let (actions, protocol) = signed_pczt_actions(&pczt)?;
+    let matches = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            let rk = *action.spend().rk();
+            (rk == *expected_rk).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(VotingError::Internal {
+            message: format!("persisted delegation PCZT has no matching {protocol} rk"),
+        }),
+        _ => Err(VotingError::Internal {
+            message: format!(
+                "persisted delegation PCZT has multiple matching {protocol} rk values"
+            ),
+        }),
+    }
+}
+
 /// Extract the spend_auth_sig from a signed PCZT.
 ///
 /// Keystone redacts sensitive fields (alpha, rseed, zip32_derivation, etc.) after signing,
@@ -776,6 +896,11 @@ pub fn extract_spend_auth_sig(
 
 #[cfg(test)]
 mod tests {
+    #[path = "output_recovery.rs"]
+    mod output_recovery;
+    #[path = "tx1_profile.rs"]
+    mod tx1_profile;
+
     use super::*;
     use orchard::{
         keys::SpendingKey,
@@ -785,7 +910,7 @@ mod tests {
         value::ValueCommitment,
         Action,
     };
-    use zcash_note_encryption::try_output_recovery_with_ovk;
+    use voting_crypto_deps::zcash_note_encryption::try_output_recovery_with_ovk;
 
     fn mock_note() -> NoteInfo {
         NoteInfo {
@@ -834,6 +959,7 @@ mod tests {
             "Test Round",
             &sample_padded_note_secrets(notes.len()).unwrap(),
             None,
+            false,
         )
         .unwrap()
     }
@@ -999,7 +1125,7 @@ mod tests {
         let hotkey_addr = Address::from_raw_address_bytes(&hotkey_raw)
             .into_option()
             .expect("mock hotkey address is valid");
-        let expected_user_address = UnifiedAddress::from_receivers(Some(hotkey_addr), None, None)
+        let expected_user_address = crate::backend::orchard_unified_address(hotkey_addr)
             .expect("an Orchard receiver forms a valid Unified Address")
             .encode(&consensus_network_for_voting_network(
                 VotingNetwork::Regtest,
@@ -1051,6 +1177,7 @@ mod tests {
             "Test Round",
             &sample_padded_note_secrets(1).unwrap(),
             None,
+            false,
         )
         .unwrap_err();
 
@@ -1122,64 +1249,6 @@ mod tests {
     }
 
     #[test]
-    fn test_governance_outputs_are_not_recoverable_with_account_ovk() {
-        let result = build_mock_nu6_3_pczt(&[mock_note()]);
-        let fvk = FullViewingKey::from_bytes(&mock_fvk_bytes().try_into().unwrap()).unwrap();
-        let ovk = fvk.to_ovk(Scope::External);
-
-        for index in 0..crate::tx1::TX1_ACTION_COUNT {
-            let start = 1 + index * crate::tx1::TX1_ACTION_EFFECTS_LEN;
-            let action = Action::from_parts(
-                Nullifier::from_bytes(
-                    result.tx1_effects[start + 32..start + 64]
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap(),
-                VerificationKey::<SpendAuth>::try_from(
-                    <[u8; 32]>::try_from(&result.tx1_effects[start + 64..start + 96]).unwrap(),
-                )
-                .unwrap(),
-                ExtractedNoteCommitment::from_bytes(
-                    result.tx1_effects[start + 96..start + 128]
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap(),
-                TransmittedNoteCiphertext {
-                    epk_bytes: result.tx1_effects[start + 128..start + 160]
-                        .try_into()
-                        .unwrap(),
-                    enc_ciphertext: result.tx1_effects[start + 160..start + 740]
-                        .try_into()
-                        .unwrap(),
-                    out_ciphertext: result.tx1_effects[start + 740..start + 820]
-                        .try_into()
-                        .unwrap(),
-                },
-                ValueCommitment::from_bytes(
-                    result.tx1_effects[start..start + 32].try_into().unwrap(),
-                )
-                .unwrap(),
-                (),
-            )
-            .unwrap();
-
-            assert!(
-                try_output_recovery_with_ovk(
-                    &IronwoodDomain::for_action(&action),
-                    &ovk,
-                    &action,
-                    action.cv_net(),
-                    &action.encrypted_note().out_ciphertext,
-                )
-                .is_none(),
-                "action {index} was recoverable with the governance account OVK"
-            );
-        }
-    }
-
-    #[test]
     fn test_build_governance_pczt_rejects_coin_type_network_mismatch() {
         let err = build_governance_pczt(
             &[mock_note()],
@@ -1194,6 +1263,7 @@ mod tests {
             "Test Round",
             &sample_padded_note_secrets(1).unwrap(),
             None,
+            false,
         )
         .unwrap_err();
 

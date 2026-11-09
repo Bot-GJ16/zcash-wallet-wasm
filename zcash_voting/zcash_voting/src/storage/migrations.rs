@@ -1,8 +1,11 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 22;
+const CURRENT_VERSION: u32 = 25;
+const UPSTREAM_VERSION: u32 = 24;
+const BROWSER_VERSION: u32 = 22;
+const LEGACY_EVIDENCE_SQL: &str = include_str!("migrations/008_legacy_browser_evidence.sql");
 
 /// Oldest launched schema version that can be upgraded in place.
 ///
@@ -18,7 +21,7 @@ const LAUNCH_VERSION: u32 = 13;
 ///
 /// Entry `(from, sql)` moves a database from `user_version == from` to
 /// `from + 1`, and the entries must form an unbroken chain from
-/// [`LAUNCH_VERSION`] to [`CURRENT_VERSION`]. Every statement here MUST preserve
+/// [`LAUNCH_VERSION`] to [`UPSTREAM_VERSION`]. Every statement here MUST preserve
 /// existing rows. The fresh schema combines `001_init.sql` (v17) and
 /// `002_wallet_owner.sql` so it matches an incrementally migrated database.
 const INCREMENTAL_MIGRATIONS: &[(u32, &str)] = &[
@@ -116,20 +119,67 @@ BEGIN
        AND commitment_bundle_json IS NOT NEW.commitment_bundle_json;
 END;",
     ),
+    // v18 adds the lifecycle-owned `chain_submissions` table. It is schema
+    // only: version-17 domain columns on `votes` and `bundles` are preserved
+    // untouched so completed rounds keep displaying, and no version-17
+    // evidence is imported into the lifecycle.
+    (
+        17,
+        include_str!("migrations/002_chain_submissions.sql"),
+    ),
+    (
+        18,
+        include_str!("migrations/003_hashless_submission.sql"),
+    ),
+    // v20 makes the round's immediate helper-share designation a row of its
+    // own, adopted from the version-19 plan markers.
+    (
+        19,
+        include_str!("migrations/004_round_immediate_share.sql"),
+    ),
+    // v21 rebuilds `chain_submissions` onto the 50-proposal bound. Sidecars
+    // migrated by a build that carried the 15-proposal bound keep it at
+    // version 20, and the version-20 fingerprint check then refuses to open
+    // them at all, so the widened bound needs a version of its own.
+    (
+        20,
+        include_str!("migrations/005_chain_submissions_proposal_range.sql"),
+    ),
+    (21, "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;"),
+    (22, include_str!("migrations/006_delegate_cast.sql")),
+    // The rejection ledger cannot be a `chain_submissions` column: that table
+    // is fingerprinted on every open and rebuilt on drift, and the combined
+    // freshness gates key off the absence of a row in it.
+    (
+        23,
+        include_str!("migrations/007_combined_cast_rejections.sql"),
+    ),
+];
+
+const BROWSER_MIGRATIONS: &[(u32, &str)] = &[
     (17, include_str!("migrations/002_wallet_owner.sql")),
     (18, include_str!("migrations/003_voting_hotkey.sql")),
     (19, include_str!("migrations/004_delegation_attempts.sql")),
-    (20, include_str!("migrations/005_delegation_confirmation.sql")),
+    (
+        20,
+        include_str!("migrations/005_delegation_confirmation.sql"),
+    ),
     (21, include_str!("migrations/006_vote_attempts.sql")),
 ];
 
-const RESET_SQL: &str = "DROP TABLE IF EXISTS wallet_metadata;
+const RESET_SQL: &str = "DROP TABLE IF EXISTS combined_cast_rejections;
+DROP TABLE IF EXISTS legacy_vote_evidence;
+DROP TABLE IF EXISTS legacy_delegation_evidence;
+DROP TABLE IF EXISTS wallet_metadata;
 DROP TABLE IF EXISTS vote_attempts;
 DROP TABLE IF EXISTS delegation_attempts;
 DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
+DROP TABLE IF EXISTS round_immediate_share;
 DROP TABLE IF EXISTS helper_share_plans;
+DROP TABLE IF EXISTS delegate_cast_recovery;
+DROP TABLE IF EXISTS chain_submissions;
 DROP TABLE IF EXISTS share_delegations;
 DROP TABLE IF EXISTS keystone_signatures;
 DROP TABLE IF EXISTS votes;
@@ -142,9 +192,7 @@ DROP TABLE IF EXISTS rounds;";
 pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read database version: {}", e),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("failed to read database version", &e))?;
 
     if version > CURRENT_VERSION {
         return Err(VotingError::Internal {
@@ -156,805 +204,418 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     }
 
     if version == CURRENT_VERSION {
-        return Ok(());
+        ensure_current_chain_submission_schema(conn)?;
+        return ensure_legacy_evidence_schema(conn);
     }
 
-    let tx = conn.transaction().map_err(|e| VotingError::Internal {
-        message: format!("failed to start database migration transaction: {}", e),
-    })?;
+    // The browser fork and upstream independently used versions 18-22. The
+    // browser fork's first migration created this table; upstream never did.
+    let browser_schema =
+        (18..=BROWSER_VERSION).contains(&version) && schema_table_present(conn, "wallet_metadata")?;
+    let capture_legacy_evidence = browser_schema || (LAUNCH_VERSION..=17).contains(&version);
+    if browser_schema && chain_submissions_present(conn)? {
+        return Err(VotingError::Internal {
+            message:
+                "ambiguous voting database schema: browser and upstream migration markers coexist"
+                    .into(),
+        });
+    }
+
+    // Immediate: a deferred transaction takes the write lock lazily on its
+    // first statement, and a read-to-write upgrade that loses the race fails
+    // without invoking the busy handler, so the connection busy timeout would
+    // not cover the schema statements below.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to start database migration transaction", &e)
+        })?;
 
     if version < LAUNCH_VERSION {
-        tx.execute_batch(RESET_SQL)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to reset pre-launch database schema: {}", e),
-            })?;
+        tx.execute_batch(RESET_SQL).map_err(|e| {
+            VotingError::from_sqlite("failed to reset pre-launch database schema", &e)
+        })?;
         tx.execute_batch(include_str!("migrations/001_init.sql"))
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to create launch database schema: {}", e),
-            })?;
-        tx.execute_batch(include_str!("migrations/002_wallet_owner.sql"))
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to create wallet owner schema: {e}"),
-            })?;
-        tx.execute_batch(include_str!("migrations/003_voting_hotkey.sql"))
-            .map_err(|_| VotingError::Internal {
-                message: "could not create voting hotkey storage".into(),
-            })?;
-        tx.execute_batch(include_str!("migrations/004_delegation_attempts.sql"))
-            .map_err(|_| VotingError::Internal {
-                message: "could not create delegation journal".into(),
-            })?;
-        tx.execute_batch(include_str!("migrations/005_delegation_confirmation.sql"))
-            .map_err(|_| VotingError::Internal {
-                message: "could not create delegation confirmation storage".into(),
-            })?;
-        tx.execute_batch(include_str!("migrations/006_vote_attempts.sql"))
-            .map_err(|_| VotingError::Internal {
-                message: "could not create vote submission journal".into(),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to create launch database schema", &e))?;
+        apply_browser_migrations(&tx, 17)?;
     } else {
         // Launched databases hold delegation state that cannot be rebuilt, so
         // they are upgraded in place rather than recreated.
-        let mut upgraded = version;
+        if browser_schema {
+            apply_browser_migrations(&tx, version)?;
+        }
+        let mut upgraded = if browser_schema { 17 } else { version };
         for (from, sql) in INCREMENTAL_MIGRATIONS {
             if *from < upgraded {
                 continue;
             }
-            tx.execute_batch(sql).map_err(|e| VotingError::Internal {
-                message: format!(
-                    "failed to upgrade database schema from version {} to {}: {}",
-                    from,
-                    from + 1,
-                    e
-                ),
+            // Both rungs below rebuild `chain_submissions` in place, so both
+            // assume it is there. A sidecar that reached this version without
+            // it has no rows to carry across: create it at the shape this
+            // build describes — the shape both rebuilds converge on — rather
+            // than strand the wallet on a table that holds nothing.
+            if matches!(*from, 18 | 20) && !chain_submissions_present(&tx)? {
+                tx.execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+                    .map_err(|e| {
+                        VotingError::from_sqlite("failed to create chain submissions", &e)
+                    })?;
+                upgraded = from + 1;
+                continue;
+            }
+            // Preview builds already stored PCZTs at version 21. Preserve them.
+            if *from == 21 && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bundles') WHERE name = 'delegation_pczt')",
+                [], |row| row.get::<_, bool>(0),
+            ).map_err(|e| VotingError::from_sqlite("failed to inspect delegation PCZT storage", &e))? {
+                upgraded = from + 1;
+                continue;
+            }
+            if *from == 22 && reconcile_combined_preview(&tx)? {
+                upgraded = from + 1;
+                continue;
+            }
+            tx.execute_batch(sql).map_err(|e| {
+                VotingError::from_sqlite(
+                    &format!(
+                        "failed to upgrade database schema from version {} to {}",
+                        from,
+                        from + 1
+                    ),
+                    &e,
+                )
             })?;
             upgraded = from + 1;
         }
-        if upgraded != CURRENT_VERSION {
+        if upgraded != UPSTREAM_VERSION {
             return Err(VotingError::Internal {
                 message: format!(
                     "no upgrade path from database version {} to {}: incremental migrations stop at {}",
-                    version, CURRENT_VERSION, upgraded
+                    version, UPSTREAM_VERSION, upgraded
                 ),
             });
         }
+        if !browser_schema {
+            apply_browser_migrations(&tx, 17)?;
+        }
+    }
+
+    tx.execute_batch(LEGACY_EVIDENCE_SQL).map_err(|error| {
+        VotingError::from_sqlite("failed to create legacy browser evidence tables", &error)
+    })?;
+    if capture_legacy_evidence {
+        tx.execute_batch(
+            "INSERT INTO legacy_delegation_evidence
+             SELECT b.round_id,b.wallet_id,b.bundle_index,b.delegation_tx_hash
+             FROM bundles b
+             WHERE b.delegation_tx_hash IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM delegation_attempts a
+                 WHERE a.round_id=b.round_id AND a.wallet_id=b.wallet_id
+                   AND a.bundle_index=b.bundle_index);
+             INSERT INTO legacy_vote_evidence
+             SELECT v.round_id,v.wallet_id,v.bundle_index,v.proposal_id,v.tx_hash
+             FROM votes v
+             WHERE v.tx_hash IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM vote_attempts a
+                 WHERE a.round_id=v.round_id AND a.wallet_id=v.wallet_id
+                   AND a.bundle_index=v.bundle_index
+                   AND v.proposal_id IN (
+                     SELECT CAST(value AS INTEGER)
+                     FROM json_each(a.proposal_ids_json)));",
+        )
+        .map_err(|error| {
+            VotingError::from_sqlite("failed to preserve legacy browser chain evidence", &error)
+        })?;
     }
 
     tx.pragma_update(None, "user_version", CURRENT_VERSION)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to update database version: {}", e),
-        })?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit database migration: {}", e),
-    })?;
+        .map_err(|e| VotingError::from_sqlite("failed to update database version", &e))?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit database migration", &e))?;
 
+    // A ladder that ends on a different shape than this build describes is the
+    // same drift, reached the long way round.
+    ensure_current_chain_submission_schema(conn)?;
+    ensure_legacy_evidence_schema(conn)
+}
+
+fn ensure_legacy_evidence_schema(conn: &Connection) -> Result<(), VotingError> {
+    for table in ["legacy_delegation_evidence", "legacy_vote_evidence"] {
+        if !schema_table_present(conn, table)? {
+            return Err(VotingError::Internal {
+                message: format!("missing {table} in current voting database schema"),
+            });
+        }
+    }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::queries;
-    use crate::VotingRoundParams;
-    use rusqlite::OptionalExtension;
-
-    fn pre_v8_schema() -> String {
-        include_str!("migrations/001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
-    }
-
-    /// Strips the `pir_proof_cache` table (added at version 15) from a schema.
-    fn without_pir_proof_cache(schema: &str) -> String {
-        let start = schema
-            .find("CREATE TABLE pir_proof_cache")
-            .expect("schema must contain the table added at version 15");
-        let end = start
-            + schema[start..]
-                .find(");")
-                .expect("pir_proof_cache DDL must be terminated")
-            + ");".len();
-        format!("{}{}", &schema[..start], &schema[end..])
-    }
-
-    /// Strips helper-delivery columns added at version 16.
-    fn without_durable_ambiguous_deliveries(schema: &str) -> String {
-        schema
-            .replace("    ambiguous_urls  TEXT NOT NULL DEFAULT '[]',\n", "")
-            .replace("    attempting_urls TEXT NOT NULL DEFAULT '[]',\n", "")
-            .replace("    target_count    INTEGER NOT NULL DEFAULT 0,\n", "")
-    }
-
-    /// Strips the helper plan table and trigger added at version 17.
-    fn without_helper_share_plans(schema: &str) -> String {
-        let start = schema
-            .find("CREATE TABLE helper_share_plans")
-            .expect("schema must contain the table added at version 17");
-        let next = schema[start..]
-            .find("CREATE TABLE share_delegations")
-            .expect("helper plan DDL must precede share delegations");
-        format!("{}{}", &schema[..start], &schema[start + next..])
-    }
-
-    fn v16_schema() -> String {
-        without_helper_share_plans(include_str!("migrations/001_init.sql"))
-    }
-
-    fn v15_schema() -> String {
-        without_durable_ambiguous_deliveries(&v16_schema())
-    }
-
-    /// The bundle-scoped `imt_proofs` table that version 15 replaced with
-    /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
-    const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
-    round_id       TEXT NOT NULL,
-    wallet_id      TEXT NOT NULL DEFAULT '',
-    bundle_index   INTEGER NOT NULL,
-    nullifier      BLOB NOT NULL,
-    root           BLOB NOT NULL,
-    nf_bounds      BLOB NOT NULL,
-    leaf_pos       INTEGER NOT NULL,
-    path           BLOB NOT NULL,
-    created_at     INTEGER NOT NULL,
-    PRIMARY KEY (round_id, wallet_id, bundle_index, nullifier),
-    FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
-);";
-
-    /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
-    fn v14_schema() -> String {
-        let v16 = v16_schema();
-        let schema = without_durable_ambiguous_deliveries(&v16);
-        format!(
-            "{}\n{}\n",
-            without_pir_proof_cache(&schema),
-            V14_IMT_PROOFS_SQL
-        )
-    }
-
-    /// The launch schema, before `bundle_policy_json` and `pir_proof_cache` were added.
-    fn launch_schema() -> String {
-        let schema = v14_schema();
-        let stripped = schema.replace("    bundle_policy_json  TEXT,\n", "");
-        assert_ne!(
-            stripped, schema,
-            "launch_schema must actually drop the column added at version 14"
-        );
-        stripped
-    }
-
-    fn test_params() -> VotingRoundParams {
-        VotingRoundParams {
-            vote_round_id: "test-round".to_string(),
-            snapshot_height: 1000,
-            ea_pk: vec![0xEA; 32],
-            nc_root: vec![0xAA; 32],
-            nullifier_imt_root: vec![0xBB; 32],
-        }
-    }
-
-    #[test]
-    fn test_migrate_fresh_database() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-    }
-
-    #[test]
-    fn test_migrate_idempotent() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-    }
-
-    #[test]
-    fn test_migrate_from_prelaunch_version_resets_existing_state() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("migrations/001_init.sql"))
-            .unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        conn.pragma_update(None, "user_version", 8).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        let round_count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rounds WHERE round_id = 'test-round'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(round_count, 0);
-    }
-
-    #[test]
-    fn migrate_from_launch_version_preserves_delegation_state() {
-        // The case this migration exists for: a wallet that already submitted a
-        // delegation upgrades before voting. `van_comm_rand` is sampled randomly
-        // and its governance nullifiers are spent on chain, so losing the row
-        // would cost that round's voting weight permanently.
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&launch_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        conn.execute(
-            "UPDATE bundles SET van_comm_rand = ?1, gov_comm = ?2
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
-            rusqlite::params![vec![0xAB_u8; 32], vec![0xCD_u8; 32]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO share_delegations
-             (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at)
-             VALUES ('test-round', 'wallet', 0, 1, 0, '[\"https://helper.example\"]', X'01', 0, 100, 90)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", LAUNCH_VERSION)
-            .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        let (van_comm_rand, gov_comm): (Vec<u8>, Vec<u8>) = conn
-            .query_row(
-                "SELECT van_comm_rand, gov_comm FROM bundles
-                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(van_comm_rand, vec![0xAB; 32]);
-        assert_eq!(gov_comm, vec![0xCD; 32]);
-
-        // The round survives and gains the new column, unset.
-        let stored_policy: Option<String> = conn
-            .query_row(
-                "SELECT bundle_policy_json FROM rounds WHERE round_id = 'test-round'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(stored_policy.is_none());
-
-        let delivery: (String, String, String, u32) = conn
-            .query_row(
-                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, target_count
-                 FROM share_delegations WHERE round_id = 'test-round' AND wallet_id = 'wallet'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(delivery.0, "[\"https://helper.example\"]");
-        assert_eq!(delivery.1, "[]");
-        assert_eq!(delivery.2, "[]");
-        assert_eq!(delivery.3, 0);
-    }
-
-    #[test]
-    fn migrate_from_launch_version_matches_a_fresh_schema() {
-        // A migrated database and a fresh one must be indistinguishable,
-        // otherwise later queries work on only one of them.
-        let mut migrated = Connection::open_in_memory().unwrap();
-        migrated.execute_batch(&launch_schema()).unwrap();
-        migrated
-            .pragma_update(None, "user_version", LAUNCH_VERSION)
-            .unwrap();
-        migrate(&mut migrated).unwrap();
-
-        let mut fresh = Connection::open_in_memory().unwrap();
-        migrate(&mut fresh).unwrap();
-
-        for table in [
-            "rounds",
-            "bundles",
-            "votes",
-            "helper_share_plans",
-            "share_delegations",
-            "pir_proof_cache",
-        ] {
-            assert_eq!(
-                table_columns(&migrated, table),
-                table_columns(&fresh, table),
-                "column mismatch in {table}"
-            );
-        }
-        assert_eq!(
-            schema_sql(
-                &migrated,
-                "trigger",
-                "clear_helper_share_plan_on_vote_generation_change"
-            ),
-            schema_sql(
-                &fresh,
-                "trigger",
-                "clear_helper_share_plan_on_vote_generation_change"
-            ),
-            "migrated and fresh schemas must install the same plan lifecycle trigger"
-        );
-    }
-
-    #[test]
-    fn migrate_v16_to_v17_installs_plan_lifecycle_invariants() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v16_schema()).unwrap();
-        conn.pragma_update(None, "user_version", 16).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                .unwrap(),
-            CURRENT_VERSION
-        );
-        assert_helper_plan_lifecycle(&conn);
-    }
-
-    #[test]
-    fn migrate_v15_recovery_json_preserves_plan_only_through_confirmation() {
-        const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v15_schema()).unwrap();
-        let mut params = test_params();
-        params.vote_round_id = ROUND_ID.to_string();
-        queries::insert_round(&conn, "wallet", crate::Network::Testnet, &params, None).unwrap();
-        queries::insert_bundle(&conn, ROUND_ID, "wallet", 0, &[1]).unwrap();
-        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 1, 2, &[0xCA; 32]).unwrap();
-        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 2, 1, &[0xCB; 32]).unwrap();
-
-        let released_json = released_singleton_recovery_json(ROUND_ID);
-        assert!(!released_json.contains("\"batch_digest\""));
-        let batch_json = r#"{"format":"zcash_voting_vote_batch_recovery_v1","batch_digest":[1],"batch_index":0,"batch_size":1}"#;
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = ?2 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![released_json, ROUND_ID],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = ?2 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 2",
-            rusqlite::params![batch_json, ROUND_ID],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 15).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let normalized =
-            crate::vote::serialize_recovery(&crate::vote::parse_recovery(&released_json).unwrap())
-                .unwrap();
-        let stored: String = conn
-            .query_row(
-                "SELECT commitment_bundle_json FROM votes
-                 WHERE round_id = ?1 AND wallet_id = 'wallet'
-                   AND bundle_index = 0 AND proposal_id = 1",
-                [ROUND_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, normalized);
-        assert!(stored.contains("\"batch_digest\":null"));
-        let stored_batch: String = conn
-            .query_row(
-                "SELECT commitment_bundle_json FROM votes
-                 WHERE round_id = ?1 AND wallet_id = 'wallet'
-                   AND bundle_index = 0 AND proposal_id = 2",
-                [ROUND_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored_batch, batch_json);
-        insert_helper_plan_for_round(&conn, ROUND_ID, &stored);
-
-        let mut confirmed =
-            crate::vote::parse_recovery(&stored).expect("normalized recovery must remain valid");
-        confirmed.vc_tree_position = 789;
-        let confirmed_json = crate::vote::serialize_recovery(&confirmed).unwrap();
-        conn.execute(
-            "UPDATE votes
-                SET commitment_bundle_json = ?1, vc_tree_position = 789
-              WHERE round_id = ?2 AND wallet_id = 'wallet'
-                AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![confirmed_json, ROUND_ID],
-        )
-        .unwrap();
-        assert_eq!(
-            stored_plan_snapshot_for_round(&conn, ROUND_ID).as_deref(),
-            Some(confirmed_json.as_str())
-        );
-
-        let replacement_json =
-            confirmed_json.replacen("\"vote_decision\":2", "\"vote_decision\":1", 1);
-        assert_ne!(replacement_json, confirmed_json);
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = ?2 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![replacement_json, ROUND_ID],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot_for_round(&conn, ROUND_ID), None);
-    }
-
-    #[test]
-    fn fresh_schema_enforces_plan_lifecycle_invariants() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        assert_helper_plan_lifecycle(&conn);
-    }
-
-    #[test]
-    fn migrate_from_v14_creates_pir_proof_cache_and_preserves_state() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v14_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        // A cached proof from the old bundle-scoped table; v15 must carry it
-        // over so an upgrade mid-round does not refetch from the PIR server.
-        conn.execute(
-            "INSERT INTO imt_proofs (round_id, wallet_id, bundle_index, nullifier, root, nf_bounds, leaf_pos, path, created_at)
-             VALUES ('test-round', 'wallet', 0, X'01', X'02', X'03', 7, X'04', 42)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 14).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        let round_count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rounds WHERE round_id = 'test-round'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(round_count, 1);
-
-        // The old proof row was migrated, keyed by the round's network, with
-        // updated_at seeded from created_at.
-        let migrated_row: (String, Vec<u8>, i64, i64, i64) = conn
-            .query_row(
-                "SELECT network, root, leaf_pos, created_at, updated_at
-                 FROM pir_proof_cache WHERE wallet_id = 'wallet' AND nullifier = X'01'",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(migrated_row, ("testnet".to_string(), vec![0x02], 7, 42, 42));
-
-        // The old table is gone...
-        assert!(!table_names(&conn).contains(&"imt_proofs".to_string()));
-
-        // ...and the new one is usable.
-        conn.execute(
-            "INSERT INTO pir_proof_cache (wallet_id, network, nullifier, root, nf_bounds, leaf_pos, path, created_at, updated_at)
-             VALUES ('wallet', 'testnet', X'05', X'02', X'03', 0, X'04', 0, 0)",
-            [],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn incremental_migrations_form_an_unbroken_chain_to_current() {
-        let mut expected = LAUNCH_VERSION;
-        for (from, _) in INCREMENTAL_MIGRATIONS {
-            assert_eq!(
-                *from, expected,
-                "incremental migrations must be ordered and contiguous"
-            );
-            expected = from + 1;
-        }
-        assert_eq!(
-            expected, CURRENT_VERSION,
-            "every version from LAUNCH_VERSION to CURRENT_VERSION needs a migration step"
-        );
-    }
-
-    #[test]
-    fn test_migrate_from_pre_v8_schema_recreates_current_schema() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&pre_v8_schema()).unwrap();
-        conn.pragma_update(None, "user_version", 7).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let columns = table_columns(&conn, "bundles");
-        assert!(columns.contains(&"note_identity_hashes_blob".to_string()));
-        assert!(columns.contains(&"tx1_effects".to_string()));
-    }
-
-    #[test]
-    fn test_migrate_rejects_newer_database_version() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", CURRENT_VERSION + 1)
-            .unwrap();
-
-        let err = migrate(&mut conn).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported newer database version"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn test_tables_created() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-
-        assert!(tables.contains(&"rounds".to_string()));
-        assert!(tables.contains(&"bundles".to_string()));
-        assert!(tables.contains(&"cached_tree_state".to_string()));
-        assert!(tables.contains(&"proofs".to_string()));
-        assert!(tables.contains(&"votes".to_string()));
-        // Replaced by pir_proof_cache at v15.
-        assert!(!tables.contains(&"imt_proofs".to_string()));
-        assert!(tables.contains(&"share_delegations".to_string()));
-        assert!(tables.contains(&"helper_share_plans".to_string()));
-        assert!(tables.contains(&"keystone_signatures".to_string()));
-        assert!(tables.contains(&"ballot_intent".to_string()));
-        assert!(tables.contains(&"pir_proof_cache".to_string()));
-
-        let round_columns = table_columns(&conn, "rounds");
-        assert!(round_columns.contains(&"network".to_string()));
-    }
-
-    /// Verify that the bundles table columns exist after migration and can round-trip BLOB data.
-    #[test]
-    fn test_bundle_data_columns_exist() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        // Insert a round first
-        conn.execute(
-            "INSERT INTO rounds (round_id, wallet_id, network, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at) VALUES ('test', 'w1', 'testnet', 1, X'00', X'00', X'00', 0, 0)",
-            [],
-        ).unwrap();
-
-        // Insert a bundle row using the delegation BLOB columns.
-        conn.execute(
-            "INSERT INTO bundles (round_id, wallet_id, bundle_index, van_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output, tx1_effects) VALUES ('test', 'w1', 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33', X'44')",
-            [],
-        ).unwrap();
-
-        // Verify van_comm_rand round-trips (the VAN blinding factor)
-        let rand: Vec<u8> = conn
-            .query_row(
-                "SELECT van_comm_rand FROM bundles WHERE round_id = 'test' AND bundle_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(rand, vec![0xAA]);
-
-        // Verify dummy_nullifiers round-trips
-        let dummies: Vec<u8> = conn
-            .query_row(
-                "SELECT dummy_nullifiers FROM bundles WHERE round_id = 'test' AND bundle_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(dummies, vec![0xBB]);
-
-        let tx1_effects: Vec<u8> = conn
-            .query_row(
-                "SELECT tx1_effects FROM bundles WHERE round_id = 'test' AND bundle_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(tx1_effects, vec![0x44]);
-    }
-
-    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
-        conn.prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap()
-            .query_map([], |row| row.get(1))
-            .unwrap()
-            .collect::<Result<Vec<String>, _>>()
-            .unwrap()
-    }
-
-    fn table_names(conn: &Connection) -> Vec<String> {
-        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<String>, _>>()
-            .unwrap()
-    }
-
-    fn schema_sql(conn: &Connection, object_type: &str, name: &str) -> String {
-        conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-            rusqlite::params![object_type, name],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    fn assert_helper_plan_lifecycle(conn: &Connection) {
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        queries::insert_round(
-            conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(conn, "test-round", "wallet", 0, &[1]).unwrap();
-        queries::store_vote(conn, "test-round", "wallet", 0, 1, 0, &[0xCA; 32]).unwrap();
-        let before = r#"{"vc_tree_position":0,"marker":"same"}"#;
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [before],
-        )
-        .unwrap();
-        insert_helper_plan(conn, before);
-
-        let confirmed = r#"{"vc_tree_position":7,"marker":"same"}"#;
-        conn.execute(
-            "UPDATE votes
-                SET commitment_bundle_json = ?1, vc_tree_position = 7
-              WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-                AND bundle_index = 0 AND proposal_id = 1",
-            [confirmed],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot(conn).as_deref(), Some(confirmed));
-
-        // A non-confirmation recovery-material change is a new generation,
-        // even when it retains the already-confirmed VC position.
-        let replacement = r#"{"vc_tree_position":7,"marker":"replacement"}"#;
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [replacement],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot(conn), None);
-
-        insert_helper_plan(conn, replacement);
-        conn.execute(
-            "DELETE FROM votes
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot(conn), None);
-    }
-
-    fn insert_helper_plan(conn: &Connection, snapshot: &str) {
-        insert_helper_plan_for_round(conn, "test-round", snapshot);
-    }
-
-    fn insert_helper_plan_for_round(conn: &Connection, round_id: &str, snapshot: &str) {
-        conn.execute(
-            "INSERT INTO helper_share_plans
-             (round_id, wallet_id, bundle_index, proposal_id,
-              commitment_bundle_json, configured_server_urls_json,
-              share_plans_json, format_version, placement_guarantee, created_at)
-             VALUES (?1, 'wallet', 0, 1, ?2, '[\"https://helper.example\"]',
-                     '[]', 1, 'strict', 1)",
-            rusqlite::params![round_id, snapshot],
-        )
-        .unwrap();
-    }
-
-    fn released_singleton_recovery_json(round_id: &str) -> String {
-        let released_shape = serde_json::to_string(&serde_json::json!({
-            "format": "zcash_voting_vote_recovery_v1",
-            "vote_round_id": round_id,
-            "bundle_index": 0,
-            "proposal_id": 1,
-            "vote_decision": 2,
-            "anchor_height": 100,
-            "vc_tree_position": 0,
-            "single_share": false,
-            "num_options": 3,
-            "van_nullifier": vec![0x31_u8; 32],
-            "vote_authority_note_new": vec![0x32_u8; 32],
-            "vote_commitment": vec![0x33_u8; 32],
-            "proof": vec![0x34_u8; 8],
-            "shares_hash": vec![0x35_u8; 32],
-            "r_vpk": vec![0x36_u8; 32],
-            "alpha_v": vec![0x37_u8; 32],
-            "vote_auth_sig": vec![0x38_u8; 64],
-            "encrypted_shares": [],
-            "share_blinds": [],
-            "share_comms": [],
-        }))
-        .unwrap();
-        let canonical_with_batch_nulls =
-            crate::vote::serialize_recovery(&crate::vote::parse_recovery(&released_shape).unwrap())
-                .unwrap();
-        canonical_with_batch_nulls
-            .strip_suffix(",\"batch_digest\":null,\"batch_index\":null,\"batch_size\":null}")
-            .map(|prefix| format!("{prefix}}}"))
-            .expect("current singleton recovery must append nullable batch metadata")
-    }
-
-    fn stored_plan_snapshot(conn: &Connection) -> Option<String> {
-        stored_plan_snapshot_for_round(conn, "test-round")
-    }
-
-    fn stored_plan_snapshot_for_round(conn: &Connection, round_id: &str) -> Option<String> {
-        conn.query_row(
-            "SELECT commitment_bundle_json FROM helper_share_plans
-             WHERE round_id = ?1 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [round_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap()
-    }
+fn schema_table_present(conn: &Connection, table: &str) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(migration_error)
 }
+
+fn apply_browser_migrations(conn: &Connection, from_version: u32) -> Result<(), VotingError> {
+    for (from, sql) in BROWSER_MIGRATIONS {
+        if *from >= from_version {
+            conn.execute_batch(sql).map_err(|error| {
+                VotingError::from_sqlite(
+                    &format!("failed to upgrade browser voting schema from version {from}"),
+                    &error,
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Recognizes the version-22 combined-vote preview without discarding its
+/// immutable recovery records. Only the exact current schema, optionally
+/// missing the nullable PCZT column, is accepted. The caller owns the migration
+/// transaction, so both the column repair and version advance commit together.
+fn reconcile_combined_preview(conn: &Connection) -> Result<bool, VotingError> {
+    let has_recovery: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'delegate_cast_recovery')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(migration_error)?;
+    if !has_recovery {
+        return Ok(false);
+    }
+    let expected = Connection::open_in_memory().map_err(migration_error)?;
+    expected
+        .execute_batch(include_str!("migrations/001_init.sql"))
+        .map_err(migration_error)?;
+    // The preview predates the combined-cast rejection ledger, which the
+    // version-23 ladder entry below creates. It is therefore not part of what
+    // identifies a preview schema, and leaving it in the expected fingerprint
+    // would refuse every preview database instead of upgrading it.
+    expected
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS combined_cast_rejections_monotonic_streak;
+             DROP TRIGGER IF EXISTS combined_cast_rejections_generation_restart;
+             DROP TABLE IF EXISTS combined_cast_rejections;",
+        )
+        .map_err(migration_error)?;
+    let actual = preview_schema_fingerprint(conn)?;
+    if actual == preview_schema_fingerprint(&expected)? {
+        return Ok(true);
+    }
+    expected
+        .execute_batch("ALTER TABLE bundles DROP COLUMN delegation_pczt;")
+        .map_err(migration_error)?;
+    if actual != preview_schema_fingerprint(&expected)? {
+        return Err(VotingError::Internal {
+            message: "unsupported version-22 combined-vote preview schema; existing recovery records were preserved".into(),
+        });
+    }
+    conn.execute_batch("ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;")
+        .map_err(migration_error)?;
+    Ok(true)
+}
+
+/// Whether the sidecar holds the lifecycle table at all.
+fn chain_submissions_present(conn: &Connection) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND name = 'chain_submissions')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(migration_error)
+}
+
+/// Compares the explicit schema objects that identify a preview database,
+/// including recovery constraints and triggers; table existence alone cannot
+/// establish migration compatibility.
+///
+/// Everything `chain_submissions` owns is excluded. That table's DDL has been
+/// edited without a version bump more than once, so real sidecars are in the
+/// field missing one of its indexes or triggers;
+/// [`ensure_current_chain_submission_schema`] exists to repair exactly that and
+/// runs after this ladder. Fingerprinting those objects here would refuse such
+/// a database with a hard error before the repair could run, and since nothing
+/// would advance `user_version`, the sidecar this reconciliation exists to
+/// rescue would become permanently unopenable. `005_chain_submissions_proposal_range.sql`
+/// makes the same argument for the version-20 step.
+fn preview_schema_fingerprint(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>, VotingError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+           AND name NOT LIKE 'chain_submissions%' \
+         ORDER BY type, name",
+        )
+        .map_err(migration_error)?;
+    let fingerprint = statement
+        .query_map([], |row| {
+            let sql: String = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, normalize_schema_sql(&sql)))
+        })
+        .map_err(migration_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(migration_error)?;
+    Ok(fingerprint)
+}
+
+/// Brings `chain_submissions` to the shape `002_chain_submissions.sql`
+/// describes, rebuilding it in place if it has drifted, and keeping every row.
+///
+/// The table's DDL has been edited without a version bump more than once — the
+/// proposal bound has moved in both directions — and each time every database
+/// already at the current version became unopenable, because the fingerprint
+/// check below is exact and the migration ladder has nothing left to run. A
+/// rebuild is the honest answer: rows are copied verbatim, so nothing durable
+/// is at stake, and the schema converges on what this build expects instead of
+/// stranding the wallet. A row the new shape genuinely rejects still fails the
+/// copy, which is the one case worth stopping for.
+fn ensure_current_chain_submission_schema(conn: &mut Connection) -> Result<(), VotingError> {
+    if chain_submission_schema_matches_current(conn)? {
+        return Ok(());
+    }
+    // An absent table is the same drift reached its limit, and the easiest
+    // case of it: there is nothing to carry across, so create it.
+    if !chain_submissions_present(conn)? {
+        conn.execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+            .map_err(|e| VotingError::from_sqlite("failed to create chain submissions", &e))?;
+        return verify_current_chain_submission_schema(conn);
+    }
+    // Only constraint, index and trigger drift is repairable. The rebuild
+    // carries rows across by name, so a table whose columns differ is drift
+    // this cannot honestly resolve — there is no answer for a column that is
+    // missing or unknown — and it stays the hard failure it has always been.
+    let columns = chain_submission_columns(conn)?;
+    if columns != expected_chain_submission_columns()? {
+        return verify_current_chain_submission_schema(conn);
+    }
+    let column_list = columns.join(", ");
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::from_sqlite("failed to start schema repair", &e))?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS chain_submissions_immutable_identity;
+         DROP TRIGGER IF EXISTS chain_submissions_monotonic_reservations;
+         DROP TRIGGER IF EXISTS chain_submissions_immutable_tracking_start;
+         DROP INDEX IF EXISTS chain_submissions_identity;
+         DROP INDEX IF EXISTS chain_submissions_candidate_owner;
+         DROP INDEX IF EXISTS chain_submissions_confirmation_hash_owner;
+         ALTER TABLE chain_submissions RENAME TO chain_submissions_drifted;",
+    )
+    .map_err(|e| VotingError::from_sqlite("failed to set aside the drifted schema", &e))?;
+    tx.execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+        .map_err(|e| VotingError::from_sqlite("failed to recreate chain submissions", &e))?;
+    tx.execute_batch(&format!(
+        "INSERT INTO chain_submissions ({column_list})
+             SELECT {column_list} FROM chain_submissions_drifted;
+         DROP TABLE chain_submissions_drifted;"
+    ))
+    .map_err(|e| VotingError::from_sqlite("failed to carry chain submissions across", &e))?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit schema repair", &e))?;
+
+    verify_current_chain_submission_schema(conn)
+}
+
+fn chain_submission_columns(conn: &Connection) -> Result<Vec<String>, VotingError> {
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('chain_submissions') ORDER BY cid")
+        .map_err(migration_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(migration_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(migration_error)?;
+    Ok(columns)
+}
+
+fn expected_chain_submission_columns() -> Result<Vec<String>, VotingError> {
+    let expected = Connection::open_in_memory().map_err(migration_error)?;
+    expected
+        .execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+        .map_err(migration_error)?;
+    chain_submission_columns(&expected)
+}
+
+fn chain_submission_schema_matches_current(conn: &Connection) -> Result<bool, VotingError> {
+    let expected = Connection::open_in_memory().map_err(migration_error)?;
+    expected
+        .execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+        .map_err(migration_error)?;
+    Ok(chain_submission_schema_fingerprint(conn)?
+        == chain_submission_schema_fingerprint(&expected)?)
+}
+
+fn verify_current_chain_submission_schema(conn: &Connection) -> Result<(), VotingError> {
+    if !chain_submission_schema_matches_current(conn)? {
+        return Err(VotingError::Internal {
+            message: format!(
+                "database uses an unsupported chain-submission schema for version {CURRENT_VERSION}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn chain_submission_schema_fingerprint(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>, VotingError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql
+               FROM sqlite_schema
+              WHERE tbl_name = 'chain_submissions' AND sql IS NOT NULL
+              ORDER BY type, name",
+        )
+        .map_err(migration_error)?;
+    let fingerprint = statement
+        .query_map([], |row| {
+            let sql: String = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, normalize_schema_sql(&sql)))
+        })
+        .map_err(migration_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(migration_error)?;
+    Ok(fingerprint)
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    let mut in_string = false;
+    while let Some(character) = characters.next() {
+        if character == '\'' {
+            normalized.push(character);
+            if in_string && characters.peek() == Some(&'\'') {
+                if let Some(escaped_quote) = characters.next() {
+                    normalized.push(escaped_quote);
+                }
+            } else {
+                in_string = !in_string;
+            }
+        } else if in_string || !character.is_whitespace() {
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
+/// Classifies a SQLite failure raised while inspecting migration state.
+///
+/// Concurrent opens can see `SQLITE_BUSY` here too, so the error must stay
+/// retryable rather than collapsing into `Internal`.
+fn migration_error(error: rusqlite::Error) -> VotingError {
+    VotingError::from_sqlite("failed to inspect chain-submission migration state", &error)
+}
+
+#[cfg(test)]
+mod tests;

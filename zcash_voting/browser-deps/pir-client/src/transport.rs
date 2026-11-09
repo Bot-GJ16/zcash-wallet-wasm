@@ -2,8 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use anyhow::Result;
 
-/// Explicit host classification for an idempotent request that may be retried.
-/// Limit, identity, decoding, and proof failures must never use this marker.
+/// Marker for transport failures on idempotent requests that may use another endpoint.
 #[derive(Debug)]
 pub struct RetryableTransportError;
 

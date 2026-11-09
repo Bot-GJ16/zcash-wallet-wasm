@@ -25,6 +25,7 @@ optional = true
 
 [dependencies]
 rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
+rand = { version = "0.10", features = ["sys_rng"] }
 serde_json = "1"
 base64 = { version = "0.22", optional = true }
 wasm-bindgen = { version = "0.2" }
@@ -44,19 +45,19 @@ tokio_with_wasm = { version = "0.7.1", features = ["rt", "rt-multi-thread", "syn
 
 zcash_keys = { path = "./librustzcash/zcash_keys", features = ["transparent-inputs", "orchard", "sapling", "unstable"] }
 zcash_client_backend = { path = "./librustzcash/zcash_client_backend", default-features = false, features = ["sync", "lightwalletd-tonic", "orchard", "pczt", "non-standard-fees"] }
-zcash_client_memory = { path = "./librustzcash/zcash_client_memory", default-features = false, features = ["orchard", "transparent-inputs", "multicore"] }
-zcash_primitives = { path = "./librustzcash/zcash_primitives", default-features = false, features = ["std", "multicore", "non-standard-fees"] }
+zcash_client_memory = { path = "./librustzcash/zcash_client_memory", default-features = false, features = ["orchard", "transparent-inputs"] }
+zcash_primitives = { path = "./librustzcash/zcash_primitives", default-features = false, features = ["std", "non-standard-fees"] }
 zcash_address = { path = "./librustzcash/components/zcash_address" }
-zcash_proofs = { path = "./librustzcash/zcash_proofs", default-features = false, features = ["bundled-prover", "multicore"] }
+zcash_proofs = { path = "./librustzcash/zcash_proofs", default-features = false, features = ["bundled-prover"] }
 zcash_protocol = { path = "./librustzcash/components/zcash_protocol", default-features = false }
 transparent = { package = "zcash_transparent", path = "./librustzcash/zcash_transparent", default-features = false, features = ["transparent-inputs"] }
 pczt = { path = "./librustzcash/pczt", default-features = false, features = ["orchard", "sapling", "transparent"] }
 zip321 = { path = "./librustzcash/components/zip321" }
 
-zip32 = { version = "0.2" }
+zip32 = { version = "0.3" }
 
-sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-orchard = { version = "=0.15.5", default-features = false, features = ["circuit", "multicore"] }
+sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
+orchard = { version = "0.16", default-features = false, features = ["circuit"] }
 
 getrandom = { version = "0.2", features = ["js"] }
 
@@ -66,20 +67,20 @@ time = { version = "0.3.22", default-features = false, features = ["wasm-bindgen
 bip0039 = "0.12.0"
 secrecy = "0.8.0"
 nonempty = "0.11"
-secp256k1 = { version = "0.29", features = ["recovery", "global-context"] }
+secp256k1 = { version = "0.33", features = ["recovery", "global-context"] }
 bitcoin_hashes = "0.13"
 hex = "0.4"
 bs58 = "0.5"
 sha2 = "0.10"
-ff = "0.13"
-zcash_script = { version = "0.4.3", default-features = false }
+ff = "0.14"
+zcash_script = { version = "0.6", default-features = false }
 
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing = "0.1.40"
 
 serde = { version = "1", features = ["derive"], default-features = false }
 subtle = "2.6.1"
-tokio = { version = "1.0", features = ["rt", "macros"] }
+tokio = { version = "1.0", features = ["rt", "macros", "time"] }
 
 age = "0.11"
 
@@ -92,6 +93,7 @@ futures-util = "0.3"
 async-trait = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 futures-channel = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "AbortController", "AbortSignal", "Headers", "Request", "RequestInit",
@@ -113,6 +115,7 @@ panic = 'abort'
 strip = true
 
 [patch.crates-io]
+voting-crypto-deps = { path = "./zcash_voting/browser-deps/voting-crypto-deps" }
 pczt = { path = "./librustzcash/pczt" }
 zcash_client_backend = { path = "./librustzcash/zcash_client_backend" }
 zcash_client_sqlite = { path = "./librustzcash/zcash_client_sqlite" }

@@ -3,6 +3,20 @@
 //! The functions in this module are the stable wallet-facing delegation flow:
 //! build a governance PCZT, precompute proof inputs, prove delegation, assemble
 //! chain submission data, and record chain recovery data.
+//!
+//! Proof generation must pass through [`ensure_proof`] (or a prepared bundle's
+//! equivalent) so process-local coordination, input validation, and wallet
+//! capture cannot be bypassed. The former database-level prover is therefore
+//! not part of the public surface:
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::round::VotingDb::build_and_prove_delegation;
+//! ```
+
+mod keystone;
+#[cfg(test)]
+#[path = "delegate/tests/keystone.rs"]
+mod keystone_tests;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use crate::backend::zcash_client_sqlite;
@@ -37,6 +51,7 @@ use crate::selection::{
     GatherDelegationWalletForTargetParams,
 };
 use crate::{
+    delegation_proof_coordination::{with_live_progress, DelegationProofIdentity},
     governance::BUNDLE_NOTE_SLOTS,
     precompute::PirPrecomputeReport,
     round::{BundleLayout, RoundParams, VotingDb},
@@ -77,6 +92,7 @@ pub struct DelegationKeys {
     pub(crate) round_name: String,
     /// Present only when the local voting hotkey secret is available.
     van_blinding_key: Option<VanBlindingKey>,
+    pub(crate) ledger_output_review: bool,
 }
 
 // Preserve the public identity semantics from before deterministic blinding.
@@ -92,6 +108,7 @@ impl PartialEq for DelegationKeys {
             && self.network == other.network
             && self.coin_type == other.coin_type
             && self.round_name == other.round_name
+            && self.ledger_output_review == other.ledger_output_review
     }
 }
 
@@ -108,6 +125,7 @@ impl Hash for DelegationKeys {
         self.network.hash(state);
         self.coin_type.hash(state);
         self.round_name.hash(state);
+        self.ledger_output_review.hash(state);
     }
 }
 
@@ -122,6 +140,7 @@ impl std::fmt::Debug for DelegationKeys {
             .field("network", &self.network)
             .field("coin_type", &self.coin_type)
             .field("round_name", &"<redacted>")
+            .field("ledger_output_review", &self.ledger_output_review)
             .field(
                 "deterministic_van_blinding",
                 &self.van_blinding_key.is_some(),
@@ -131,6 +150,16 @@ impl std::fmt::Debug for DelegationKeys {
 }
 
 impl DelegationKeys {
+    /// Enables account-OVK recovery and printable ASCII memos for Ledger review.
+    ///
+    /// Disabled by default. Account-OVK holders can recover the hotkey output and
+    /// memo from published TX1 effects. Titles escape non-ASCII/control characters;
+    /// line breaks become spaces. Existing persisted PCZTs are reused unchanged.
+    pub fn with_ledger_output_review(mut self) -> Self {
+        self.ledger_output_review = true;
+        self
+    }
+
     /// Builds delegation keys from one already validated target.
     #[allow(clippy::too_many_arguments)]
     fn with_voting_target(
@@ -153,6 +182,7 @@ impl DelegationKeys {
             coin_type: target.network().network_type().coin_type(),
             round_name,
             van_blinding_key,
+            ledger_output_review: false,
         }
     }
 
@@ -247,6 +277,8 @@ pub enum DelegationProgress {
     PcztBuilding,
     PcztBuilt,
     ProofStarting,
+    /// This caller is waiting for the same bundle's in-flight proof producer.
+    WaitingForExistingProof,
     ProofProgress(f64),
     ProofComplete,
     SigningPayload,
@@ -341,11 +373,46 @@ pub fn ensure_round_context(
     round_name: &str,
     session_json: Option<&str>,
 ) -> Result<DelegationRoundContext, VotingError> {
-    let state = voting_db.ensure_round_state(network, params, session_json)?;
-    Ok(DelegationRoundContext {
-        snapshot_height: state.snapshot_height,
-        round_name: crate::round::delegation_round_name(params, round_name),
-    })
+    observe_ensure_round_context(
+        voting_db,
+        network,
+        params,
+        round_name,
+        session_json,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_ensure_round_context(
+    voting_db: &VotingDb,
+    network: Network,
+    params: &RoundParams,
+    round_name: &str,
+    session_json: Option<&str>,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationRoundContext, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("delegate::ensure_round_context");
+    let operation_result: Result<DelegationRoundContext, VotingError> = (|| {
+        let state = voting_db.ensure_round_state(network, params, session_json)?;
+        Ok(DelegationRoundContext {
+            snapshot_height: state.snapshot_height,
+            round_name: crate::round::delegation_round_name(params, round_name),
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Parameters for resolving lightwalletd-derived delegation inputs.
@@ -444,6 +511,35 @@ pub struct PreparedDelegationBundle {
     pub round_name: String,
 }
 
+impl DelegationLwdInputs {
+    /// Builds delegation inputs from an anchor tree state the host already
+    /// fetched over its own lightwalletd route.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the round params are invalid
+    /// or no consensus branch id is known for the snapshot height.
+    pub fn from_anchor_tree_state(
+        network: Network,
+        round_params: crate::VotingRoundParams,
+        round_name: &str,
+        anchor_tree_state: &zcash_client_backend::proto::service::TreeState,
+    ) -> Result<Self, VotingError> {
+        use prost::Message as _;
+        crate::validate_round_params(&round_params)?;
+        let resolved_round_name = crate::round::delegation_round_name(&round_params, round_name);
+        let branch_id_provider =
+            LightwalletdBranchIdProvider::for_height(network, round_params.snapshot_height)?;
+        Ok(Self {
+            network,
+            round_params,
+            resolved_round_name,
+            anchor_tree_state_bytes: anchor_tree_state.encode_to_vec(),
+            branch_id_provider,
+        })
+    }
+}
+
 /// Validates round params and resolves lightwalletd anchor and branch state.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn gather_delegation_lwd_inputs(
@@ -492,18 +588,82 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    prepare_delegation_bundle_inner(
+    observe_prepare_delegation_bundle(
         voting_db,
         wallet_db,
-        PrepareDelegationBundleInnerParams {
-            lwd: params.lwd,
-            session_json: params.session_json,
-            account_uuid: params.account_uuid,
-            target: PrepareDelegationTarget::Local(params.voting_hotkey),
-            bundle_index: params.bundle_index,
-            bundle_policy: params.bundle_policy,
-        },
+        params,
+        &crate::ObservationScope::disabled(),
     )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_prepare_delegation_bundle<C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    params: PrepareDelegationBundleParams<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedDelegationBundle, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(params.bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("delegate::prepare_delegation_bundle");
+    let observations = observation_stage.scope();
+    let operation_result: Result<PreparedDelegationBundle, VotingError> = (|| {
+        prepare_delegation_bundle_inner(
+            voting_db,
+            wallet_db,
+            PrepareDelegationBundleInnerParams {
+                lwd: params.lwd,
+                session_json: params.session_json,
+                account_uuid: params.account_uuid,
+                target: PrepareDelegationTarget::Local(params.voting_hotkey),
+                bundle_index: params.bundle_index,
+                bundle_policy: params.bundle_policy,
+            },
+            observations,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_delegation_bundle_with_report<C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    params: PrepareDelegationBundleParams<'_>,
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<PreparedDelegationBundle, VotingError>>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let operation_result =
+        observe_prepare_delegation_bundle(voting_db, wallet_db, params, invocation.scope());
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    invocation.complete("prepare_delegation_bundle", outcome, operation_result)
 }
 
 /// Prepares one delegation bundle for a validated public voting target.
@@ -527,17 +687,90 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    prepare_delegation_bundle_inner(
+    observe_prepare_delegation_bundle_for_target(
         voting_db,
         wallet_db,
-        PrepareDelegationBundleInnerParams {
-            lwd: params.lwd,
-            session_json: params.session_json,
-            account_uuid: params.account_uuid,
-            target: PrepareDelegationTarget::RoundBound(params.voting_target),
-            bundle_index: params.bundle_index,
-            bundle_policy: params.bundle_policy,
-        },
+        params,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_prepare_delegation_bundle_for_target<C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    params: PrepareDelegationBundleForTargetParams<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedDelegationBundle, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(params.bundle_index),
+        ..Default::default()
+    });
+    let observation_stage =
+        attributed_observations.stage("delegate::prepare_delegation_bundle_for_target");
+    let observations = observation_stage.scope();
+    let operation_result: Result<PreparedDelegationBundle, VotingError> = (|| {
+        prepare_delegation_bundle_inner(
+            voting_db,
+            wallet_db,
+            PrepareDelegationBundleInnerParams {
+                lwd: params.lwd,
+                session_json: params.session_json,
+                account_uuid: params.account_uuid,
+                target: PrepareDelegationTarget::RoundBound(params.voting_target),
+                bundle_index: params.bundle_index,
+                bundle_policy: params.bundle_policy,
+            },
+            observations,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_delegation_bundle_for_target_with_report<C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    params: PrepareDelegationBundleForTargetParams<'_>,
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<PreparedDelegationBundle, VotingError>>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let operation_result = observe_prepare_delegation_bundle_for_target(
+        voting_db,
+        wallet_db,
+        params,
+        invocation.scope(),
+    );
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    invocation.complete(
+        "prepare_delegation_bundle_for_target",
+        outcome,
+        operation_result,
     )
 }
 
@@ -546,6 +779,7 @@ fn prepare_delegation_bundle_inner<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &WalletDb<C, P, CL, R>,
     params: PrepareDelegationBundleInnerParams<'_>,
+    observations: &crate::ObservationScope,
 ) -> Result<PreparedDelegationBundle, VotingError>
 where
     C: Borrow<rusqlite::Connection>,
@@ -560,13 +794,15 @@ where
     }
     params.target.validate_round(&lwd.round_params)?;
     // Ensure the round is present in the voting database.
-    ensure_round_context(
+    observe_ensure_round_context(
         voting_db,
         lwd.network,
         &lwd.round_params,
         &lwd.resolved_round_name,
         session_json,
+        observations,
     )?;
+    observations.bind_round_id(&lwd.round_params.vote_round_id);
     let DelegationLwdInputs {
         round_params,
         resolved_round_name,
@@ -583,26 +819,32 @@ where
     // Gather the wallet inputs.
     let wallet_inputs = match params.target {
         PrepareDelegationTarget::Local(voting_hotkey) => {
-            gather_delegation_wallet_inputs(GatherDelegationWalletParams {
-                wallet_db,
-                account_uuid: params.account_uuid,
-                voting_hotkey,
-                snapshot_height: round_params.snapshot_height,
-                scanned_height,
-                anchor_tree_state_bytes,
-                resolved_round_name,
-            })?
+            crate::selection::observe_gather_delegation_wallet_inputs(
+                GatherDelegationWalletParams {
+                    wallet_db,
+                    account_uuid: params.account_uuid,
+                    voting_hotkey,
+                    snapshot_height: round_params.snapshot_height,
+                    scanned_height,
+                    anchor_tree_state_bytes,
+                    resolved_round_name,
+                },
+                observations,
+            )?
         }
         PrepareDelegationTarget::RoundBound(voting_target) => {
-            gather_delegation_wallet_inputs_for_target(GatherDelegationWalletForTargetParams {
-                wallet_db,
-                account_uuid: params.account_uuid,
-                voting_target,
-                snapshot_height: round_params.snapshot_height,
-                scanned_height,
-                anchor_tree_state_bytes,
-                resolved_round_name,
-            })?
+            gather_delegation_wallet_inputs_for_target(
+                GatherDelegationWalletForTargetParams {
+                    wallet_db,
+                    account_uuid: params.account_uuid,
+                    voting_target,
+                    snapshot_height: round_params.snapshot_height,
+                    scanned_height,
+                    anchor_tree_state_bytes,
+                    resolved_round_name,
+                },
+                observations,
+            )?
         }
     };
 
@@ -630,7 +872,7 @@ where
     };
 
     // Ensure witnesses are present in the voting database.
-    prepared.ensure_witnesses(voting_db, wallet_db)?;
+    prepared.observe_ensure_witnesses(voting_db, wallet_db, observations)?;
 
     Ok(prepared)
 }
@@ -713,30 +955,22 @@ pub struct DelegationProof {
     pub gov_nullifiers: [[u8; 32]; BUNDLE_NOTE_SLOTS],
 }
 
-/// Signature source used when assembling a delegation transaction payload.
-pub enum DelegationSigner {
-    /// Signature that already covers the stored PCZT sighash.
-    Signature { sig: [u8; 64], sighash: [u8; 32] },
+/// Whether an ensured delegation proof was generated by this call or reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelegationProofStatus {
+    /// This call generated and durably persisted the proof.
+    Generated,
+    /// A proof already persisted by this or another coordinated call was used.
+    Reused,
 }
 
-impl DelegationSigner {
-    /// Builds a delegation signer from an externally produced SpendAuth signature.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VotingError::InvalidInput`] unless `sig` is 64 bytes and
-    /// `sighash` is 32 bytes.
-    pub fn signature_from_bytes(sig: &[u8], sighash: &[u8]) -> Result<Self, VotingError> {
-        Ok(Self::Signature {
-            sig: array64_slice("signature", sig)?,
-            sighash: array32_slice("sighash", sighash)?,
-        })
-    }
-
-    /// Builds a delegation signer from an externally produced SpendAuth signature.
-    pub fn signature(sig: [u8; 64], sighash: [u8; 32]) -> Self {
-        Self::Signature { sig, sighash }
-    }
+/// Durable delegation proof returned by [`PreparedDelegationBundle::ensure_proof`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationProofCompletion {
+    /// Validated proof bytes and public fields loaded from durable state.
+    pub proof: DelegationProof,
+    /// Whether this call generated or reused the durable proof.
+    pub status: DelegationProofStatus,
 }
 
 /// Signature source for a prepared delegation bundle.
@@ -766,6 +1000,21 @@ impl PreparedSigner {
     }
 }
 
+/// Compatibility name for wallet callers that supply an already-signed TX1.
+pub use PreparedSigner as DelegationSigner;
+
+/// Rebuilds a delegation submission from the persisted proof and checked signature.
+pub fn submission(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    signer: DelegationSigner,
+) -> Result<DelegationSubmission, VotingError> {
+    let PreparedSigner::Signature { sig, sighash } = signer;
+    let conn = db.conn();
+    submission_with_expected_sighash(&conn, &db.wallet_id(), round_id, bundle_index, sig, sighash)
+}
+
 /// Validated delegation transaction fields for one bundle.
 ///
 /// The sighash is retained for wallet-side signing checks. The vote-chain wire
@@ -789,7 +1038,8 @@ pub struct DelegationSubmission {
 /// Signed delegation bundle plus bundle-level metadata for wallet submission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedDelegationBundle {
-    /// Chain-ready delegation fields produced by [`submission`].
+    /// Chain-ready delegation fields produced by
+    /// [`PreparedDelegationBundle::submission`].
     pub submission: DelegationSubmission,
     /// Full governance PCZT bytes that were signed for this bundle.
     pub pczt_bytes: Vec<u8>,
@@ -816,7 +1066,8 @@ pub struct KeystoneSigningRequest {
     pub rk: Vec<u8>,
     /// Governance action index within the selected shielded protocol bundle.
     pub action_index: u32,
-    /// Human-readable memo shown to the signer.
+    /// Human-readable memo recovered from the persisted transaction, retaining
+    /// the round name used at setup even if the caller supplies a new name.
     pub display_memo: String,
     /// Total eligible round weight after bundle quantization.
     pub eligible_weight_zatoshi: u64,
@@ -876,6 +1127,7 @@ impl PreparedDelegationBundle {
     /// Callers that separately warm PIR rows can use this before proving without
     /// knowing how witness rows are cached.
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn ensure_witnesses<C, P, CL, R>(
         &self,
         voting_db: &VotingDb,
@@ -885,21 +1137,59 @@ impl PreparedDelegationBundle {
         C: Borrow<rusqlite::Connection>,
         P: Parameters,
     {
-        if !voting_db.has_complete_witnesses(
-            &self.round_id,
-            self.bundle_index,
-            &self.bundle_note_infos,
-        )? {
-            crate::precompute::note_witnesses(
-                voting_db,
+        self.observe_ensure_witnesses(voting_db, wallet_db, &crate::ObservationScope::disabled())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn observe_ensure_witnesses<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+        observations: &crate::ObservationScope,
+    ) -> Result<(), VotingError>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::ensure_witnesses");
+        let observations = observation_stage.scope();
+        let operation_result: Result<(), VotingError> = (|| {
+            if !voting_db.has_complete_witnesses(
                 &self.round_id,
                 self.bundle_index,
-                &self.anchor_tree_state_bytes,
                 &self.bundle_note_infos,
-                wallet_db,
-            )?;
-        }
-        Ok(())
+            )? {
+                crate::precompute::observe_note_witnesses(
+                    voting_db,
+                    &self.round_id,
+                    self.bundle_index,
+                    &self.anchor_tree_state_bytes,
+                    &self.bundle_note_infos,
+                    wallet_db,
+                    observations,
+                )?;
+            }
+            Ok(())
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Persists bundle witnesses, initializes padded secrets, and warms PIR rows.
@@ -912,23 +1202,91 @@ impl PreparedDelegationBundle {
         &self,
         voting_db: &VotingDb,
         wallet_db: &WalletDb<C, P, CL, R>,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
     ) -> Result<PreparedDelegationReport, VotingError>
     where
         C: Borrow<rusqlite::Connection>,
         P: Parameters,
     {
-        self.ensure_witnesses(voting_db, wallet_db)?;
-
-        crate::precompute::warm_delegation_pir(
+        self.observe_precompute(
             voting_db,
-            &self.round_id,
-            self.bundle_index,
-            &self.bundle_note_infos,
-            self.layout.clone(),
+            wallet_db,
             pir_client,
-            self.network,
+            &crate::ObservationScope::disabled(),
         )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn observe_precompute<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+        pir_client: &dyn crate::pir::PirProofSource,
+        observations: &crate::ObservationScope,
+    ) -> Result<PreparedDelegationReport, VotingError>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::precompute");
+        let observations = observation_stage.scope();
+        let operation_result: Result<PreparedDelegationReport, VotingError> = (|| {
+            self.observe_ensure_witnesses(voting_db, wallet_db, observations)?;
+
+            crate::precompute::warm_delegation_pir(
+                voting_db,
+                &self.round_id,
+                self.bundle_index,
+                &self.bundle_note_infos,
+                self.layout.clone(),
+                pir_client,
+                self.network,
+                observations,
+            )
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn precompute_with_report<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+        pir_client: &dyn crate::pir::PirProofSource,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<PreparedDelegationReport, VotingError>>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let operation_result =
+            self.observe_precompute(voting_db, wallet_db, pir_client, invocation.scope());
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("precompute", outcome, operation_result)
     }
 
     /// Builds and persists the governance PCZT setup for this prepared bundle.
@@ -937,16 +1295,47 @@ impl PreparedDelegationBundle {
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationSetup, VotingError> {
-        self.validate_snapshot_branch_id_provider()?;
-        crate::delegate::setup(
-            voting_db,
-            &self.round_id,
-            self.bundle_index,
-            &self.bundle_note_infos,
-            &self.delegation_keys,
-            &self.branch_id_provider,
-            stages,
-        )
+        self.observe_setup(voting_db, stages, &crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_setup(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationSetup, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::setup");
+        let observations = observation_stage.scope();
+        let operation_result: Result<DelegationSetup, VotingError> = (|| {
+            self.validate_snapshot_branch_id_provider()?;
+            crate::delegate::observe_setup(
+                voting_db,
+                &self.round_id,
+                self.bundle_index,
+                &self.bundle_note_infos,
+                &self.delegation_keys,
+                &self.branch_id_provider,
+                stages,
+                observations,
+            )
+        })();
+        // `SetupAlreadyPersisted` on a tolerated field is reuse, not failure;
+        // see `delegation_setup_outcome`.
+        let outcome = crate::observability::delegation_setup_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Generates and persists the delegation proof for this prepared bundle.
@@ -954,18 +1343,217 @@ impl PreparedDelegationBundle {
     pub fn prove(
         &self,
         voting_db: &VotingDb,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProof, VotingError> {
-        crate::delegate::prove(
+        self.observe_prove(
             voting_db,
-            &self.round_id,
-            self.bundle_index,
-            &self.bundle_note_infos,
-            &self.delegation_keys,
             pir_client,
             stages,
+            &crate::ObservationScope::disabled(),
         )
+    }
+
+    pub(crate) fn observe_prove(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &dyn crate::pir::PirProofSource,
+        stages: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationProof, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::prove");
+        let observations = observation_stage.scope();
+        let operation_result: Result<DelegationProof, VotingError> = (|| {
+            self.observe_ensure_proof(voting_db, pir_client, stages, observations)
+                .map(|completion| completion.proof)
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub fn prove_with_report(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &dyn crate::pir::PirProofSource,
+        stages: &dyn DelegationProgressReporter,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<DelegationProof, VotingError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let operation_result =
+            self.observe_prove(voting_db, pir_client, stages, invocation.scope());
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("prove", outcome, operation_result)
+    }
+
+    /// Generates or reuses the durable delegation proof for this bundle.
+    ///
+    /// Calls for the same wallet, round, and bundle are single-flighted within
+    /// the process. A follower waits, revalidates durable state, and returns the
+    /// leader's proof; distinct bundle identities remain independent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError`] when durable state cannot be read or validated,
+    /// or when proof generation or persistence fails.
+    pub fn ensure_proof(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &dyn crate::pir::PirProofSource,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationProofCompletion, VotingError> {
+        self.observe_ensure_proof(
+            voting_db,
+            pir_client,
+            stages,
+            &crate::ObservationScope::disabled(),
+        )
+    }
+
+    pub(crate) fn observe_ensure_proof(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &dyn crate::pir::PirProofSource,
+        stages: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationProofCompletion, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::ensure_proof");
+        let observations = observation_stage.scope();
+        let operation_result: Result<DelegationProofCompletion, VotingError> = (|| {
+            crate::delegate::observe_ensure_proof(
+                voting_db,
+                &self.round_id,
+                self.bundle_index,
+                &self.bundle_note_infos,
+                &self.delegation_keys,
+                pir_client,
+                stages,
+                observations,
+            )
+        })();
+        let outcome = if operation_result
+            .as_ref()
+            .is_ok_and(|completion| completion.status == DelegationProofStatus::Reused)
+        {
+            crate::ObservationOutcome::Reused
+        } else if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub fn ensure_proof_with_report(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &dyn crate::pir::PirProofSource,
+        stages: &dyn DelegationProgressReporter,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<DelegationProofCompletion, VotingError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let operation_result =
+            self.observe_ensure_proof(voting_db, pir_client, stages, invocation.scope());
+        let outcome = if operation_result
+            .as_ref()
+            .is_ok_and(|completion| completion.status == DelegationProofStatus::Reused)
+        {
+            crate::ObservationOutcome::Reused
+        } else if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("ensure_proof", outcome, operation_result)
+    }
+
+    /// Checks that this bundle's notes and keys are the ones a persisted
+    /// proof was generated for, without touching PIR.
+    ///
+    /// Reusing a persisted proof is only correct for the same bundle notes
+    /// and the same target-bound hotkey. A pipeline constructed with another
+    /// same-network hotkey would otherwise be handed the stored delegation
+    /// for the original target. Fails with [`VotingError::InvalidInput`] on a
+    /// note, network or round mismatch, and with
+    /// [`VotingError::DelegationTargetMismatch`] when the stored target does
+    /// not reproduce from this pipeline's hotkey. That last one reports the
+    /// disagreement only; it does not establish that the bundle is
+    /// unbroadcast, and so does not license discarding it.
+    pub fn validate_persisted_proof(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
+        self.observe_validate_persisted_proof(voting_db, &crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_validate_persisted_proof(
+        &self,
+        voting_db: &VotingDb,
+        observations: &crate::ObservationScope,
+    ) -> Result<(), VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::validate_persisted_proof");
+        let observations = observation_stage.scope();
+        let operation_result: Result<(), VotingError> = (|| {
+            observe_validate_persisted_proof_reuse(
+                voting_db,
+                &self.round_id,
+                self.bundle_index,
+                &self.bundle_note_infos,
+                &self.delegation_keys,
+                observations,
+            )
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Assembles chain-ready submission fields for this prepared bundle.
@@ -974,10 +1562,48 @@ impl PreparedDelegationBundle {
         voting_db: &VotingDb,
         signer: PreparedSigner,
     ) -> Result<DelegationSubmission, VotingError> {
-        let signer = match signer {
-            PreparedSigner::Signature { sig, sighash } => DelegationSigner::signature(sig, sighash),
+        self.observe_submission(voting_db, signer, &crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_submission(
+        &self,
+        voting_db: &VotingDb,
+        signer: PreparedSigner,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationSubmission, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::submission");
+        let operation_result: Result<DelegationSubmission, VotingError> = (|| {
+            let PreparedSigner::Signature { sig, sighash } = signer;
+            let wallet_id = voting_db.wallet_id();
+            let conn = voting_db.conn();
+            submission_with_expected_sighash(
+                &conn,
+                &wallet_id,
+                &self.round_id,
+                self.bundle_index,
+                sig,
+                sighash,
+            )
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
         };
-        crate::delegate::submission(voting_db, &self.round_id, self.bundle_index, signer)
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Assembles a signed delegation bundle plus wallet-facing metadata.
@@ -992,25 +1618,63 @@ impl PreparedDelegationBundle {
         pczt_bytes: Vec<u8>,
         signer: PreparedSigner,
     ) -> Result<SignedDelegationBundle, VotingError> {
-        if !pczt_bytes.is_empty() {
-            let provided_sighash = pczt_sighash(&pczt_bytes)?;
-            let PreparedSigner::Signature { sighash, .. } = &signer;
-            if provided_sighash != *sighash {
-                return Err(VotingError::InvalidInput {
-                    message: "pczt_bytes sighash does not match delegation signer sighash"
-                        .to_string(),
-                });
-            }
-        }
-        let submission = self.submission(voting_db, signer)?;
-        Ok(SignedDelegationBundle {
-            submission,
+        self.observe_signed_bundle(
+            voting_db,
             pczt_bytes,
-            eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
-            delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
-            bundle_count: self.layout.bundle_count,
-            bundle_index: self.bundle_index,
-        })
+            signer,
+            &crate::ObservationScope::disabled(),
+        )
+    }
+
+    pub(crate) fn observe_signed_bundle(
+        &self,
+        voting_db: &VotingDb,
+        pczt_bytes: Vec<u8>,
+        signer: PreparedSigner,
+        observations: &crate::ObservationScope,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::signed_bundle");
+        let observations = observation_stage.scope();
+        let operation_result: Result<SignedDelegationBundle, VotingError> = (|| {
+            if !pczt_bytes.is_empty() {
+                let provided_sighash = pczt_sighash(&pczt_bytes)?;
+                let PreparedSigner::Signature { sighash, .. } = &signer;
+                if provided_sighash != *sighash {
+                    return Err(VotingError::InvalidInput {
+                        message: "pczt_bytes sighash does not match delegation signer sighash"
+                            .to_string(),
+                    });
+                }
+            }
+            let submission = self.observe_submission(voting_db, signer, observations)?;
+            Ok(SignedDelegationBundle {
+                submission,
+                pczt_bytes,
+                eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
+                delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
+                bundle_count: self.layout.bundle_count,
+                bundle_index: self.bundle_index,
+            })
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Loads the account-scoped data needed to sign this prepared bundle locally.
@@ -1021,42 +1685,89 @@ impl PreparedDelegationBundle {
         &self,
         voting_db: &VotingDb,
     ) -> Result<DelegationSigningRequest, VotingError> {
-        crate::delegate::signing_request(
-            voting_db,
-            &self.round_id,
-            self.bundle_index,
-            &self.delegation_keys,
-        )
+        self.observe_signing_request(voting_db, &crate::ObservationScope::disabled())
     }
 
-    /// Builds the redacted Keystone signing request for this prepared bundle.
+    pub(crate) fn observe_signing_request(
+        &self,
+        voting_db: &VotingDb,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationSigningRequest, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::signing_request");
+        let observations = observation_stage.scope();
+        let operation_result: Result<DelegationSigningRequest, VotingError> = (|| {
+            crate::delegate::observe_signing_request(
+                voting_db,
+                &self.round_id,
+                self.bundle_index,
+                &self.delegation_keys,
+                observations,
+            )
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
+    }
+
+    /// Builds or reloads the exact Keystone signing request, including after
+    /// background proof generation or restart. Legacy setup without its original
+    /// PCZT returns [`VotingError::DelegationPcztUnavailable`]. Concurrent setup
+    /// can return [`VotingError::Busy`]; retry after the setup lease is released.
+    /// A stored setup for another hotkey returns
+    /// [`VotingError::DelegationTargetMismatch`]. Request creation preserves it;
+    /// call [`Self::setup`] to explicitly replace an unusable unbroadcast setup.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<KeystoneSigningRequest, VotingError> {
-        let setup = self.setup(voting_db, stages)?;
-        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&setup.pczt_bytes)?;
-        let display_weight_zatoshi = crate::round::raw_bundle_weight(&self.bundle_note_infos)?;
-        let display_memo = display_memo(&self.round_name, display_weight_zatoshi);
-        let action_index = crate::wire::BoundedU32::try_from(setup.action_index).map_err(|_| {
-            VotingError::InvalidInput {
-                message: format!("action_index {} does not fit u32", setup.action_index),
-            }
-        })?;
+        self.observe_keystone_request(voting_db, stages, &crate::ObservationScope::disabled())
+    }
 
-        Ok(KeystoneSigningRequest {
-            pczt_bytes: setup.pczt_bytes,
-            redacted_pczt_bytes,
-            pczt_sighash: setup.pczt_sighash.to_vec(),
-            rk: setup.rk.to_vec(),
-            action_index: action_index.0,
-            display_memo,
-            eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
-            delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
-            bundle_count: self.layout.bundle_count,
-            bundle_index: self.bundle_index,
-        })
+    pub(crate) fn observe_keystone_request(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<KeystoneSigningRequest, VotingError> {
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            ..Default::default()
+        });
+        let observations = &attributed;
+        observations.bind_round_id(&self.round_id);
+        let observation_stage = observations.stage("delegation::keystone_request");
+        let observations = observation_stage.scope();
+        let operation_result = keystone::request(self, voting_db, stages, observations);
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 }
 
@@ -1079,34 +1790,64 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    let account_uuid = parse_account_uuid(account_uuid)?;
-    let account = db
-        .get_account(account_uuid)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to load voting account: {e}"),
-        })?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "voting account not found".to_string(),
-        })?;
-    let derivation =
-        account
-            .source()
-            .key_derivation()
-            .ok_or_else(|| VotingError::InvalidInput {
-                message: "voting account has no ZIP-32 derivation metadata".to_string(),
-            })?;
-    let ufvk = account.ufvk().ok_or_else(|| VotingError::InvalidInput {
-        message: "voting account has no UFVK".to_string(),
-    })?;
-    let orchard_fvk = ufvk.orchard().ok_or_else(|| VotingError::InvalidInput {
-        message: "voting account has no Orchard viewing key".to_string(),
-    })?;
+    observe_load_account_keys(db, account_uuid, &crate::ObservationScope::disabled())
+}
 
-    Ok(DelegationAccountKeys {
-        account_index: u32::from(derivation.account_index()),
-        orchard_fvk_bytes: orchard_fvk.to_bytes(),
-        seed_fingerprint: derivation.seed_fingerprint().to_bytes(),
-    })
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_load_account_keys<C, P, CL, R>(
+    db: &WalletDb<C, P, CL, R>,
+    account_uuid: &str,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationAccountKeys, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("delegate::load_account_keys");
+    let operation_result: Result<DelegationAccountKeys, VotingError> = (|| {
+        let account_uuid = parse_account_uuid(account_uuid)?;
+        let account = db
+            .get_account(account_uuid)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to load voting account: {e}"),
+            })?
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "voting account not found".to_string(),
+            })?;
+        let derivation =
+            account
+                .source()
+                .key_derivation()
+                .ok_or_else(|| VotingError::InvalidInput {
+                    message: "voting account has no ZIP-32 derivation metadata".to_string(),
+                })?;
+        let ufvk = account.ufvk().ok_or_else(|| VotingError::InvalidInput {
+            message: "voting account has no UFVK".to_string(),
+        })?;
+        let orchard_fvk = ufvk.orchard().ok_or_else(|| VotingError::InvalidInput {
+            message: "voting account has no Orchard viewing key".to_string(),
+        })?;
+
+        Ok(DelegationAccountKeys {
+            account_index: u32::from(derivation.account_index()),
+            orchard_fvk_bytes: orchard_fvk.to_bytes(),
+            seed_fingerprint: derivation.seed_fingerprint().to_bytes(),
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1131,21 +1872,63 @@ pub fn setup(
     branch_id_provider: &dyn BranchIdProvider,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationSetup, VotingError> {
-    let consensus_branch_id = branch_id_provider.consensus_branch_id()?;
-    stages.on_progress(DelegationProgress::PcztBuilding);
-    let pczt =
-        db.build_governance_pczt(round_id, bundle_index, notes, keys, consensus_branch_id)?;
-    stages.on_progress(DelegationProgress::PcztBuilt);
+    observe_setup(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        keys,
+        branch_id_provider,
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
 
-    let pczt_sighash = array32("pczt_sighash", pczt.pczt_sighash)?;
-    Ok(DelegationSetup {
-        pczt_bytes: pczt.pczt_bytes,
-        pczt_sighash,
-        rk: array32("rk", pczt.rk)?,
-        action_index: pczt.action_index,
-        action_bytes: pczt.action_bytes,
-        tx1_effects: pczt.tx1_effects,
-    })
+pub(crate) fn observe_setup(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    branch_id_provider: &dyn BranchIdProvider,
+    stages: &dyn DelegationProgressReporter,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationSetup, VotingError> {
+    observations.bind_round_id(round_id);
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observations = &attributed;
+    let observation_stage = observations.stage("delegation::setup");
+    let operation_result: Result<DelegationSetup, VotingError> = (|| {
+        let consensus_branch_id = branch_id_provider.consensus_branch_id()?;
+        stages.on_progress(DelegationProgress::PcztBuilding);
+        let pczt =
+            db.build_governance_pczt(round_id, bundle_index, notes, keys, consensus_branch_id)?;
+        stages.on_progress(DelegationProgress::PcztBuilt);
+
+        let pczt_sighash = array32("pczt_sighash", pczt.pczt_sighash)?;
+        Ok(DelegationSetup {
+            pczt_bytes: pczt.pczt_bytes,
+            pczt_sighash,
+            rk: array32("rk", pczt.rk)?,
+            action_index: pczt.action_index,
+            action_bytes: pczt.action_bytes,
+            tx1_effects: pczt.tx1_effects,
+        })
+    })();
+    // `SetupAlreadyPersisted` on a tolerated field is reuse, not failure;
+    // see `delegation_setup_outcome`.
+    let outcome = crate::observability::delegation_setup_outcome(&operation_result);
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Loads the account-scoped data needed to sign a delegation PCZT locally.
@@ -1160,13 +1943,53 @@ pub fn signing_request(
     bundle_index: u32,
     keys: &DelegationKeys,
 ) -> Result<DelegationSigningRequest, VotingError> {
-    db.get_delegation_signing_request(round_id, bundle_index, keys)
+    observe_signing_request(
+        db,
+        round_id,
+        bundle_index,
+        keys,
+        &crate::ObservationScope::disabled(),
+    )
 }
 
-/// Generates and persists the delegation proof for one bundle.
+pub(crate) fn observe_signing_request(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    keys: &DelegationKeys,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationSigningRequest, VotingError> {
+    observations.bind_round_id(round_id);
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observations = &attributed;
+    let observation_stage = observations.stage("delegation::signing_request");
+    let operation_result: Result<DelegationSigningRequest, VotingError> =
+        (|| db.get_delegation_signing_request(round_id, bundle_index, keys))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Generates or reuses the durable delegation proof for one bundle.
 ///
 /// Witnesses and PIR proof precompute data must already be present. The proof
 /// result is checked against PCZT-derived public fields before persistence.
+/// Progress is delivered live from a dedicated delivery thread, so the
+/// producer never waits on the reporter and a reporter may safely enter proof
+/// generation itself or dispatch it to another thread.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn prove(
     db: &VotingDb,
@@ -1174,12 +1997,196 @@ pub fn prove(
     bundle_index: u32,
     notes: &[NoteInfo],
     keys: &DelegationKeys,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProof, VotingError> {
+    observe_prove(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        keys,
+        pir_client,
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_prove(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    pir_client: &dyn crate::pir::PirProofSource,
+    stages: &dyn DelegationProgressReporter,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationProof, VotingError> {
+    observations.bind_round_id(round_id);
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observations = &attributed;
+    let observation_stage = observations.stage("delegation::prove");
+    let observations = observation_stage.scope();
+    let operation_result: Result<DelegationProof, VotingError> = (|| {
+        observe_ensure_proof(
+            db,
+            round_id,
+            bundle_index,
+            notes,
+            keys,
+            pir_client,
+            stages,
+            observations,
+        )
+        .map(|completion| completion.proof)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Generates or reuses one durable delegation proof.
+///
+/// Concurrent calls for the same wallet, round, and bundle wait behind one
+/// process-local producer and re-read the committed proof before returning.
+/// Different bundle identities are never serialized by this coordination.
+///
+/// # Errors
+///
+/// Returns [`VotingError`] when durable state cannot be read or validated, or
+/// when proof generation or persistence fails. Progress, including the
+/// waiting notification, is delivered live from a dedicated delivery thread
+/// that the producer never waits on; a reporter that reenters proof
+/// coordination waits at most until the current operation releases its lock.
+/// If the original setup is cleared or replaced while proving, persistence
+/// fails without saving the proof or advancing the round phase.
+pub fn ensure_proof(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    pir_client: &dyn crate::pir::PirProofSource,
+    stages: &dyn DelegationProgressReporter,
+) -> Result<DelegationProofCompletion, VotingError> {
+    observe_ensure_proof(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        keys,
+        pir_client,
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_ensure_proof(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    pir_client: &dyn crate::pir::PirProofSource,
+    stages: &dyn DelegationProgressReporter,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationProofCompletion, VotingError> {
+    observations.bind_round_id(round_id);
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observations = &attributed;
+    let observation_stage = observations.stage("delegation::ensure_proof");
+    let observations = observation_stage.scope();
+    let operation = crate::proving_runtime::Operation::for_bundle(db, round_id, bundle_index);
+    let operation_result: Result<DelegationProofCompletion, VotingError> = operation.enter(|| {
+        let identity =
+            DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
+        with_live_progress(stages, |progress| {
+            crate::delegation_proof_coordination::coordinate(
+                identity,
+                || progress.on_progress(DelegationProgress::WaitingForExistingProof),
+                |identity| {
+                    db.validate_delegation_proof_inputs(identity, notes, keys)?;
+
+                    if let Some(proof) = load_persisted_proof(db, identity)? {
+                        db.validate_delegation_proof_target(identity, keys)?;
+                        progress.on_progress(DelegationProgress::ProofComplete);
+                        return Ok(DelegationProofCompletion {
+                            proof,
+                            status: DelegationProofStatus::Reused,
+                        });
+                    }
+
+                    generate_and_persist_proof(
+                        db,
+                        identity,
+                        notes,
+                        keys,
+                        pir_client,
+                        progress,
+                        observations,
+                    )
+                    .map(|proof| DelegationProofCompletion {
+                        proof,
+                        status: DelegationProofStatus::Generated,
+                    })
+                },
+            )
+        })
+    });
+    let outcome = if operation_result
+        .as_ref()
+        .is_ok_and(|completion| completion.status == DelegationProofStatus::Reused)
+    {
+        crate::ObservationOutcome::Reused
+    } else if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+fn generate_and_persist_proof(
+    db: &VotingDb,
+    identity: &DelegationProofIdentity,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    pir_client: &dyn crate::pir::PirProofSource,
+    stages: &dyn DelegationProgressReporter,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationProof, VotingError> {
     stages.on_progress(DelegationProgress::ProofStarting);
-    let proof =
-        db.build_and_prove_delegation(round_id, bundle_index, notes, keys, pir_client, stages)?;
+    let proof = db.generate_and_persist_delegation_proof(
+        identity,
+        notes,
+        keys,
+        pir_client,
+        stages,
+        observations,
+    )?;
     stages.on_progress(DelegationProgress::ProofComplete);
 
     Ok(DelegationProof {
@@ -1192,20 +2199,173 @@ pub fn prove(
     })
 }
 
-/// Assembles chain-ready delegation submission fields for one bundle.
-///
-/// Signers provide a SpendAuth signature over the stored PCZT sighash.
-pub fn submission(
+/// Validates that `notes` and `keys` match the durable bundle a persisted
+/// proof belongs to; see [`PreparedDelegationBundle::validate_persisted_proof`].
+pub fn validate_persisted_proof_reuse(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
-    signer: DelegationSigner,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+) -> Result<(), VotingError> {
+    observe_validate_persisted_proof_reuse(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        keys,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_validate_persisted_proof_reuse(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    observations: &crate::ObservationScope,
+) -> Result<(), VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage =
+        attributed_observations.stage("delegate::validate_persisted_proof_reuse");
+    let operation_result: Result<(), VotingError> = (|| {
+        let identity =
+            DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
+        db.validate_delegation_proof_inputs(&identity, notes, keys)?;
+        db.validate_delegation_proof_target(&identity, keys)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+fn load_persisted_proof(
+    db: &VotingDb,
+    identity: &DelegationProofIdentity,
+) -> Result<Option<DelegationProof>, VotingError> {
+    if !db
+        .delegation_phase_for_wallet(
+            identity.wallet_id(),
+            identity.round_id(),
+            identity.bundle_index(),
+        )?
+        .has_persisted_proof()
+    {
+        return Ok(None);
+    }
+
+    let conn = db.conn();
+    let stored = crate::storage::queries::load_delegation_submission_data(
+        &conn,
+        identity.round_id(),
+        identity.wallet_id(),
+        identity.bundle_index(),
+    )?;
+    Ok(Some(DelegationProof {
+        bytes: stored.proof,
+        rk: array32("rk", stored.rk)?,
+        nf_signed: array32("nf_signed", stored.nf_signed)?,
+        cmx_new: array32("cmx_new", stored.cmx_new)?,
+        van_comm: array32("van_comm", stored.gov_comm)?,
+        gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", stored.gov_nullifiers)?,
+    }))
+}
+
+/// Reconstructs a chain-ready delegation request from durable state on `conn`.
+///
+/// The supplied signature must verify under the stored randomized key and
+/// stored PCZT sighash. This function performs no signing or durable writes.
+pub(crate) fn submission_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    spend_auth_signature: [u8; 64],
 ) -> Result<DelegationSubmission, VotingError> {
-    let data = match signer {
-        DelegationSigner::Signature { sig, sighash } => {
-            db.get_delegation_submission_with_signature(round_id, bundle_index, &sig, &sighash)
+    submission_with_sighash_constraint(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        spend_auth_signature,
+        None,
+    )
+}
+
+fn submission_with_expected_sighash(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    spend_auth_signature: [u8; 64],
+    expected_sighash: [u8; 32],
+) -> Result<DelegationSubmission, VotingError> {
+    submission_with_sighash_constraint(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        spend_auth_signature,
+        Some(expected_sighash),
+    )
+}
+
+fn submission_with_sighash_constraint(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    spend_auth_signature: [u8; 64],
+    expected_sighash: Option<[u8; 32]>,
+) -> Result<DelegationSubmission, VotingError> {
+    let data = crate::storage::queries::load_delegation_submission_data(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+    )?;
+    let stored_sighash =
+        crate::storage::queries::load_pczt_sighash(conn, round_id, wallet_id, bundle_index)?;
+    if stored_sighash.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "pczt_sighash must be 32 bytes, got {}",
+                stored_sighash.len()
+            ),
+        });
+    }
+    if let Some(expected_sighash) = expected_sighash {
+        if stored_sighash.as_slice() != expected_sighash {
+            return Err(VotingError::InvalidInput {
+                message: "sighash does not match stored PCZT sighash".to_string(),
+            });
         }
-    }?;
+    }
+    crate::storage::operations::verify_delegation_spend_auth_signature(
+        &data.rk,
+        &stored_sighash,
+        &spend_auth_signature,
+    )?;
+
+    let sighash: [u8; 32] = stored_sighash
+        .try_into()
+        .expect("validated 32-byte sighash must convert to an array");
 
     Ok(DelegationSubmission {
         proof: data.proof,
@@ -1216,33 +2376,10 @@ pub fn submission(
         gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", data.gov_nullifiers)?,
         alpha: array32("alpha", data.alpha)?,
         vote_round_id: data.vote_round_id,
-        spend_auth_sig: array64("spend_auth_sig", data.spend_auth_sig)?,
-        sighash: array32("sighash", data.sighash)?,
+        spend_auth_sig: spend_auth_signature,
+        sighash,
         tx1_effects: data.tx1_effects,
     })
-}
-
-/// Records the submitted delegation transaction hash for recovery.
-pub fn record_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    db.store_delegation_tx_hash(round_id, bundle_index, tx_hash)
-}
-
-/// Records the confirmed VAN leaf position for a delegated bundle.
-///
-/// Cast-vote callers should use `confirmation::confirm_vote_submission` so the
-/// vote hash, successor VAN position, and VC position are stored atomically.
-pub fn record_van_position(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    position: u32,
-) -> Result<(), VotingError> {
-    db.store_van_position(round_id, bundle_index, position)
 }
 
 /// Extracts the ZIP-244 shielded sighash from a serialized voting PCZT.
@@ -1255,7 +2392,35 @@ pub fn spend_auth_signature(
     signed_pczt_bytes: &[u8],
     action_index: usize,
 ) -> Result<[u8; 64], VotingError> {
-    crate::action::extract_spend_auth_sig(signed_pczt_bytes, action_index)
+    observe_spend_auth_signature(
+        signed_pczt_bytes,
+        action_index,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_spend_auth_signature(
+    signed_pczt_bytes: &[u8],
+    action_index: usize,
+    observations: &crate::ObservationScope,
+) -> Result<[u8; 64], VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("delegate::spend_auth_signature");
+    let operation_result: Result<[u8; 64], VotingError> =
+        (|| crate::action::extract_spend_auth_sig(signed_pczt_bytes, action_index))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Redacts delegation PCZT metadata that signer devices do not need.
@@ -1332,6 +2497,21 @@ pub fn display_memo(round_name: &str, total_weight_zatoshi: u64) -> String {
     memo
 }
 
+// Escape before truncation to preserve the amount and avoid Ledger's memo-hash path.
+pub(crate) fn ledger_display_memo(round_name: &str, total_weight_zatoshi: u64) -> String {
+    let title: String = round_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_ascii_control() {
+                ch.to_string()
+            } else {
+                ch.escape_default().collect()
+            }
+        })
+        .collect();
+    display_memo(&title, total_weight_zatoshi).replace('\n', " ")
+}
+
 fn truncate_utf8_prefix(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
@@ -1350,14 +2530,6 @@ fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {
         .try_into()
         .map_err(|value: Vec<u8>| VotingError::Internal {
             message: format!("{label} must be 32 bytes, got {}", value.len()),
-        })
-}
-
-fn array64(label: &str, value: Vec<u8>) -> Result<[u8; 64], VotingError> {
-    value
-        .try_into()
-        .map_err(|value: Vec<u8>| VotingError::Internal {
-            message: format!("{label} must be 64 bytes, got {}", value.len()),
         })
 }
 
@@ -1404,6 +2576,9 @@ fn array64_slice(label: &str, value: &[u8]) -> Result<[u8; 64], VotingError> {
 
 #[cfg(test)]
 mod tests {
+    mod observability;
+    mod pipeline_observability;
+    mod setup_observability;
     use super::*;
     pub(crate) use crate::backend::pasta_curves;
 
@@ -1415,6 +2590,7 @@ mod tests {
     };
     use rusqlite::{params, Connection};
     use secrecy::{ExposeSecret, SecretVec};
+    use voting_crypto_deps::zip32::Scope;
     use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday, WalletWrite};
     use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db};
     use zcash_primitives::block::BlockHash;
@@ -1422,7 +2598,6 @@ mod tests {
     use zcash_protocol::consensus::{
         Network as ZcashNetwork, NetworkConstants, NetworkUpgrade, Parameters,
     };
-    use zip32::Scope;
 
     const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
@@ -1769,6 +2944,9 @@ mod tests {
                 privacy_trim_dropped_bundles: 0,
                 privacy_trim_dropped_notes: 0,
                 privacy_trim_dropped_value_zatoshi: 0,
+                skipped_suffix_bundles: 0,
+                skipped_suffix_notes: 0,
+                skipped_suffix_value_zatoshi: 0,
             },
             bundle_note_infos,
             delegation_keys: DelegationKeys {
@@ -1782,6 +2960,7 @@ mod tests {
                 coin_type: Network::Testnet.network_type().coin_type(),
                 round_name: "Demo Round".to_string(),
                 van_blinding_key: None,
+                ledger_output_review: false,
             },
             branch_id_provider: LightwalletdBranchIdProvider::resolved(TESTNET_NU6_BRANCH_ID),
             anchor_tree_state_bytes: vec![0xAA],
@@ -1790,7 +2969,7 @@ mod tests {
         }
     }
 
-    fn prepared_wallet_delegation_fixture() -> (
+    pub(super) fn prepared_wallet_delegation_fixture() -> (
         VotingDb,
         crate::VotingRoundParams,
         VotingHotkey,
@@ -2254,17 +3433,17 @@ mod tests {
     }
 
     #[test]
-    fn external_signature_signer_validates_signature_shapes() {
+    fn prepared_signer_validates_signature_shapes() {
         assert!(matches!(
-            DelegationSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap(),
-            DelegationSigner::Signature { .. }
+            PreparedSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap(),
+            PreparedSigner::Signature { .. }
         ));
 
-        let sig_err = match DelegationSigner::signature_from_bytes(&[1; 63], &[2; 32]) {
+        let sig_err = match PreparedSigner::signature_from_bytes(&[1; 63], &[2; 32]) {
             Ok(_) => panic!("short signature should be rejected"),
             Err(err) => err.to_string(),
         };
-        let sighash_err = match DelegationSigner::signature_from_bytes(&[1; 64], &[2; 31]) {
+        let sighash_err = match PreparedSigner::signature_from_bytes(&[1; 64], &[2; 31]) {
             Ok(_) => panic!("short sighash should be rejected"),
             Err(err) => err.to_string(),
         };

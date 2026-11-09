@@ -217,7 +217,7 @@ impl IntoIterator for NonHardenedChildRange {
 
     fn into_iter(self) -> Self::IntoIter {
         NonHardenedChildIter {
-            next: Some(self.0.start),
+            next: (self.0.start < self.0.end).then_some(self.0.start),
             end: self.0.end,
         }
     }
@@ -517,8 +517,24 @@ pub trait IncomingViewingKey: private::SealedChangeLevelKey + core::marker::Size
         &self,
         address_index: NonHardenedChildIndex,
     ) -> Result<TransparentAddress, bip32::Error> {
-        let child_key = self.extended_pubkey().derive_child(address_index.into())?;
-        Ok(TransparentAddress::from_pubkey(child_key.public_key()))
+        Ok(TransparentAddress::from_pubkey(
+            &self.derive_pubkey(address_index)?,
+        ))
+    }
+
+    /// Derives the public key at the provided child index.
+    ///
+    /// This is the key material [`derive_address`](Self::derive_address) hashes, which a
+    /// caller needs directly when the address is determined by a script over several keys
+    /// rather than by a single key hash.
+    fn derive_pubkey(
+        &self,
+        address_index: NonHardenedChildIndex,
+    ) -> Result<PublicKey, bip32::Error> {
+        Ok(*self
+            .extended_pubkey()
+            .derive_child(address_index.into())?
+            .public_key())
     }
 
     /// Searches the space of child indexes for an index that will
@@ -728,10 +744,13 @@ impl ShieldingOvks {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+    use core::ops::Range;
+
     use bip32::ChildNumber;
     use subtle::ConstantTimeEq;
 
-    use crate::keys::NonHardenedChildIndex;
+    use crate::keys::{NonHardenedChildIndex, NonHardenedChildRange};
 
     #[cfg(feature = "transparent-inputs")]
     use {
@@ -887,6 +906,22 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn nonhardened_child_range() {
+        let collect = |range: Range<NonHardenedChildIndex>| {
+            NonHardenedChildRange::from(range)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let zero = NonHardenedChildIndex::ZERO;
+        let one = zero.next().unwrap();
+        let two = one.next().unwrap();
+
+        assert_eq!(collect(zero..two), [zero, one]);
+        assert_eq!(collect(one..one), []);
+        assert_eq!(collect(two..one), []);
     }
 
     #[test]

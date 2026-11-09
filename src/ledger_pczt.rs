@@ -446,8 +446,8 @@ fn convert_orchard_action(
         seed_fingerprint,
         cmx: output.cmx().to_bytes().to_vec(),
         ephemeral_key: note.epk_bytes.to_vec(),
-        enc_ciphertext: note.enc_ciphertext.to_vec(),
-        out_ciphertext: note.out_ciphertext.to_vec(),
+        enc_ciphertext: note.enc_ciphertext.as_ref().to_vec(),
+        out_ciphertext: note.out_ciphertext.as_ref().to_vec(),
         recipient: output
             .recipient()
             .map(|value| value.to_raw_address_bytes().to_vec())

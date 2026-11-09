@@ -431,6 +431,101 @@ pub struct VoteSubmissionAttempt {
 }
 
 impl VotingDb {
+    /// Adopt pre-journal browser votes that already have a durable transaction hash.
+    /// The row is never left Prepared, which would authorize a duplicate POST
+    /// if persistence fails between two separate writes.
+    #[cfg(feature = "browser")]
+    pub fn adopt_legacy_vote_submission(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        canonical: &CanonicalVoteSubmission,
+    ) -> Result<bool, VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| invalid())?;
+        canonical.validate_with_conn(&tx, &wallet_id, round_id, bundle_index)?;
+        if load_attempt_with_conn(
+            &tx,
+            &wallet_id,
+            round_id,
+            bundle_index,
+            canonical.anchor_proposal_id,
+        )?
+        .is_some()
+        {
+            return Err(invalid());
+        }
+        let hashes = canonical
+            .proposal_ids
+            .iter()
+            .map(|proposal_id| {
+                queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, *proposal_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if hashes.iter().all(Option::is_none) {
+            return Ok(false);
+        }
+        if hashes
+            .iter()
+            .any(|hash| hash.as_deref() != Some(canonical.tx_hash.as_str()))
+        {
+            return Err(invalid());
+        }
+        for proposal_id in &canonical.proposal_ids {
+            let preserved: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_vote_evidence
+                     WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3
+                       AND proposal_id=?4 AND tx_hash=?5)",
+                    params![
+                        round_id,
+                        wallet_id,
+                        bundle_index,
+                        proposal_id,
+                        canonical.tx_hash
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|_| invalid())?;
+            if !preserved {
+                return Err(invalid());
+            }
+        }
+        tx.execute(
+            "INSERT INTO vote_attempts
+             (round_id,wallet_id,bundle_index,anchor_proposal_id,canonical_json,tx_hash,proposal_ids_json,batch_digest,outcome)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'dispatching')",
+            params![
+                round_id,
+                wallet_id,
+                bundle_index,
+                canonical.anchor_proposal_id,
+                canonical.json,
+                canonical.tx_hash,
+                serde_json::to_string(&canonical.proposal_ids).map_err(|_| invalid())?,
+                canonical.batch_digest.map(|digest| digest.to_vec()),
+            ],
+        )
+        .map_err(|_| invalid())?;
+        for proposal_id in &canonical.proposal_ids {
+            let removed = tx
+                .execute(
+                    "DELETE FROM legacy_vote_evidence WHERE round_id=?1 AND wallet_id=?2
+                     AND bundle_index=?3 AND proposal_id=?4",
+                    params![round_id, wallet_id, bundle_index, proposal_id],
+                )
+                .map_err(|_| invalid())?;
+            if removed != 1 {
+                return Err(invalid());
+            }
+        }
+        tx.commit().map_err(|_| invalid())?;
+        Ok(true)
+    }
+
     pub fn prepare_vote_submission(
         &self,
         round_id: &str,
@@ -643,12 +738,12 @@ impl VotingDb {
             )?;
         }
         if !replay || current_van < parsed.van_position {
-            queries::store_van_position(
+            queries::store_van_position_u64(
                 &tx,
                 round_id,
                 &wallet_id,
                 bundle_index,
-                parsed.van_position,
+                u64::from(parsed.van_position),
             )?;
         }
         let vc_json = serde_json::to_string(&parsed.vc_positions).map_err(|_| invalid())?;
@@ -748,6 +843,36 @@ impl VotingDb {
                     && attempt.canonical.tx_hash == hash
                     && attempt.canonical.proposal_ids.contains(&proposal)
             }) {
+                #[cfg(feature = "browser")]
+                {
+                    let state = queries::load_vote_row_state(
+                        &conn, round_id, &wallet_id, bundle, proposal,
+                    )?
+                    .ok_or_else(invalid)?;
+                    let preserved: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM legacy_vote_evidence
+                             WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3
+                               AND proposal_id=?4 AND tx_hash=?5)",
+                            params![round_id, wallet_id, bundle, proposal, hash],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| invalid())?;
+                    let confirmed = state.vc_tree_position.is_some_and(|position| {
+                        u64::try_from(position)
+                            .ok()
+                            .is_some_and(|position| position < vote_commitment_tree::TREE_CAPACITY)
+                    });
+                    if preserved
+                        && (confirmed
+                            || crate::vote::recovery_bundle_with_conn(
+                                &conn, &wallet_id, round_id, bundle, proposal,
+                            )?
+                            .is_some())
+                    {
+                        continue;
+                    }
+                }
                 return Err(invalid());
             }
         }

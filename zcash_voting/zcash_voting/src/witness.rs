@@ -10,10 +10,12 @@ use crate::{
     types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessData},
 };
 
-use incrementalmerkletree::{frontier::CommitmentTree, Hashable, Level, MerklePath, Position};
 use orchard::tree::MerkleHashOrchard;
 use prost::Message;
 use subtle::CtOption;
+use voting_crypto_deps::incrementalmerkletree::{
+    frontier::CommitmentTree, Hashable, Level, MerklePath, Position,
+};
 use zcash_client_backend::proto::service::TreeState;
 #[cfg(not(target_arch = "wasm32"))]
 use zcash_client_sqlite::WalletDb;
@@ -23,7 +25,10 @@ pub(crate) fn snapshot_frontier(
     bytes: &[u8],
     network: Network,
     height: u64,
-) -> Result<incrementalmerkletree::frontier::NonEmptyFrontier<MerkleHashOrchard>, VotingError> {
+) -> Result<
+    voting_crypto_deps::incrementalmerkletree::frontier::NonEmptyFrontier<MerkleHashOrchard>,
+    VotingError,
+> {
     let invalid = |message: &str| VotingError::InvalidInput {
         message: message.into(),
     };
@@ -143,23 +148,73 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    validate_wallet_db_network_for_round(db, round_id, wallet_db)?;
-    let witnesses = generate_note_witnesses_with_tree_state(
-        db,
-        round_id,
-        notes,
-        wallet_db,
-        Some(tree_state_bytes),
-    )?;
-    store_tree_state_and_witnesses(
+    observe_store_tree_state_and_generate_note_witnesses(
         db,
         round_id,
         bundle_index,
         tree_state_bytes,
         notes,
-        &witnesses,
-    )?;
-    Ok(witnesses)
+        wallet_db,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn observe_store_tree_state_and_generate_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    tree_state_bytes: &[u8],
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage =
+        attributed_observations.stage("witness::store_tree_state_and_generate_note_witnesses");
+    let observations = observation_stage.scope();
+    let operation_result: Result<Vec<WitnessData>, VotingError> = (|| {
+        validate_wallet_db_network_for_round(db, round_id, wallet_db)?;
+        let witnesses = observe_generate_note_witnesses_with_tree_state(
+            db,
+            round_id,
+            notes,
+            wallet_db,
+            Some(tree_state_bytes),
+            observations,
+        )?;
+        store_tree_state_and_witnesses(
+            db,
+            round_id,
+            bundle_index,
+            tree_state_bytes,
+            notes,
+            &witnesses,
+        )?;
+        Ok(witnesses)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Generate shielded Merkle witnesses for the bundle notes at the round snapshot.
@@ -179,124 +234,173 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    generate_note_witnesses_with_tree_state(db, round_id, notes, wallet_db, None)
+    observe_generate_note_witnesses(
+        db,
+        round_id,
+        notes,
+        wallet_db,
+        &crate::ObservationScope::disabled(),
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn generate_note_witnesses_with_tree_state<C, P, CL, R>(
+pub(crate) fn observe_generate_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    observe_generate_note_witnesses_with_tree_state(
+        db,
+        round_id,
+        notes,
+        wallet_db,
+        None,
+        observations,
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn observe_generate_note_witnesses_with_tree_state<C, P, CL, R>(
     db: &VotingDb,
     round_id: &str,
     notes: &[NoteInfo],
     wallet_db: &WalletDb<C, P, CL, R>,
     supplied_tree_state: Option<&[u8]>,
+    observations: &crate::ObservationScope,
 ) -> Result<Vec<WitnessData>, VotingError>
 where
     C: Borrow<rusqlite::Connection>,
-    P: Parameters,
+    P: zcash_protocol::consensus::Parameters,
 {
-    let (tree_state_bytes, params, stored_network) = {
-        let wallet_id = db.wallet_id();
-        let conn = db.conn();
-        let tree_state_bytes = match supplied_tree_state {
-            Some(bytes) => bytes.to_vec(),
-            None => queries::load_tree_state(&conn, round_id, &wallet_id)?,
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("witness::generate_note_witnesses");
+    let operation_result: Result<Vec<WitnessData>, VotingError> = (|| {
+        let (tree_state_bytes, params, stored_network) = {
+            let wallet_id = db.wallet_id();
+            let conn = db.conn();
+            let tree_state_bytes = match supplied_tree_state {
+                Some(bytes) => bytes.to_vec(),
+                None => queries::load_tree_state(&conn, round_id, &wallet_id)?,
+            };
+            let (params, stored_network) =
+                queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+            (tree_state_bytes, params, stored_network)
         };
-        let (params, stored_network) =
-            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
-        (tree_state_bytes, params, stored_network)
-    };
-    validate_wallet_network(stored_network, wallet_db)?;
-    snapshot_frontier(&tree_state_bytes, stored_network, params.snapshot_height)?;
+        validate_wallet_network(stored_network, wallet_db)?;
 
-    let tree_state =
-        TreeState::decode(tree_state_bytes.as_slice()).map_err(|e| VotingError::Internal {
-            message: format!("failed to decode TreeState protobuf: {e}"),
-        })?;
+        let tree_state =
+            TreeState::decode(tree_state_bytes.as_slice()).map_err(|e| VotingError::Internal {
+                message: format!("failed to decode TreeState protobuf: {e}"),
+            })?;
 
-    let snapshot_height =
-        u32::try_from(params.snapshot_height).map_err(|_| VotingError::InvalidInput {
-            message: format!(
-                "snapshot_height {} does not fit in u32",
-                params.snapshot_height
-            ),
-        })?;
-    let snapshot_block_height = BlockHeight::from_u32(snapshot_height);
-    let voting_protocol =
-        VotingShieldedProtocol::for_height(&stored_network, snapshot_block_height)?;
+        let snapshot_height =
+            u32::try_from(params.snapshot_height).map_err(|_| VotingError::InvalidInput {
+                message: format!(
+                    "snapshot_height {} does not fit in u32",
+                    params.snapshot_height
+                ),
+            })?;
+        let snapshot_block_height = BlockHeight::from_u32(snapshot_height);
+        let voting_protocol =
+            VotingShieldedProtocol::for_height(&stored_network, snapshot_block_height)?;
 
-    let note_commitment_tree: CommitmentTree<
-        MerkleHashOrchard,
-        { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
-    > = match voting_protocol {
-        VotingShieldedProtocol::Ironwood => tree_state.ironwood_tree(),
-    }
-    .map_err(|e| VotingError::Internal {
-        message: format!(
-            "failed to parse {} tree from TreeState: {e}",
-            voting_protocol.pool()
-        ),
-    })?;
-
-    let frontier_root_bytes = note_commitment_tree.root().to_bytes();
-    validate_cached_tree_state_for_round(
-        &tree_state,
-        &frontier_root_bytes[..],
-        &params,
-        voting_protocol,
-    )?;
-    let frontier = note_commitment_tree.to_frontier();
-    let nonempty_frontier = frontier.take().ok_or_else(|| VotingError::InvalidInput {
-        message: format!(
-            "empty {} frontier at snapshot height",
-            voting_protocol.pool()
-        ),
-    })?;
-
-    let positions: Vec<Position> = notes
-        .iter()
-        .map(|note| Position::from(note.position))
-        .collect();
-    let merkle_paths: Vec<
-        MerklePath<MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>,
-    > = match voting_protocol {
-        VotingShieldedProtocol::Ironwood => {
-            WalletDb::generate_ironwood_witnesses_at_historical_height(
-                wallet_db,
-                &positions,
-                nonempty_frontier,
-                snapshot_block_height,
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("generate_ironwood_witnesses_at_historical_height failed: {e}"),
-            })?
+        let note_commitment_tree: CommitmentTree<
+            MerkleHashOrchard,
+            { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+        > = match voting_protocol {
+            VotingShieldedProtocol::Ironwood => tree_state.ironwood_tree(),
         }
-    };
-
-    if merkle_paths.len() != notes.len() {
-        return Err(VotingError::Internal {
+        .map_err(|e| VotingError::Internal {
             message: format!(
-                "generated {} Merkle paths for {} voting notes",
-                merkle_paths.len(),
-                notes.len()
+                "failed to parse {} tree from TreeState: {e}",
+                voting_protocol.pool()
             ),
-        });
-    }
+        })?;
 
-    let root = frontier_root_bytes.to_vec();
-    Ok(merkle_paths
-        .into_iter()
-        .zip(notes.iter())
-        .map(|(path, note)| WitnessData {
-            note_commitment: note.commitment.clone(),
-            position: note.position,
-            root: root.clone(),
-            auth_path: path
-                .path_elems()
-                .iter()
-                .map(|hash| hash.to_bytes().to_vec())
-                .collect(),
-        })
-        .collect())
+        let frontier_root_bytes = note_commitment_tree.root().to_bytes();
+        validate_cached_tree_state_for_round(
+            &tree_state,
+            &frontier_root_bytes[..],
+            &params,
+            voting_protocol,
+        )?;
+        let frontier = note_commitment_tree.to_frontier();
+        let nonempty_frontier = frontier.take().ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "empty {} frontier at snapshot height",
+                voting_protocol.pool()
+            ),
+        })?;
+
+        let positions: Vec<Position> = notes
+            .iter()
+            .map(|note| Position::from(note.position))
+            .collect();
+        let merkle_paths: Vec<
+            MerklePath<MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>,
+        > = match voting_protocol {
+            VotingShieldedProtocol::Ironwood => {
+                WalletDb::generate_ironwood_witnesses_at_historical_height(
+                    wallet_db,
+                    &positions,
+                    nonempty_frontier,
+                    snapshot_block_height,
+                )
+                .map_err(|e| VotingError::Internal {
+                    message: format!(
+                        "generate_ironwood_witnesses_at_historical_height failed: {e}"
+                    ),
+                })?
+            }
+        };
+
+        if merkle_paths.len() != notes.len() {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "generated {} Merkle paths for {} voting notes",
+                    merkle_paths.len(),
+                    notes.len()
+                ),
+            });
+        }
+
+        let root = frontier_root_bytes.to_vec();
+        Ok(merkle_paths
+            .into_iter()
+            .zip(notes.iter())
+            .map(|(path, note)| WitnessData {
+                note_commitment: note.commitment.clone(),
+                position: note.position,
+                root: root.clone(),
+                auth_path: path
+                    .path_elems()
+                    .iter()
+                    .map(|hash| hash.to_bytes().to_vec())
+                    .collect(),
+            })
+            .collect())
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -465,10 +569,11 @@ mod tests {
     use super::*;
 
     pub(crate) use crate::backend::pasta_curves;
-    use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
-    use incrementalmerkletree::Retention;
     use pasta_curves::group::ff::PrimeField;
     use pasta_curves::pallas;
+    use voting_crypto_deps::incrementalmerkletree::frontier::{CommitmentTree, Frontier};
+    use voting_crypto_deps::incrementalmerkletree::Retention;
+    use voting_crypto_deps::zip32::{AccountId, Scope};
     use zcash_client_backend::data_api::WalletCommitmentTrees;
     use zcash_client_backend::proto::service::TreeState;
     use zcash_client_sqlite::util::SystemClock;
@@ -558,7 +663,7 @@ mod tests {
         let ufvk = crate::backend::zcash_keys::keys::UnifiedSpendingKey::from_seed(
             &VotingNetwork::Regtest,
             &[17; 32],
-            zip32::AccountId::ZERO,
+            AccountId::ZERO,
         )
         .unwrap()
         .to_unified_full_viewing_key();
@@ -568,9 +673,7 @@ mod tests {
             .find_map(|b| orchard::note::RandomSeed::from_bytes([b; 32], &rho).into_option())
             .unwrap();
         let note = orchard::Note::from_parts(
-            ufvk.orchard()
-                .unwrap()
-                .address_at(0u32, zip32::Scope::External),
+            ufvk.orchard().unwrap().address_at(0u32, Scope::External),
             orchard::value::NoteValue::from_raw(1),
             rho,
             rseed,
@@ -580,7 +683,7 @@ mod tests {
         NoteInfo::from_orchard_note(
             &note,
             position,
-            zip32::Scope::External,
+            Scope::External,
             &ufvk,
             &VotingNetwork::Regtest,
         )

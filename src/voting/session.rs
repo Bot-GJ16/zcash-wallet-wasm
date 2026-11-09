@@ -40,6 +40,58 @@ fn conflict(_: impl Sized) -> VotingApiError {
     VotingApiError::new(VotingErrorCode::RecoveryConflict)
 }
 
+fn browser_step_kind(
+    db: &VotingDb,
+    round_id: &str,
+    step: &NextStep,
+) -> Result<&'static str, VotingApiError> {
+    use zcash_voting::vote_submission::VoteSubmissionOutcome;
+    Ok(match step {
+        NextStep::Delegate { .. } => "delegate",
+        NextStep::AdvanceDelegation { .. } | NextStep::AdvanceImportedDelegation { .. } => {
+            "poll_delegation"
+        }
+        NextStep::CastVote { .. } => "cast_vote",
+        NextStep::AdvanceVote {
+            bundle_index,
+            proposal_id,
+        }
+        | NextStep::AdvanceVoteBatch {
+            bundle_index,
+            proposal_id,
+        } => {
+            let attempt = db
+                .vote_submission(round_id, *bundle_index, *proposal_id)
+                .map_err(conflict)?;
+            let pending =
+                attempt.is_some_and(|attempt| attempt.outcome != VoteSubmissionOutcome::Prepared);
+            match (matches!(step, NextStep::AdvanceVoteBatch { .. }), pending) {
+                (false, false) => "submit_vote",
+                (true, false) => "submit_vote_batch",
+                (false, true) => "poll_vote",
+                (true, true) => "poll_vote_batch",
+            }
+        }
+        NextStep::SubmitShares { .. } => "submit_shares",
+        NextStep::ConfirmShare { .. } => "confirm_share",
+        _ => return Err(conflict(())),
+    })
+}
+
+fn browser_round_action(
+    action: zcash_voting::session::RoundPlanAction,
+) -> Result<&'static str, VotingApiError> {
+    use zcash_voting::session::RoundPlanAction;
+    Ok(match action {
+        RoundPlanAction::Idle => "idle",
+        RoundPlanAction::Delegate => "delegate",
+        RoundPlanAction::Vote => "vote",
+        RoundPlanAction::SubmitShares => "submit_shares",
+        RoundPlanAction::Done => "done",
+        _ => return Err(conflict(())),
+    })
+}
+
 fn all_expected_votes_confirmed(confirmed: u32, expected: u32) -> bool {
     expected > 0 && confirmed == expected
 }
@@ -137,9 +189,9 @@ impl VotingSessionInner {
                 return self.delegation_progress(&id, now()?);
             };
             let bundle = match step {
-                NextStep::Delegate { bundle_index } | NextStep::PollDelegation { bundle_index } => {
-                    *bundle_index
-                }
+                NextStep::Delegate { bundle_index }
+                | NextStep::AdvanceDelegation { bundle_index }
+                | NextStep::AdvanceImportedDelegation { bundle_index } => *bundle_index,
                 _ => unreachable!(),
             };
             let mut attempt = self
@@ -147,7 +199,10 @@ impl VotingSessionInner {
                 .delegation_submission(&id, bundle)
                 .map_err(conflict)?;
             if attempt.is_none() {
-                if matches!(step, NextStep::PollDelegation { .. }) {
+                if matches!(
+                    step,
+                    NextStep::AdvanceDelegation { .. } | NextStep::AdvanceImportedDelegation { .. }
+                ) {
                     return Err(conflict(()));
                 }
                 let round = authenticate().await?;
@@ -411,7 +466,11 @@ impl VotingSessionInner {
             return Err(conflict(()));
         }
         Ok((
-            (&signing_key.sign(rand_core::OsRng, &request.sighash)).into(),
+            (&signing_key.sign(
+                rand::rand_core::UnwrapErr(rand::rngs::SysRng),
+                &request.sighash,
+            ))
+                .into(),
             request.sighash,
         ))
     }
@@ -500,7 +559,7 @@ impl VotingSessionInner {
         use zcash_voting::{
             delegation_submission::{
                 DelegationOutcome, DelegationStatus, delegation_status_request,
-                parse_delegation_status,
+                legacy_delegation_status_request, parse_delegation_status,
             },
             platform::TransportError,
             vote_submission::{
@@ -535,7 +594,11 @@ impl VotingSessionInner {
                         proposal_id,
                         share_index,
                     } => !visited_helpers.contains(&(
-                        step.kind(),
+                        if matches!(step, NextStep::SubmitShares { .. }) {
+                            "submit_shares"
+                        } else {
+                            "confirm_share"
+                        },
                         *bundle_index,
                         *proposal_id,
                         *share_index,
@@ -548,18 +611,33 @@ impl VotingSessionInner {
             };
             match step {
                 NextStep::Delegate { .. } => return self.delegation_progress(id, now()?),
-                NextStep::PollDelegation { bundle_index } => {
+                NextStep::AdvanceDelegation { bundle_index }
+                | NextStep::AdvanceImportedDelegation { bundle_index } => {
                     let attempt = self
                         .db
                         .delegation_submission(id, bundle_index)
-                        .map_err(conflict)?
-                        .ok_or_else(|| conflict(()))?;
+                        .map_err(conflict)?;
+                    let legacy_hash = if attempt.is_none()
+                        && matches!(step, NextStep::AdvanceDelegation { .. })
+                    {
+                        self.db
+                            .get_delegation_tx_hash(id, bundle_index)
+                            .map_err(conflict)?
+                    } else {
+                        None
+                    };
                     let mut confirmed = false;
                     for base in &round.vote_server_urls {
-                        let response = match transport
-                            .execute(delegation_status_request(base, &attempt.canonical))
-                            .await
-                        {
+                        let request = if let Some(attempt) = &attempt {
+                            delegation_status_request(base, &attempt.canonical)
+                        } else {
+                            legacy_delegation_status_request(
+                                base,
+                                legacy_hash.as_deref().ok_or_else(|| conflict(()))?,
+                            )
+                            .map_err(conflict)?
+                        };
+                        let response = match transport.execute(request).await {
                             Ok(response) => response,
                             Err(TransportError::Definite) => continue,
                             Err(_) => return Err(conflict(())),
@@ -567,29 +645,42 @@ impl VotingSessionInner {
                         match parse_delegation_status(response).map_err(conflict)? {
                             DelegationStatus::Pending => continue,
                             DelegationStatus::Rejected => {
-                                self.db
-                                    .record_delegation_outcome(
-                                        id,
-                                        bundle_index,
-                                        DelegationOutcome::Rejected,
-                                    )
-                                    .map_err(conflict)?;
-                                checkpoint().await.map_err(|_| {
-                                    VotingApiError::new(VotingErrorCode::SubmissionUnknown)
-                                })?;
+                                if attempt.is_some() {
+                                    self.db
+                                        .record_delegation_outcome(
+                                            id,
+                                            bundle_index,
+                                            DelegationOutcome::Rejected,
+                                        )
+                                        .map_err(conflict)?;
+                                    checkpoint().await.map_err(|_| {
+                                        VotingApiError::new(VotingErrorCode::SubmissionUnknown)
+                                    })?;
+                                }
                                 return Err(VotingApiError::new(
                                     VotingErrorCode::SubmissionRejected,
                                 ));
                             }
                             DelegationStatus::Confirmed(events) => {
-                                self.db
-                                    .confirm_journaled_delegation(
-                                        id,
-                                        bundle_index,
-                                        attempt.canonical.tx_hash(),
-                                        &events,
-                                    )
-                                    .map_err(conflict)?;
+                                if let Some(attempt) = &attempt {
+                                    self.db
+                                        .confirm_journaled_delegation(
+                                            id,
+                                            bundle_index,
+                                            attempt.canonical.tx_hash(),
+                                            &events,
+                                        )
+                                        .map_err(conflict)?;
+                                } else {
+                                    self.db
+                                        .confirm_legacy_delegation(
+                                            id,
+                                            bundle_index,
+                                            legacy_hash.as_deref().ok_or_else(|| conflict(()))?,
+                                            &events,
+                                        )
+                                        .map_err(conflict)?;
+                                }
                                 checkpoint().await.map_err(|_| {
                                     VotingApiError::new(VotingErrorCode::SubmissionUnknown)
                                 })?;
@@ -655,7 +746,12 @@ impl VotingSessionInner {
                         })
                     };
                     let fleet = round.helper_urls();
-                    visited_helpers.insert((step.kind(), bundle_index, proposal_id, share_index));
+                    visited_helpers.insert((
+                        browser_step_kind(&self.db, id, &step)?,
+                        bundle_index,
+                        proposal_id,
+                        share_index,
+                    ));
                     if matches!(step, NextStep::SubmitShares { .. }) {
                         let committed = zcash_voting::vote::CommittedVote::recover(
                             &self.db,
@@ -788,11 +884,11 @@ impl VotingSessionInner {
                         .await
                         .map_err(|_| VotingApiError::new(VotingErrorCode::PersistenceFailed))?;
                 }
-                NextStep::SubmitVote {
+                NextStep::AdvanceVote {
                     bundle_index,
                     proposal_id,
                 }
-                | NextStep::SubmitVoteBatch {
+                | NextStep::AdvanceVoteBatch {
                     bundle_index,
                     proposal_id,
                 } => {
@@ -802,16 +898,18 @@ impl VotingSessionInner {
                         .map_err(conflict)?;
                     if attempt.is_none() {
                         let canonical = match step {
-                            NextStep::SubmitVote { .. } => CanonicalVoteSubmission::from_singleton(
-                                &zcash_voting::vote::submission(
-                                    &self.db,
-                                    id,
-                                    bundle_index,
-                                    proposal_id,
+                            NextStep::AdvanceVote { .. } => {
+                                CanonicalVoteSubmission::from_singleton(
+                                    &zcash_voting::vote::submission(
+                                        &self.db,
+                                        id,
+                                        bundle_index,
+                                        proposal_id,
+                                    )
+                                    .map_err(conflict)?,
                                 )
-                                .map_err(conflict)?,
-                            )
-                            .map_err(conflict)?,
+                                .map_err(conflict)?
+                            }
                             _ => CanonicalVoteSubmission::from_batch(
                                 &zcash_voting::vote::recover_atomic_vote_batch(
                                     &self.db,
@@ -823,9 +921,15 @@ impl VotingSessionInner {
                             )
                             .map_err(conflict)?,
                         };
-                        self.db
-                            .prepare_vote_submission(id, bundle_index, &canonical)
-                            .map_err(conflict)?;
+                        if !self
+                            .db
+                            .adopt_legacy_vote_submission(id, bundle_index, &canonical)
+                            .map_err(conflict)?
+                        {
+                            self.db
+                                .prepare_vote_submission(id, bundle_index, &canonical)
+                                .map_err(conflict)?;
+                        }
                         checkpoint()
                             .await
                             .map_err(|_| VotingApiError::new(VotingErrorCode::PersistenceFailed))?;
@@ -835,51 +939,40 @@ impl VotingSessionInner {
                             .map_err(conflict)?;
                     }
                     let attempt = attempt.ok_or_else(|| conflict(()))?;
-                    if attempt.outcome != VoteSubmissionOutcome::Prepared {
-                        continue;
-                    }
-                    self.db
-                        .mark_vote_dispatching(id, bundle_index, proposal_id)
-                        .map_err(conflict)?;
-                    checkpoint()
-                        .await
-                        .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
-                    self.validate_delegation_round(id, &round, now()?)?;
-                    let outcome = transport
-                        .execute(vote_request(
-                            round.vote_server_urls.first().ok_or_else(|| conflict(()))?,
-                            &attempt.canonical,
-                        ))
-                        .await
-                        .and_then(|response| parse_vote_result(response, &attempt.canonical));
-                    let recorded = match outcome {
-                        Ok(outcome) => outcome,
-                        Err(TransportError::Definite) => VoteSubmissionOutcome::Rejected,
-                        Err(_) => VoteSubmissionOutcome::Ambiguous,
-                    };
-                    self.db
-                        .record_vote_outcome(id, bundle_index, proposal_id, recorded)
-                        .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
-                    checkpoint()
-                        .await
-                        .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
-                    if recorded == VoteSubmissionOutcome::Rejected {
+                    if attempt.outcome == VoteSubmissionOutcome::Rejected {
                         return Err(VotingApiError::new(VotingErrorCode::SubmissionRejected));
                     }
-                }
-                NextStep::PollVote {
-                    bundle_index,
-                    proposal_id,
-                }
-                | NextStep::PollVoteBatch {
-                    bundle_index,
-                    proposal_id,
-                } => {
-                    let attempt = self
-                        .db
-                        .vote_submission(id, bundle_index, proposal_id)
-                        .map_err(conflict)?
-                        .ok_or_else(|| conflict(()))?;
+                    if attempt.outcome == VoteSubmissionOutcome::Prepared {
+                        self.db
+                            .mark_vote_dispatching(id, bundle_index, proposal_id)
+                            .map_err(conflict)?;
+                        checkpoint()
+                            .await
+                            .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
+                        self.validate_delegation_round(id, &round, now()?)?;
+                        let outcome = transport
+                            .execute(vote_request(
+                                round.vote_server_urls.first().ok_or_else(|| conflict(()))?,
+                                &attempt.canonical,
+                            ))
+                            .await
+                            .and_then(|response| parse_vote_result(response, &attempt.canonical));
+                        let recorded = match outcome {
+                            Ok(outcome) => outcome,
+                            Err(TransportError::Definite) => VoteSubmissionOutcome::Rejected,
+                            Err(_) => VoteSubmissionOutcome::Ambiguous,
+                        };
+                        self.db
+                            .record_vote_outcome(id, bundle_index, proposal_id, recorded)
+                            .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
+                        checkpoint()
+                            .await
+                            .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
+                        if recorded == VoteSubmissionOutcome::Rejected {
+                            return Err(VotingApiError::new(VotingErrorCode::SubmissionRejected));
+                        }
+                        continue;
+                    }
                     let mut confirmed = false;
                     for base in &round.vote_server_urls {
                         let response = match transport
@@ -1115,17 +1208,18 @@ impl VotingSessionInner {
         if super::network::VotingNetwork::for_wallet(self.wallet.network) != self.network
             || db.params().network_type() != self.network.network().network_type()
             || *derivation.seed_fingerprint() != fingerprint
-            || ufvk.encode(&self.wallet.network)
+            || ufvk.encode(&self.wallet.network).map_err(conflict)?
                 != usk
                     .to_unified_full_viewing_key()
                     .encode(&self.wallet.network)
+                    .map_err(conflict)?
         {
             return Err(conflict(()));
         }
         let mut digest = Sha256::new();
         digest.update(b"zcash-wallet-wasm/voting-wallet-id/v1");
         digest.update(self.network.label().as_bytes());
-        let encoding = SecretString::new(ufvk.encode(&self.wallet.network));
+        let encoding = SecretString::new(ufvk.encode(&self.wallet.network).map_err(conflict)?);
         digest.update(encoding.expose_secret().as_bytes());
         if hex::encode(digest.finalize()) != self.wallet_id {
             return Err(conflict(()));
@@ -1162,7 +1256,7 @@ impl VotingSessionInner {
                 .ufvk()
                 .filter(|key| key.orchard().is_some())
                 .ok_or_else(|| VotingApiError::new(VotingErrorCode::NotEligible))?;
-            let encoding = SecretString::new(ufvk.encode(&wallet.network));
+            let encoding = SecretString::new(ufvk.encode(&wallet.network).map_err(conflict)?);
             let mut digest = Sha256::new();
             digest.update(b"zcash-wallet-wasm/voting-wallet-id/v1");
             digest.update(network.label().as_bytes());
@@ -1442,16 +1536,14 @@ impl VotingSessionInner {
                     .iter()
                     .filter(|step| matches!(step, NextStep::SubmitShares { .. }))
                     .count() as u32;
-            status.next_action = plan
-                .next_steps
-                .first()
-                .map(|s| s.kind())
-                .unwrap_or(if plan.needs_draft_setup {
-                    "submit_ballot"
-                } else {
-                    plan.primary_action.as_str()
-                })
-                .into();
+            status.next_action = if let Some(step) = plan.next_steps.first() {
+                browser_step_kind(&self.db, &id, step)?
+            } else if plan.needs_draft_setup {
+                "submit_ballot"
+            } else {
+                browser_round_action(plan.primary_action)?
+            }
+            .into();
             status.phase = if !roster.is_empty() && plan.all_decided && !plan.pending_recovery {
                 VotingRoundPhase::SharesConfirmed
             } else if status.total_bundles == 0 {
@@ -2092,7 +2184,7 @@ mod tests {
             );
             let sql = match phase {
                 DelegationPhase::Prepared => {
-                    "UPDATE proofs SET success=0 WHERE bundle_index=1; UPDATE bundles SET pczt_sighash=NULL,rk=NULL,tx1_effects=NULL WHERE bundle_index=1"
+                    "UPDATE proofs SET success=0 WHERE bundle_index=1; UPDATE bundles SET pczt_sighash=NULL,rk=NULL,tx1_effects=NULL,delegation_pczt=NULL WHERE bundle_index=1"
                 }
                 DelegationPhase::PcztBuilt => "UPDATE proofs SET success=0 WHERE bundle_index=1",
                 _ => "SELECT 1",
@@ -3047,7 +3139,7 @@ mod tests {
         (
             crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap(),
             id,
-            encoding,
+            encoding.unwrap(),
         )
     }
     fn open(

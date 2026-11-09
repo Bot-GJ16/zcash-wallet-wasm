@@ -1283,6 +1283,38 @@ CREATE TABLE nullifier_map (
 pub(super) const INDEX_NF_MAP_LOCATOR_IDX: &str =
     r#"CREATE INDEX nf_map_locator_idx ON nullifier_map(block_height, tx_index)"#;
 
+/// A map from spent transparent outpoints to the transaction that spent them.
+///
+/// This is the transparent counterpart of [`TABLE_NULLIFIER_MAP`], and exists for the same
+/// reason: an outpoint observed being spent while scanning a range `Y..Z` may spend an output
+/// the wallet has not yet discovered, and the spend must be recoverable once it is.
+///
+/// It is distinct from [`TABLE_TRANSPARENT_SPEND_MAP`], which records the same relation for a
+/// spending transaction the wallet stores. Block scanning observes spending transactions with
+/// no wallet involvement, for which no [`TABLE_TRANSACTIONS`] row exists or should be created,
+/// so the spending transaction is identified by its locator in [`TABLE_TX_LOCATOR_MAP`].
+///
+/// The `prevout_uniq` constraint holds because an outpoint can be spent at most once on a given
+/// chain; a competing spend belongs to a fork, and the entry for it is removed with the locator
+/// when the reorg is processed.
+pub(super) const TABLE_TRANSPARENT_SPEND_LOCATOR_MAP: &str = r#"
+CREATE TABLE transparent_spend_locator_map (
+    prevout_txid BLOB NOT NULL,
+    prevout_output_index INTEGER NOT NULL,
+    block_height INTEGER NOT NULL,
+    tx_index INTEGER NOT NULL,
+    CONSTRAINT tx_locator
+        FOREIGN KEY (block_height, tx_index)
+        REFERENCES tx_locator_map(block_height, tx_index)
+        ON DELETE CASCADE
+        ON UPDATE RESTRICT,
+    CONSTRAINT prevout_uniq UNIQUE (prevout_txid, prevout_output_index)
+)"#;
+pub(super) const INDEX_TRANSPARENT_SPEND_LOCATOR_IDX: &str = r#"CREATE INDEX transparent_spend_locator_idx ON transparent_spend_locator_map (
+    block_height,
+    tx_index
+)"#;
+
 //
 // Internal tables
 //
@@ -1692,7 +1724,8 @@ GROUP BY notes.account_id, notes.transaction_id
 ///   or `NULL` for wallet-internal outputs.
 /// - `diversifier_index_be`: The big-endian representation of the diversifier index (or, for
 ///   transparent addresses, the BIP 44 change-level index of the derivation path) of the receiving
-///   address. This will be `NULL` for outgoing transaction outputs.
+///   address. This will be `NULL` for outputs that were not received at one of the wallet's
+///   diversified addresses (in particular, for outputs sent to external recipients).
 /// - `value`: The value of the output, in zatoshis.
 /// - `is_change`: `0` for outgoing outputs and outputs received at external-facing addresses, `1`
 ///   for outputs received at wallet-internal addresses. This represents a best-effort judgement
@@ -1780,6 +1813,7 @@ SELECT
         MAX(CASE WHEN is_sent_row THEN to_address END),
         MAX(CASE WHEN NOT is_sent_row THEN to_address END)
     )                           AS to_address,
+    MAX(diversifier_index_be)   AS diversifier_index_be,
     MAX(value)                  AS value,
     MAX(is_change)              AS is_change,
     MAX(memo)                   AS memo,

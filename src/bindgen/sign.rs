@@ -130,8 +130,13 @@ fn pczt_sign_owned(
     let pczt = {
         use pczt::roles::updater::Updater;
 
-        let external_proof_gen_key = usk.sapling().expsk.proof_generation_key();
-        let internal_proof_gen_key = usk.sapling().derive_internal().expsk.proof_generation_key();
+        let external_proof_gen_key = usk.sapling().expsk().proof_generation_key();
+        let internal_proof_gen_key = usk
+            .sapling()
+            .derive_internal()
+            .ok_or_else(|| Error::PcztSign("Failed to derive internal Sapling key".into()))?
+            .expsk()
+            .proof_generation_key();
 
         let external_vk = external_proof_gen_key.to_viewing_key();
         let internal_vk = internal_proof_gen_key.to_viewing_key();
@@ -195,6 +200,7 @@ fn pczt_sign_owned(
             KeyRef::Orchard { index } => {
                 signer
                     .sign_orchard(
+                        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
                         index,
                         &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
                     )
@@ -205,6 +211,7 @@ fn pczt_sign_owned(
             KeyRef::Ironwood { index } => {
                 signer
                     .sign_ironwood(
+                        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
                         index,
                         &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
                     )
@@ -214,7 +221,11 @@ fn pczt_sign_owned(
             }
             KeyRef::Sapling { index } => {
                 signer
-                    .sign_sapling(index, &usk.sapling().expsk.ask)
+                    .sign_sapling(
+                        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
+                        index,
+                        usk.sapling().expsk().ask(),
+                    )
                     .map_err(|e| {
                         Error::PcztSign(format!("Failed to sign Sapling spend {index}: {e:?}"))
                     })?;
@@ -350,7 +361,7 @@ pub fn sign_message_with_transparent(
     address_index: Option<u32>,
 ) -> Result<wasm_bindgen::JsValue, Error> {
     use bitcoin_hashes::{Hash, sha256d};
-    use secp256k1::{Message as Secp256k1Message, Secp256k1, SecretKey};
+    use secp256k1::{Message as Secp256k1Message, Secp256k1};
     use serde::{Deserialize, Serialize};
     use transparent::keys::{IncomingViewingKey, NonHardenedChildIndex};
     use zcash_client_backend::encoding::AddressCodec;
@@ -396,14 +407,10 @@ pub fn sign_message_with_transparent(
         .derive_external_secret_key(address_index)
         .map_err(|e| Error::Generic(format!("Failed to derive private key: {e:?}")))?;
 
-    // Convert to secp256k1 SecretKey
-    let secret_key = SecretKey::from_slice(privkey.as_ref())
-        .map_err(|e| Error::Generic(format!("Invalid private key: {e}")))?;
-
     let secp = Secp256k1::new();
 
     // Get the uncompressed public key (65 bytes: 04 + x + y)
-    let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let public_key = privkey.public_key();
     let pubkey_uncompressed = public_key.serialize_uncompressed();
     let pubkey_hex = hex::encode(pubkey_uncompressed);
 
@@ -418,17 +425,16 @@ pub fn sign_message_with_transparent(
 
     // Double SHA256
     let hash = sha256d::Hash::hash(&msg_bytes);
-    let message_hash = Secp256k1Message::from_digest_slice(hash.as_ref())
-        .map_err(|e| Error::Generic(format!("Failed to create message: {e}")))?;
+    let message_hash = Secp256k1Message::from_digest(hash.to_byte_array());
 
     // Sign with recovery ID
-    let signature = secp.sign_ecdsa_recoverable(&message_hash, &secret_key);
+    let signature = secp.sign_ecdsa_recoverable(message_hash, &privkey);
     let (recovery_id, sig_bytes) = signature.serialize_compact();
 
     // For Zcash message signing:
     // - Uncompressed pubkey: recovery_id + 27 (range 27-30)
     // - Compressed pubkey: recovery_id + 31 (range 31-34)
-    let recovery_byte = 27 + recovery_id.to_i32() as u8;
+    let recovery_byte = 27 + recovery_id.to_u8();
 
     // Combine recovery_id + signature bytes (65 bytes total)
     let mut full_sig = Vec::with_capacity(65);
@@ -450,7 +456,7 @@ pub(crate) mod tests {
     use super::pczt_sign_inner;
     use crate::{Network, error::Error};
     use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer, updater::Updater};
-    use rand_core::OsRng;
+    use rand::{rand_core::UnwrapErr, rngs::SysRng};
     use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_primitives::transaction::{
         builder::{BuildConfig, Builder, PcztResult},
@@ -652,14 +658,14 @@ pub(crate) mod tests {
             ironwood_meta,
             ..
         } = builder
-            .build_for_pczt(OsRng, &zip317::FeeRule::standard())
+            .build_for_pczt(UnwrapErr(SysRng), &zip317::FeeRule::standard())
             .unwrap();
         let spend_index = match pool {
             OrchardPool::Orchard => orchard_meta.spend_action_index(0).unwrap(),
             OrchardPool::Ironwood => ironwood_meta.spend_action_index(0).unwrap(),
         };
         let pczt = IoFinalizer::new(Creator::build_from_parts(pczt_parts).unwrap())
-            .finalize_io()
+            .finalize_io(UnwrapErr(SysRng))
             .unwrap();
         let pczt = if include_derivation {
             let derivation = orchard::pczt::Zip32Derivation::parse(

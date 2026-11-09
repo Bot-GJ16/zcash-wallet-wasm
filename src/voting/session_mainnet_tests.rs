@@ -45,6 +45,75 @@ impl HttpTransport for DelegationChain {
 }
 
 #[tokio::test]
+async fn legacy_delegation_hash_without_a_journal_is_polled_without_reposting() {
+    use crate::voting::network::VotingNetwork;
+
+    let (initial, round) = BallotFixture::session_and_round(VotingNetwork::Testnet, false).await;
+    let envelope = VotingSessionEnvelope::encode(initial.network, &round.identity()).unwrap();
+    initial
+        .db
+        .init_round(
+            VotingNetwork::Testnet.network(),
+            &round.params,
+            Some(&envelope),
+        )
+        .unwrap();
+    let canonical = delegation_fixture::prepare_for_stored_network(&initial.db, &round.params, 17);
+    let old_bytes = delegation_fixture::corrupt(
+        &initial.db.serialize_bytes().unwrap(),
+        &format!(
+            "UPDATE bundles SET delegation_tx_hash='{0}';
+             INSERT INTO legacy_delegation_evidence
+             SELECT round_id,wallet_id,bundle_index,delegation_tx_hash FROM bundles",
+            canonical.tx_hash()
+        ),
+    );
+    let session = VotingSessionInner::open(
+        initial.wallet.clone(),
+        initial.account_id,
+        Some(&old_bytes),
+        Persistence::default(),
+    )
+    .unwrap();
+    session
+        .trusted_rounds
+        .borrow_mut()
+        .insert(ID.into(), round.clone());
+    let chain = DelegationChain {
+        canonical,
+        requests: Mutex::new(Vec::new()),
+    };
+    let durable = Arc::new(Mutex::new(old_bytes));
+    session
+        .submit_ballot_with(
+            ID,
+            None,
+            &chain,
+            || std::future::ready(Ok(round.clone())),
+            |_, _, _| async { panic!("legacy delegation must not build a vote") },
+            || async {
+                *durable.lock().unwrap() = session.db.serialize_bytes().unwrap();
+                Ok(())
+            },
+            || Ok(1500),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.db.load_van_position(ID, 0).unwrap(), 41);
+    session.validate_submission_state(ID).unwrap();
+    assert_eq!(
+        chain
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        vec!["GET"]
+    );
+}
+
+#[tokio::test]
 async fn mainnet_prepare_delegation_ballot_confirmation_and_reload_stay_bound() {
     use crate::voting::network::VotingNetwork;
 

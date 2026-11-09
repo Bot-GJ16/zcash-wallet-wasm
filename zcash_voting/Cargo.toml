@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "recovery-conformance",
+    "stage-bench",
     "zcash_voting",
     "vote-commitment-tree",
     "vote-commitment-tree-client",
@@ -16,14 +18,18 @@ resolver = "2"
 exclude = ["browser-deps/rusqlite", "browser-deps/pir-client"]
 
 [workspace.dependencies]
-voting-circuits = { version = "=0.12.1", default-features = false }
-voting-crypto-deps = { version = "=0.2.3", default-features = false }
-zcash_protocol = { version = "0.10.4" }
+voting-circuits = { version = "=0.14.0", default-features = false }
+voting-crypto-deps = { version = "=0.4.0", default-features = false }
+# Zakura 4.0 publishes protocol as `zakura-protocol` with lib name `zcash_protocol`.
+# Packages select one of these through the `zakura` / `lrz` features.
+zcash_protocol = { version = "=4.0.0", package = "zakura-protocol", default-features = false }
+lrz_zcash_protocol = { version = "0.11.0", package = "zcash_protocol" }
 
 [profile.test.package.imt-tree]
 opt-level = 3
 
 [patch.crates-io]
+voting-crypto-deps = { path = "browser-deps/voting-crypto-deps" }
 pczt = { path = "../librustzcash/pczt" }
 zcash_client_backend = { path = "../librustzcash/zcash_client_backend" }
 zcash_client_sqlite = { path = "../librustzcash/zcash_client_sqlite" }
@@ -37,3 +43,14 @@ opt-level = 3
 
 [profile.test.package.valar-spiral-rs]
 opt-level = 3
+
+# Debug info dominates link time across the ~900-test suite and is the main
+# reason `target/` grows without bound. Line tables preserve backtraces and
+# panic locations; full DWARF for third-party crates buys nothing locally.
+# CI achieves the same for one job via CARGO_PROFILE_TEST_DEBUG=0.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false

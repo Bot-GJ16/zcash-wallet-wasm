@@ -8,13 +8,7 @@
 pub(crate) use crate::backend::{orchard, pasta_curves};
 use serde::{Deserialize, Serialize};
 
-use std::{
-    collections::{BTreeSet, HashSet},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
-    },
-};
+use std::collections::{BTreeSet, HashSet};
 
 use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 
@@ -23,9 +17,14 @@ use crate::{
     types::{
         validate_proposal_id, validate_vote_decision, validate_vote_round_id_hex,
         CastVoteSignature, EncryptedShare, Network, ProgressReporter, SharePayload,
-        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare,
+        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare, MAX_PROPOSAL_ID,
     },
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+mod share_delivery;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use share_delivery::submit_confirmed_vote_shares;
 
 /// Number of siblings in a vote-authority-note witness.
 pub const VAN_AUTH_PATH_LEN: usize = 24;
@@ -34,9 +33,14 @@ pub const VAN_AUTH_PATH_LEN: usize = 24;
 pub const DEFAULT_BATCH_PROOF_CONCURRENCY: usize = 3;
 
 /// Protocol maximum for the number of actions in one atomic vote batch.
-pub const MAX_VOTE_BATCH_ACTIONS: usize = 15;
+pub const MAX_VOTE_BATCH_ACTIONS: usize = MAX_PROPOSAL_ID as usize;
+
+// Preserve the pre-50-action resource ceiling independently of the protocol
+// action limit. The default remains DEFAULT_BATCH_PROOF_CONCURRENCY.
+const MAX_BATCH_PROOF_CONCURRENCY: usize = 15;
 
 const VOTE_RECOVERY_FORMAT: &str = "zcash_voting_vote_recovery_v1";
+const DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT: &str = "zcash_voting_delegate_cast_recovery_v1";
 const VOTE_BATCH_RECOVERY_FORMAT: &str = "zcash_voting_vote_batch_recovery_v1";
 
 /// Wallet-supplied cast-vote intent for one proposal in one bundle.
@@ -230,6 +234,44 @@ pub struct SignedVoteBatch {
     pub batch_json: String,
 }
 
+impl SignedVoteBatch {
+    /// Builds the typed lifecycle request from the persisted authorization kind.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn advance_request(&self) -> Result<crate::ChainAdvanceRequest, VotingError> {
+        let first = self
+            .commitments
+            .first()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "empty signed batch".to_string(),
+            })?;
+        let recovery = parse_recovery(&first.commitment_bundle_json)?;
+        let combined = recovery
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.delegation_van.is_some());
+        let request = crate::AdvanceVoteBatch {
+            vote_round_id: array32(
+                "round id",
+                hex::decode(&first.vote_round_id).map_err(|error| VotingError::InvalidInput {
+                    message: error.to_string(),
+                })?,
+            )?,
+            bundle_index: self.bundle_index,
+            ordered_batch_digest: self.batch_digest,
+            ordered_proposal_ids: self
+                .commitments
+                .iter()
+                .map(|vote| vote.proposal_id)
+                .collect(),
+        };
+        Ok(if combined {
+            crate::ChainAdvanceRequest::DelegateAndVoteBatch(request)
+        } else {
+            crate::ChainAdvanceRequest::VoteBatch(request)
+        })
+    }
+}
+
 /// Unpersisted cast-vote work produced without holding the voting database lock.
 ///
 /// This is an opaque, process-local handoff between [`prepare_commit`] and
@@ -258,6 +300,7 @@ pub struct PreparedVoteCommitments {
 
 /// Unpersisted atomic cast-vote work for one delegation bundle.
 pub struct PreparedAtomicVoteBatch {
+    delegation: Option<crate::delegate_and_vote_batch::DelegationAuthorization>,
     wallet_id: String,
     round_id: String,
     bundle_index: u32,
@@ -293,8 +336,62 @@ impl CommittedVote {
         signer: VoteSigner<'_>,
         stages: &dyn crate::types::VoteCommitStageReporter,
     ) -> Result<Self, VotingError> {
-        crate::vote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
-        Self::recover(db, round_id, bundle_index, draft.proposal_id)
+        Self::observe_commit(
+            db,
+            round_id,
+            bundle_index,
+            draft,
+            witness,
+            signer,
+            stages,
+            &crate::ObservationScope::disabled(),
+        )
+    }
+
+    pub(crate) fn observe_commit(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        draft: &DraftVote,
+        witness: &VanWitness,
+        signer: VoteSigner<'_>,
+        stages: &dyn crate::types::VoteCommitStageReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<Self, VotingError> {
+        observations.bind_round_id(round_id);
+
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(bundle_index),
+            ..Default::default()
+        });
+        let stage = attributed.stage("vote.commit");
+        let observations = stage.scope();
+        let operation_result: Result<Self, VotingError> = (|| {
+            crate::vote::observe_commit(
+                db,
+                round_id,
+                bundle_index,
+                draft,
+                witness,
+                signer,
+                stages,
+                observations,
+            )?;
+            Self::observe_recover(db, round_id, bundle_index, draft.proposal_id, observations)
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Reconstructs a committed cast-vote handle from persisted recovery state.
@@ -304,14 +401,53 @@ impl CommittedVote {
         bundle_index: u32,
         proposal_id: u32,
     ) -> Result<Self, VotingError> {
-        let (commit, commitment_bundle_json) =
-            recover_commit_with_generation(db, round_id, bundle_index, proposal_id)?;
-        Ok(Self {
-            round_id: round_id.to_string(),
+        Self::observe_recover(
+            db,
+            round_id,
             bundle_index,
-            commitment_bundle_json,
-            commit,
-        })
+            proposal_id,
+            &crate::ObservationScope::disabled(),
+        )
+    }
+
+    pub(crate) fn observe_recover(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        observations: &crate::ObservationScope,
+    ) -> Result<Self, VotingError> {
+        observations.bind_round_id(round_id);
+
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(bundle_index),
+            proposal_id: Some(proposal_id),
+            ..Default::default()
+        });
+        let stage = attributed.stage("vote.recover");
+        let operation_result: Result<Self, VotingError> = (|| {
+            let (commit, commitment_bundle_json) =
+                recover_commit_with_generation(db, round_id, bundle_index, proposal_id)?;
+            Ok(Self {
+                round_id: round_id.to_string(),
+                bundle_index,
+                commitment_bundle_json,
+                commit,
+            })
+        })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
     }
 
     /// Returns the round identifier for this committed vote.
@@ -357,15 +493,88 @@ impl CommittedVote {
         db: &VotingDb,
         params: crate::share_tracking::ShareDeliveryPlanningParams<'_>,
     ) -> Result<crate::share_tracking::ShareDeliveryPlan, VotingError> {
-        crate::share_tracking::prepare_share_delivery_plan(
+        self.observe_prepare_share_delivery(db, params, &crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_prepare_share_delivery(
+        &self,
+        db: &VotingDb,
+        params: crate::share_tracking::ShareDeliveryPlanningParams<'_>,
+        observations: &crate::ObservationScope,
+    ) -> Result<crate::share_tracking::ShareDeliveryPlan, VotingError> {
+        observations.bind_round_id(&self.round_id);
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.bundle_index),
+            proposal_id: Some(self.commit.proposal_id),
+            ..Default::default()
+        });
+        let stage = attributed.stage("vote.prepare_share_delivery");
+        let operation_result: Result<crate::share_tracking::ShareDeliveryPlan, VotingError> =
+            (|| {
+                crate::share_tracking::prepare_share_delivery_plan(
+                    db,
+                    &self.round_id,
+                    self.bundle_index,
+                    self.commit.proposal_id,
+                    &self.commitment_bundle_json,
+                    &self.commit.share_payloads,
+                    params,
+                )
+            })();
+        let outcome = if operation_result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
+    }
+
+    /// Returns the confirmed form of this vote, if its chain confirmation is
+    /// durable for this exact commitment generation.
+    ///
+    /// Helper-share submission needs the vote's commitment-tree position, so
+    /// it is only offered on [`ConfirmedVote`]. A vote whose confirmation is
+    /// still pending returns `None`; recover it again after the next chain
+    /// advancement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the durable commitment
+    /// changed since this handle was recovered, and an internal error when the
+    /// recovery material is missing.
+    pub fn confirmed(self, db: &VotingDb) -> Result<Option<ConfirmedVote>, VotingError> {
+        let scope = crate::share::ShareOperationScope::capture(db);
+        let recovery = crate::recovery::helper_recovery_material_for_wallet(
             db,
+            scope.wallet_id(),
             &self.round_id,
             self.bundle_index,
             self.commit.proposal_id,
-            &self.commitment_bundle_json,
-            &self.commit.share_payloads,
-            params,
-        )
+        )?;
+        match recovery {
+            crate::recovery::HelperRecoveryMaterial::Ready(bundle)
+                if bundle.commitment_bundle_json == self.commitment_bundle_json =>
+            {
+                Ok(Some(ConfirmedVote {
+                    vote: self,
+                    vc_tree_position: bundle.vc_tree_position,
+                }))
+            }
+            crate::recovery::HelperRecoveryMaterial::Ready(_) => Err(VotingError::InvalidInput {
+                message: "committed vote changed after it was recovered".to_string(),
+            }),
+            crate::recovery::HelperRecoveryMaterial::AwaitingVcPosition => Ok(None),
+            crate::recovery::HelperRecoveryMaterial::Missing => Err(VotingError::Internal {
+                message: "committed vote is missing durable helper recovery material".to_string(),
+            }),
+        }
     }
 
     /// Submits every incomplete helper share from the persisted complete plan.
@@ -378,6 +587,7 @@ impl CommittedVote {
     /// This handle must match the exact durable recovery snapshot; recover a
     /// fresh `CommittedVote` after confirmation synchronizes a pre-confirmation
     /// plan to its confirmed VC tree position.
+    #[cfg(not(target_arch = "wasm32"))]
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn submit_prepared_shares(
         &self,
@@ -563,6 +773,31 @@ impl CommittedVote {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn submit_prepared_shares_unchecked(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<
+        crate::share_tracking::ShareBatchDeliveryReport,
+        crate::share_tracking::ShareDeliveryFailure,
+    > {
+        share_delivery::submit_votes(
+            std::iter::once(self),
+            db,
+            client,
+            params,
+            cancel,
+            &mut |_, _| {},
+        )
+        .await
+        .pop()
+        .expect("one vote produces one delivery result")
+        .delivery
+    }
+
     /// Submits one committed helper share using crate-owned durable journaling.
     ///
     /// The request selects only a share index and a planner-produced placement
@@ -624,16 +859,6 @@ impl CommittedVote {
         .await
     }
 
-    /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
-    pub fn submission(&self, db: &VotingDb) -> Result<VoteSubmission, VotingError> {
-        submission(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-        )
-    }
-
     /// Serializes the persisted recovery bundle for this committed vote.
     pub fn recovery_json(&self, db: &VotingDb) -> Result<String, VotingError> {
         let bundle = recovery_bundle(
@@ -667,32 +892,6 @@ impl CommittedVote {
         })?;
         signed_commitment_from_parts(&self.commit, &recovery)
     }
-
-    /// Records the cast-vote transaction hash for this vote.
-    pub fn record_submission(&self, db: &VotingDb, tx_hash: &str) -> Result<(), VotingError> {
-        record_submission(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            tx_hash,
-        )
-    }
-
-    /// Records the confirmed vote-commitment tree position for this vote.
-    pub fn record_vc_position(
-        &self,
-        db: &VotingDb,
-        vc_tree_position: u64,
-    ) -> Result<(), VotingError> {
-        record_vc_position(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            vc_tree_position,
-        )
-    }
 }
 
 fn signed_commitment_from_parts(
@@ -717,6 +916,15 @@ fn signed_commitment_from_parts(
     })
 }
 
+/// Encodes the chain-visible vote request stored in a recovery bundle.
+///
+/// Helper-share recovery material and confirmation positions are not exposed.
+pub(crate) fn wire_submission_from_recovery(
+    recovery: &VoteRecoveryBundle,
+) -> Result<crate::wire::VoteCommitmentWire, VotingError> {
+    crate::wire::VoteCommitmentWire::try_from(&submission_from_recovery(recovery))
+}
+
 /// Inputs for the historical batch-named singleton preparation API.
 ///
 /// `drafts` must contain exactly one item. Use [`AtomicVoteBatch`] for multiple
@@ -727,6 +935,398 @@ pub struct VoteCommitBatch<'a> {
     pub drafts: &'a [DraftVote],
     pub witness: &'a VanWitness,
     pub stages: &'a dyn crate::types::VoteCommitStageReporter,
+}
+
+/// A committed vote whose chain confirmation is durable.
+///
+/// Only a confirmed vote can submit helper shares, because the share payloads
+/// carry the vote's commitment-tree position. The type has no public
+/// constructor: it comes from [`CommittedVote::confirmed`], which reads the
+/// durable confirmation, so a host cannot submit shares for a vote the chain
+/// has not confirmed.
+///
+/// ```compile_fail
+/// # async fn demo(vote: zcash_voting::vote::CommittedVote, db: &zcash_voting::round::VotingDb,
+/// #   client: &zcash_voting::HelperClient,
+/// #   params: zcash_voting::share_tracking::ShareDeliverySubmissionParams<'_>) {
+/// let _ = vote.submit_prepared_shares(db, client, params, &|| false).await;
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct ConfirmedVote {
+    vote: CommittedVote,
+    vc_tree_position: u64,
+}
+
+impl ConfirmedVote {
+    /// The underlying committed vote.
+    pub fn vote(&self) -> &CommittedVote {
+        &self.vote
+    }
+
+    /// Durable commitment-tree position of the confirmed vote.
+    pub fn vc_tree_position(&self) -> u64 {
+        self.vc_tree_position
+    }
+
+    /// Submits the vote's helper shares from its persisted complete plan.
+    ///
+    /// Call [`CommittedVote::prepare_share_delivery`] before the chain
+    /// broadcast so the plan is durable first; this method loads that plan,
+    /// limits delivery to `configured_server_urls`, journals every attempt,
+    /// and resumes only the remaining definite-delivery deficits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn submit_prepared_shares(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> {
+        self.observe_submit_prepared_shares(db, client, params, cancel)
+            .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn observe_submit_prepared_shares(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> {
+        let observations = client.observation_scope();
+        observations.bind_round_id(&self.vote.round_id);
+        let observations = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(self.vote.bundle_index),
+            proposal_id: Some(self.vote.commit.proposal_id),
+            ..Default::default()
+        });
+        let stage = observations.stage("helper::submit_prepared_shares");
+        let observed_client = client.observing(stage.scope());
+        let client = &observed_client;
+        let operation_result: Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> =
+            async {
+                self.submit_prepared_shares_keeping_partial_report(db, client, params, cancel)
+                    .await
+                    .map_err(|failure| failure.error)
+            }
+            .await;
+        let outcome = crate::observability::share_delivery_outcome(&operation_result);
+        stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    ///
+    /// Diagnostics report success once every share has a definite acceptance,
+    /// pending while shares are unprocessed or only ambiguously delivered, and
+    /// failure when a processed share has neither accepted nor ambiguous helpers.
+    /// Errors and cancellation take precedence. The domain result is unchanged:
+    /// an unsuccessful delivery pass can still return `Ok(report)`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn submit_prepared_shares_with_report(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError>>
+    {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let observed_client = client.observing(invocation.scope());
+        let operation_result = self
+            .observe_submit_prepared_shares(db, &observed_client, params, cancel)
+            .await;
+        let outcome = crate::observability::share_delivery_outcome(&operation_result);
+        invocation.complete("submit_prepared_shares", outcome, operation_result)
+    }
+
+    /// [`Self::submit_prepared_shares`] whose error keeps the report over
+    /// the shares that completed before the failure, for callers that must
+    /// surface every network effect of a failed pass.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn submit_prepared_shares_keeping_partial_report(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<
+        crate::share_tracking::ShareBatchDeliveryReport,
+        crate::share_tracking::ShareDeliveryFailure,
+    > {
+        self.vote
+            .submit_prepared_shares_unchecked(db, client, params, cancel)
+            .await
+    }
+}
+
+/// Recovered commitment for a vote, in whichever shape it was committed.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum VoteCommitmentRecovery {
+    /// A legacy singleton commitment submitted through the singleton endpoint.
+    Singleton(SignedVoteCommitments),
+    /// A member of an atomic batch; the whole batch is recovered.
+    AtomicBatch(SignedVoteBatch),
+}
+
+impl VoteCommitmentRecovery {
+    pub fn bundle_index(&self) -> u32 {
+        match self {
+            Self::Singleton(commitments) => commitments.bundle_index,
+            Self::AtomicBatch(batch) => batch.bundle_index,
+        }
+    }
+
+    /// Proposal ids in signed order.
+    pub fn proposal_ids(&self) -> Vec<u32> {
+        match self {
+            Self::Singleton(commitments) => commitments
+                .commitments
+                .iter()
+                .map(|commitment| commitment.proposal_id)
+                .collect(),
+            Self::AtomicBatch(batch) => batch
+                .commitments
+                .iter()
+                .map(|commitment| commitment.proposal_id)
+                .collect(),
+        }
+    }
+}
+
+/// Recovers a vote's durable commitment without the caller knowing whether it
+/// was committed alone or inside an atomic batch.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when no recovery bundle exists for
+/// the vote.
+pub fn recover_vote_commitment(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<VoteCommitmentRecovery, VotingError> {
+    observe_recover_vote_commitment(
+        db,
+        round_id,
+        bundle_index,
+        proposal_id,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_recover_vote_commitment(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    observations: &crate::ObservationScope,
+) -> Result<VoteCommitmentRecovery, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        proposal_id: Some(proposal_id),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("vote::recover_vote_commitment");
+    let observations = observation_stage.scope();
+    let operation_result: Result<VoteCommitmentRecovery, VotingError> = (|| {
+        let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        }
+    })?;
+        if requested.batch.is_some() {
+            observe_recover_atomic_vote_batch(db, round_id, bundle_index, proposal_id, observations)
+                .map(VoteCommitmentRecovery::AtomicBatch)
+        } else {
+            observe_recover_signed_commitments(
+                db,
+                round_id,
+                bundle_index,
+                proposal_id,
+                observations,
+            )
+            .map(VoteCommitmentRecovery::Singleton)
+        }
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Inputs for committing every draft of one bundle in one call.
+pub struct VoteWorkRequest<'a> {
+    pub round_id: &'a str,
+    pub bundle_index: u32,
+    /// One draft commits as a singleton; several commit as one atomic batch.
+    pub drafts: &'a [DraftVote],
+    pub witness: &'a VanWitness,
+    pub stages: &'a dyn crate::types::VoteCommitStageReporter,
+    /// Proof concurrency for an atomic batch; ignored for a singleton.
+    pub max_proof_concurrency: usize,
+}
+
+/// Proved but not yet persisted vote work from [`prepare_vote_work`].
+#[non_exhaustive]
+pub enum PreparedVoteWork {
+    Singleton(PreparedVoteCommitments),
+    AtomicBatch(PreparedAtomicVoteBatch),
+}
+
+/// Proves every draft for one bundle, choosing the singleton or atomic shape.
+///
+/// A single draft is committed through the legacy singleton path; two or more
+/// drafts become one atomic batch so the chain accepts or rejects them
+/// together. Proofs run on the calling thread.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] for an empty draft list or a zero
+/// concurrency, and otherwise whatever the underlying preparation returns.
+pub fn prepare_vote_work(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    request: VoteWorkRequest<'_>,
+) -> Result<PreparedVoteWork, VotingError> {
+    observe_prepare_vote_work(db, signer, request, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_prepare_vote_work(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    request: VoteWorkRequest<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedVoteWork, VotingError> {
+    observations.bind_round_id(request.round_id);
+    let attributed_observations = if request.drafts.len() > 1 {
+        observations.for_bundle(request.bundle_index)
+    } else {
+        observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(request.bundle_index),
+            ..Default::default()
+        })
+    };
+    let observation_stage = attributed_observations.stage("vote::prepare_vote_work");
+    let observations = observation_stage.scope();
+    let operation_result: Result<PreparedVoteWork, VotingError> = (|| {
+        if request.drafts.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "vote batch must contain at least one draft".to_string(),
+            });
+        }
+        if request.drafts.len() == 1 {
+            observe_prepare_commit_batch(
+                db,
+                signer,
+                VoteCommitBatch {
+                    round_id: request.round_id,
+                    bundle_index: request.bundle_index,
+                    drafts: request.drafts,
+                    witness: request.witness,
+                    stages: request.stages,
+                },
+                observations,
+            )
+            .map(PreparedVoteWork::Singleton)
+        } else {
+            let batch = AtomicVoteBatch::new(
+                request.round_id,
+                request.bundle_index,
+                request.drafts,
+                request.witness,
+                request.stages,
+            )
+            .with_max_proof_concurrency(request.max_proof_concurrency)?;
+            observe_prepare_atomic_vote_batch(db, signer, batch, observations)
+                .map(PreparedVoteWork::AtomicBatch)
+        }
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Persists prepared vote work under one write transaction.
+pub fn persist_prepared_vote_work(
+    db: &VotingDb,
+    prepared: PreparedVoteWork,
+) -> Result<VoteCommitmentRecovery, VotingError> {
+    observe_persist_prepared_vote_work(db, prepared, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_persist_prepared_vote_work(
+    db: &VotingDb,
+    prepared: PreparedVoteWork,
+    observations: &crate::ObservationScope,
+) -> Result<VoteCommitmentRecovery, VotingError> {
+    let attributed_observations = match &prepared {
+        PreparedVoteWork::AtomicBatch(batch) => {
+            observations.bind_round_id(&batch.round_id);
+            observations.for_bundle(batch.bundle_index)
+        }
+        PreparedVoteWork::Singleton(_) => observations.clone(),
+    };
+    crate::proving_runtime::check_interruption()?;
+    let observation_stage = attributed_observations.stage("vote::persist_prepared_vote_work");
+    let observations = observation_stage.scope();
+    let operation_result: Result<VoteCommitmentRecovery, VotingError> = (|| match prepared {
+        PreparedVoteWork::Singleton(prepared) => {
+            observe_persist_prepared_commit_batch(db, prepared, observations)
+                .map(VoteCommitmentRecovery::Singleton)
+        }
+        PreparedVoteWork::AtomicBatch(prepared) => {
+            observe_persist_prepared_atomic_vote_batch(db, prepared, observations)
+                .map(VoteCommitmentRecovery::AtomicBatch)
+        }
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Builds one signed singleton vote commitment under the historical batch name.
@@ -744,21 +1344,74 @@ pub fn commit_batch(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<SignedVoteCommitments, VotingError> {
-    validate_legacy_singleton_batch(drafts)?;
-    let bundle_count = db.get_bundle_count(round_id)?;
-    crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
-
-    let mut commitments = Vec::with_capacity(drafts.len());
-    for draft in drafts {
-        let committed =
-            CommittedVote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
-        commitments.push(committed.signed_commitment(db)?);
-    }
-
-    Ok(SignedVoteCommitments {
+    observe_commit_batch(
+        db,
+        round_id,
         bundle_index,
-        commitments,
-    })
+        drafts,
+        witness,
+        signer,
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_commit_batch(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    drafts: &[DraftVote],
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+    observations: &crate::ObservationScope,
+) -> Result<SignedVoteCommitments, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("vote::commit_batch");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SignedVoteCommitments, VotingError> = (|| {
+        validate_legacy_singleton_batch(drafts)?;
+        let bundle_count = db.get_bundle_count(round_id)?;
+        crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
+
+        let mut commitments = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let committed = CommittedVote::observe_commit(
+                db,
+                round_id,
+                bundle_index,
+                draft,
+                witness,
+                signer,
+                stages,
+                observations,
+            )?;
+            commitments.push(committed.signed_commitment(db)?);
+        }
+
+        Ok(SignedVoteCommitments {
+            bundle_index,
+            commitments,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Builds and signs one singleton commitment without holding SQLite during
@@ -771,27 +1424,55 @@ pub fn prepare_commit_batch(
     signer: VoteSigner<'_>,
     batch: VoteCommitBatch<'_>,
 ) -> Result<PreparedVoteCommitments, VotingError> {
-    validate_legacy_singleton_batch(batch.drafts)?;
-    let bundle_count = db.get_bundle_count(batch.round_id)?;
-    crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
+    observe_prepare_commit_batch(db, signer, batch, &crate::ObservationScope::disabled())
+}
 
-    let mut commitments = Vec::with_capacity(batch.drafts.len());
-    for draft in batch.drafts {
-        commitments.push(prepare_commit(
-            db,
-            batch.round_id,
-            batch.bundle_index,
-            draft,
-            batch.witness,
-            signer,
-            batch.stages,
-        )?);
-    }
+pub(crate) fn observe_prepare_commit_batch(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    batch: VoteCommitBatch<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedVoteCommitments, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("vote::prepare_commit_batch");
+    let observations = observation_stage.scope();
+    let operation_result: Result<PreparedVoteCommitments, VotingError> = (|| {
+        validate_legacy_singleton_batch(batch.drafts)?;
+        let bundle_count = db.get_bundle_count(batch.round_id)?;
+        crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
 
-    Ok(PreparedVoteCommitments {
-        bundle_index: batch.bundle_index,
-        commitments,
-    })
+        let mut commitments = Vec::with_capacity(batch.drafts.len());
+        for draft in batch.drafts {
+            commitments.push(observe_prepare_commit(
+                db,
+                batch.round_id,
+                batch.bundle_index,
+                draft,
+                batch.witness,
+                signer,
+                batch.stages,
+                observations,
+            )?);
+        }
+
+        Ok(PreparedVoteCommitments {
+            bundle_index: batch.bundle_index,
+            commitments,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Persists the one commitment prepared through [`prepare_commit_batch`].
@@ -799,16 +1480,42 @@ pub fn persist_prepared_commit_batch(
     db: &VotingDb,
     prepared: PreparedVoteCommitments,
 ) -> Result<SignedVoteCommitments, VotingError> {
-    validate_legacy_singleton_batch_len(prepared.commitments.len())?;
-    let mut commitments = Vec::with_capacity(prepared.commitments.len());
-    for prepared_commit in prepared.commitments {
-        let committed = persist_prepared_commit(db, prepared_commit)?;
-        commitments.push(committed.signed_commitment(db)?);
-    }
-    Ok(SignedVoteCommitments {
-        bundle_index: prepared.bundle_index,
-        commitments,
-    })
+    observe_persist_prepared_commit_batch(db, prepared, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_persist_prepared_commit_batch(
+    db: &VotingDb,
+    prepared: PreparedVoteCommitments,
+    observations: &crate::ObservationScope,
+) -> Result<SignedVoteCommitments, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("vote::persist_prepared_commit_batch");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SignedVoteCommitments, VotingError> = (|| {
+        validate_legacy_singleton_batch_len(prepared.commitments.len())?;
+        let mut commitments = Vec::with_capacity(prepared.commitments.len());
+        for prepared_commit in prepared.commitments {
+            let committed = observe_persist_prepared_commit(db, prepared_commit, observations)?;
+            commitments.push(committed.signed_commitment(db)?);
+        }
+        Ok(SignedVoteCommitments {
+            bundle_index: prepared.bundle_index,
+            commitments,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Builds, signs, and persists one atomic vote batch with default proof
@@ -823,16 +1530,61 @@ pub fn commit_atomic_vote_batch(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<SignedVoteBatch, VotingError> {
-    let prepared = prepare_atomic_vote_batch(
+    observe_commit_atomic_vote_batch(
         db,
+        round_id,
+        bundle_index,
+        drafts,
+        witness,
         signer,
-        AtomicVoteBatch::new(round_id, bundle_index, drafts, witness, stages),
-    )?;
-    persist_prepared_atomic_vote_batch(db, prepared)
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_commit_atomic_vote_batch(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    drafts: &[DraftVote],
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+    observations: &crate::ObservationScope,
+) -> Result<SignedVoteBatch, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.for_bundle(bundle_index);
+    let observation_stage = attributed_observations.stage("vote::commit_atomic_vote_batch");
+    let observations = observation_stage.scope();
+    crate::proving_runtime::check_interruption()?;
+    let operation_result: Result<SignedVoteBatch, VotingError> = (|| {
+        let prepared = observe_prepare_atomic_vote_batch(
+            db,
+            signer,
+            AtomicVoteBatch::new(round_id, bundle_index, drafts, witness, stages),
+            observations,
+        )?;
+        observe_persist_prepared_atomic_vote_batch(db, prepared, observations)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Inputs for preparing one atomic vote batch.
 pub struct AtomicVoteBatch<'a> {
+    delegation: Option<crate::delegate_and_vote_batch::DelegationAuthorization>,
     round_id: &'a str,
     bundle_index: u32,
     drafts: &'a [DraftVote],
@@ -851,6 +1603,7 @@ impl<'a> AtomicVoteBatch<'a> {
         stages: &'a dyn crate::types::VoteCommitStageReporter,
     ) -> Self {
         Self {
+            delegation: None,
             round_id,
             bundle_index,
             drafts,
@@ -952,6 +1705,7 @@ impl VoteProofJob {
             self.captured.zkp2.proposal_authority,
             self.draft.single_share,
             &progress,
+            &crate::ObservationScope::disabled(),
         )?;
         let wire_shares = bundle
             .enc_shares
@@ -1076,6 +1830,7 @@ impl AtomicVoteProofJob {
                 stages,
                 self.legacy_proof_concurrency,
                 &proof_plans,
+                &crate::ObservationScope::disabled(),
             )?
         } else {
             build_batch_proofs_owned(
@@ -1085,6 +1840,7 @@ impl AtomicVoteProofJob {
                 &round_id_bytes,
                 stages,
                 &proof_plans,
+                &crate::ObservationScope::disabled(),
             )?
         };
         finish_atomic_vote_proof(
@@ -1161,6 +1917,7 @@ impl VotingDb {
                 witness,
                 network,
                 std::slice::from_ref(&captured),
+                None,
             )?;
         }
         Ok(VoteProofJob {
@@ -1293,6 +2050,7 @@ fn capture_atomic_vote_proof_job(
             batch.witness,
             network,
             &captured,
+            None,
         )?;
     }
     Ok(AtomicVoteProofJob {
@@ -1307,6 +2065,376 @@ fn capture_atomic_vote_proof_job(
         recovered,
         legacy_proof_concurrency: batch.max_proof_concurrency.min(MAX_VOTE_BATCH_ACTIONS),
     })
+}
+
+pub(crate) fn observe_prepare_atomic_vote_batch(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    batch: AtomicVoteBatch<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedAtomicVoteBatch, VotingError> {
+    observations.bind_round_id(batch.round_id);
+    let attributed_observations = observations.for_bundle(batch.bundle_index);
+    let observation_stage = attributed_observations.stage("vote::prepare_atomic_vote_batch");
+    let observations = observation_stage.scope();
+    let operation =
+        crate::proving_runtime::Operation::for_bundle(db, batch.round_id, batch.bundle_index);
+    let operation_result: Result<PreparedAtomicVoteBatch, VotingError> = operation.enter(|| {
+        validate_atomic_vote_batch(batch.drafts)?;
+        let bundle_count = db.get_bundle_count(batch.round_id)?;
+        crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
+        let (secret, network) = signer_secret_and_network(signer);
+        db.require_round_network(batch.round_id, network, "vote signer")?;
+        let wallet_id = db.wallet_id();
+
+        // Capture every proposal row under one read transaction. The proofs run
+        // after this transaction is released and persistence revalidates the same
+        // snapshots under one Immediate write transaction.
+        let (captured, recovered) = {
+            let mut conn = db.conn();
+            let tx = conn.transaction().map_err(|e| {
+                VotingError::from_sqlite("failed to begin vote batch preparation transaction", &e)
+            })?;
+            let mut recoveries = Vec::with_capacity(batch.drafts.len());
+            for draft in batch.drafts {
+                recoveries.push(recovery_bundle_with_conn(
+                    &tx,
+                    &wallet_id,
+                    batch.round_id,
+                    batch.bundle_index,
+                    draft.proposal_id,
+                )?);
+            }
+            let recovered_count = recoveries
+                .iter()
+                .filter(|recovery| recovery.is_some())
+                .count();
+            if recovered_count != 0 && recovered_count != recoveries.len() {
+                return Err(VotingError::InvalidInput {
+                message: "found a partial persisted vote batch; recover or clear the inconsistent local state before rebuilding".to_string(),
+            });
+            }
+            let proposal_ids = batch
+                .drafts
+                .iter()
+                .map(|draft| draft.proposal_id)
+                .collect::<Vec<_>>();
+            if recovered_count == 0 {
+                ensure_no_competing_pending_vote_chain_with_conn(
+                    &tx,
+                    &wallet_id,
+                    batch.round_id,
+                    batch.bundle_index,
+                    &proposal_ids,
+                )?;
+            }
+            let (captured, recovered) = if recovered_count == recoveries.len() {
+                let recovered = batch
+                    .drafts
+                    .iter()
+                    .zip(recoveries)
+                    .map(|(draft, recovery)| {
+                        let vote = crate::storage::queries::load_vote_row_state(
+                            &tx,
+                            batch.round_id,
+                            &wallet_id,
+                            batch.bundle_index,
+                            draft.proposal_id,
+                        )?
+                        .ok_or_else(|| {
+                            vote_not_found_error(
+                                batch.round_id,
+                                batch.bundle_index,
+                                draft.proposal_id,
+                            )
+                        })?;
+                        Ok((vote, recovery.expect("all recovery rows were counted")))
+                    })
+                    .collect::<Result<Vec<_>, VotingError>>()?;
+                (Vec::new(), Some(recovered))
+            } else {
+                let captured = batch
+                    .drafts
+                    .iter()
+                    .map(|draft| {
+                        crate::storage::queries::load_vote_preparation_state(
+                            &tx,
+                            batch.round_id,
+                            &wallet_id,
+                            batch.bundle_index,
+                            draft.proposal_id,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, VotingError>>()?;
+                (captured, None)
+            };
+            tx.commit().map_err(|e| {
+                VotingError::from_sqlite("failed to finish vote batch preparation transaction", &e)
+            })?;
+            (captured, recovered)
+        };
+
+        if let Some(recovered) = recovered {
+            return prepare_recovered_vote_batch(
+                &wallet_id,
+                batch.round_id,
+                batch.bundle_index,
+                batch.drafts,
+                recovered,
+            );
+        }
+
+        db.require_capability_delegations_confirmed(batch.round_id)?;
+        if let Some(authorization) = &batch.delegation {
+            authorization.validate_fresh(&db.conn())?;
+        } else if batch.witness.anchor_height == 0 {
+            return Err(VotingError::InvalidInput {
+                message: "standalone batches require a chain anchor".to_string(),
+            });
+        }
+        for draft in batch.drafts {
+            ensure_vote_rebuild_allowed(db, batch.round_id, batch.bundle_index, draft.proposal_id)?;
+        }
+        validate_captured_batch_state(
+            batch.round_id,
+            batch.bundle_index,
+            batch.drafts,
+            batch.witness,
+            network,
+            &captured,
+            batch
+                .delegation
+                .as_ref()
+                .map(|authorization| authorization.van),
+        )?;
+
+        let first_state = &captured[0];
+        let round_id_bytes =
+            hex::decode(&first_state.zkp2.voting_round_id).map_err(|e| VotingError::Internal {
+                message: format!(
+                    "invalid voting_round_id hex '{}': {e}",
+                    first_state.zkp2.voting_round_id
+                ),
+            })?;
+        let mut authority = first_state.zkp2.proposal_authority;
+        let mut proof_plans = Vec::with_capacity(batch.drafts.len());
+        for (index, (draft, state)) in batch.drafts.iter().zip(captured.iter()).enumerate() {
+            let transition = crate::zkp2::plan_vote_authority_transition(
+                secret,
+                network,
+                state.zkp2.address_index,
+                state.zkp2.total_note_value,
+                &state.zkp2.gov_comm_rand,
+                &round_id_bytes,
+                draft.proposal_id,
+                authority,
+            )?;
+            if index == 0
+                && batch.delegation.as_ref().is_some_and(|authorization| {
+                    authorization.van != transition.vote_authority_note_old
+                })
+            {
+                return Err(VotingError::InvalidInput {
+                    message: "initial cast VAN does not match the delegation".to_string(),
+                });
+            }
+            authority = transition.proposal_authority_new;
+            let (auth_path, position) = if index == 0 {
+                (batch.witness.auth_path_fixed()?, batch.witness.position)
+            } else {
+                (
+                    single_leaf_auth_path(transition.vote_authority_note_old)?,
+                    0,
+                )
+            };
+            proof_plans.push(BatchProofPlan {
+                draft: draft.clone(),
+                state: state.clone(),
+                auth_path,
+                position,
+                proposal_authority: transition.proposal_authority_old,
+                expected_new_van: transition.vote_authority_note_new,
+            });
+        }
+
+        let bundles = build_batch_proofs(
+            secret,
+            batch.bundle_index,
+            batch.witness.anchor_height,
+            &round_id_bytes,
+            batch.stages,
+            batch.max_proof_concurrency.min(MAX_BATCH_PROOF_CONCURRENCY),
+            &proof_plans,
+            observations,
+        )?;
+
+        crate::proving_runtime::check_interruption()?;
+        let sighash_actions = bundles
+            .iter()
+            .map(
+                |bundle| crate::vote_commitment::CastVoteBatchSighashAction {
+                    r_vpk: &bundle.r_vpk_bytes,
+                    van_nullifier: &bundle.van_nullifier,
+                    vote_authority_note_new: &bundle.vote_authority_note_new,
+                    vote_commitment: &bundle.vote_commitment,
+                    proposal_id: bundle.proposal_id,
+                },
+            )
+            .collect::<Vec<_>>();
+        let batch_digest = if let Some(authorization) = &batch.delegation {
+            crate::delegate_and_vote_batch::delegate_and_vote_batch_sighash(
+                authorization.identity.vote_round_id(),
+                &authorization.van,
+                &sighash_actions,
+            )?
+        } else {
+            crate::vote_commitment::cast_vote_batch_sighash(
+                batch.round_id,
+                batch.witness.anchor_height as u64,
+                &sighash_actions,
+            )?
+        };
+
+        let batch_size = u32::try_from(batch.drafts.len()).map_err(|_| VotingError::Internal {
+            message: "vote batch length does not fit in u32".to_string(),
+        })?;
+        let mut commitments = Vec::with_capacity(batch.drafts.len());
+        for (index, (plan, bundle)) in proof_plans.into_iter().zip(bundles).enumerate() {
+            let wire_shares = bundle
+                .enc_shares
+                .iter()
+                .map(WireEncryptedShare::from)
+                .collect::<Vec<_>>();
+            batch
+                .stages
+                .on_stage(VoteCommitStage::SharePayloadsBuilding {
+                    proposal_id: plan.draft.proposal_id,
+                    bundle_index: batch.bundle_index,
+                });
+            let share_payloads = db.build_share_payloads(
+                &wire_shares,
+                &bundle,
+                plan.draft.choice,
+                plan.draft.num_options,
+                plan.draft.vc_tree_position,
+                plan.draft.single_share,
+            )?;
+            batch.stages.on_stage(VoteCommitStage::Signing {
+                proposal_id: plan.draft.proposal_id,
+                bundle_index: batch.bundle_index,
+            });
+            crate::proving_runtime::check_interruption()?;
+            let signature = crate::vote_commitment::sign_cast_vote_digest(
+                secret,
+                network,
+                &batch_digest,
+                &bundle.alpha_v,
+            )?;
+            let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
+            let mut recovery = VoteRecoveryBundle::from_parts(
+                batch.bundle_index,
+                &plan.draft,
+                bundle,
+                vote_auth_sig,
+            )?;
+            recovery.batch = Some(VoteBatchRecovery {
+                delegation_van: batch
+                    .delegation
+                    .as_ref()
+                    .map(|authorization| authorization.van),
+                digest: batch_digest,
+                index: index as u32,
+                size: batch_size,
+            });
+            let commit = commit_from_recovery(&recovery)?;
+            commitments.push(PreparedVoteCommit {
+                wallet_id: wallet_id.clone(),
+                round_id: batch.round_id.to_string(),
+                bundle_index: batch.bundle_index,
+                draft: plan.draft,
+                recovery,
+                commit: VoteCommit {
+                    encrypted_shares: wire_shares,
+                    share_payloads,
+                    ..commit
+                },
+                captured_state: CapturedVoteState::Fresh(plan.state),
+            });
+        }
+
+        let batch_json = if let Some(authorization) = &batch.delegation {
+            crate::wire::DelegateAndVoteBatchWire {
+                delegation: authorization.submission.clone(),
+                batch: crate::wire::VoteCommitmentBatchWire {
+                    votes: commitments
+                        .iter()
+                        .map(|prepared| wire_submission_from_recovery(&prepared.recovery))
+                        .collect::<Result<_, _>>()?,
+                },
+            }
+            .to_json()?
+        } else {
+            canonical_batch_json(&commitments)?
+        };
+        Ok(PreparedAtomicVoteBatch {
+            delegation: batch.delegation,
+            wallet_id,
+            round_id: batch.round_id.to_string(),
+            bundle_index: batch.bundle_index,
+            commitments,
+            batch_digest,
+            batch_json,
+        })
+    });
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+pub(crate) fn prepare_delegate_and_vote_batch(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    request: crate::delegate_and_vote_batch::DelegateAndVoteBatchRequest<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedAtomicVoteBatch, VotingError> {
+    // Keep the authorization and every subsequent read on one wallet even if
+    // the host switches its active account while proofs are being prepared.
+    let db = db.scoped(&db.wallet_id())?;
+    let authorization = crate::delegate_and_vote_batch::DelegationAuthorization::capture(
+        &db.conn(),
+        &db.wallet_id(),
+        request.round_id,
+        request.bundle_index,
+        request.spend_auth_signature,
+    )?;
+    let witness = VanWitness {
+        auth_path: single_leaf_auth_path(authorization.van)?
+            .into_iter()
+            .map(|sibling| sibling.to_vec())
+            .collect(),
+        position: 0,
+        anchor_height: 0,
+    };
+    let mut batch = AtomicVoteBatch::new(
+        request.round_id,
+        request.bundle_index,
+        request.drafts,
+        &witness,
+        request.stages,
+    )
+    .with_max_proof_concurrency(request.max_proof_concurrency)?;
+    batch.delegation = Some(authorization);
+    observe_prepare_atomic_vote_batch(&db, signer, batch, observations)
 }
 
 fn finish_atomic_vote_proof(
@@ -1374,6 +2502,7 @@ fn finish_atomic_vote_proof(
         let mut recovery =
             VoteRecoveryBundle::from_parts(bundle_index, &plan.draft, bundle, vote_auth_sig)?;
         recovery.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest: batch_digest,
             index: index as u32,
             size: batch_size,
@@ -1396,6 +2525,7 @@ fn finish_atomic_vote_proof(
 
     let batch_json = canonical_batch_json(&commitments)?;
     Ok(PreparedAtomicVoteBatch {
+        delegation: None,
         wallet_id,
         round_id,
         bundle_index,
@@ -1412,6 +2542,7 @@ fn build_batch_proofs_owned(
     round_id_bytes: &[u8],
     stages: &dyn crate::types::VoteCommitStageReporter,
     plans: &[BatchProofPlan],
+    observations: &crate::ObservationScope,
 ) -> Result<Vec<VoteCommitmentBundle>, VotingError> {
     plans.iter().map(|plan| {
         stages.on_stage(VoteCommitStage::ProofStarting {
@@ -1426,6 +2557,7 @@ fn build_batch_proofs_owned(
             round_id_bytes, &plan.state.zkp2.ea_pk, plan.draft.proposal_id,
             plan.draft.choice, plan.draft.num_options, &plan.auth_path, plan.position,
             anchor_height, plan.proposal_authority, plan.draft.single_share, &progress,
+            observations,
         )?;
         if bundle.vote_authority_note_new != plan.expected_new_van {
             return Err(VotingError::Internal {
@@ -1454,7 +2586,34 @@ pub fn persist_prepared_atomic_vote_batch(
     db: &VotingDb,
     prepared: PreparedAtomicVoteBatch,
 ) -> Result<SignedVoteBatch, VotingError> {
-    persist_prepared_atomic_vote_batch_inner(db, prepared, || {})
+    observe_persist_prepared_atomic_vote_batch(db, prepared, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_persist_prepared_atomic_vote_batch(
+    db: &VotingDb,
+    prepared: PreparedAtomicVoteBatch,
+    observations: &crate::ObservationScope,
+) -> Result<SignedVoteBatch, VotingError> {
+    observations.bind_round_id(&prepared.round_id);
+    let attributed_observations = observations.for_bundle(prepared.bundle_index);
+    let observation_stage =
+        attributed_observations.stage("vote::persist_prepared_atomic_vote_batch");
+    crate::proving_runtime::check_interruption()?;
+    let operation_result: Result<SignedVoteBatch, VotingError> =
+        (|| persist_prepared_atomic_vote_batch_inner(db, prepared, || {}))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 fn persist_prepared_atomic_vote_batch_inner<F>(
@@ -1466,6 +2625,7 @@ where
     F: FnOnce(),
 {
     let PreparedAtomicVoteBatch {
+        delegation,
         wallet_id,
         round_id,
         bundle_index,
@@ -1482,11 +2642,14 @@ where
             message: "prepared vote batch contains mismatched storage identities".to_string(),
         });
     }
+    if let Some(authorization) = &delegation {
+        authorization.validate_scope(&wallet_id, &round_id, bundle_index)?;
+    }
     let commitments = prepared_commits
         .iter()
         .map(|prepared| signed_commitment_from_parts(&prepared.commit, &prepared.recovery))
         .collect::<Result<Vec<_>, _>>()?;
-    persist_prepared_commits(db, prepared_commits)?;
+    persist_prepared_commits(db, prepared_commits, delegation)?;
     after_persist();
     Ok(SignedVoteBatch {
         bundle_index,
@@ -1503,23 +2666,65 @@ pub fn recover_signed_commitments(
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<SignedVoteCommitments, VotingError> {
-    let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
+    observe_recover_signed_commitments(
+        db,
+        round_id,
+        bundle_index,
+        proposal_id,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_recover_signed_commitments(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    observations: &crate::ObservationScope,
+) -> Result<SignedVoteCommitments, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        proposal_id: Some(proposal_id),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("vote::recover_signed_commitments");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SignedVoteCommitments, VotingError> = (|| {
+        let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
         VotingError::InvalidInput {
             message: format!(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         }
     })?;
-    if requested.batch.is_some() {
-        return Err(VotingError::InvalidInput {
-            message: "vote belongs to an atomic batch; use recover_atomic_vote_batch".to_string(),
-        });
-    }
-    let committed = CommittedVote::recover(db, round_id, bundle_index, proposal_id)?;
-    Ok(SignedVoteCommitments {
-        bundle_index,
-        commitments: vec![committed.signed_commitment(db)?],
-    })
+        if requested.batch.is_some() {
+            return Err(VotingError::InvalidInput {
+                message: "vote belongs to an atomic batch; use recover_atomic_vote_batch"
+                    .to_string(),
+            });
+        }
+        let committed =
+            CommittedVote::observe_recover(db, round_id, bundle_index, proposal_id, observations)?;
+        Ok(SignedVoteCommitments {
+            bundle_index,
+            commitments: vec![committed.signed_commitment(db)?],
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Recovers the complete atomic batch containing `proposal_id`.
@@ -1529,48 +2734,100 @@ pub fn recover_atomic_vote_batch(
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<SignedVoteBatch, VotingError> {
-    let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
+    observe_recover_atomic_vote_batch(
+        db,
+        round_id,
+        bundle_index,
+        proposal_id,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_recover_atomic_vote_batch(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    observations: &crate::ObservationScope,
+) -> Result<SignedVoteBatch, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.for_bundle(bundle_index);
+    let observation_stage = attributed_observations.stage("vote::recover_atomic_vote_batch");
+    let operation_result: Result<SignedVoteBatch, VotingError> = (|| {
+        let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
         VotingError::InvalidInput {
             message: format!(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         }
     })?;
-    let batch = requested
-        .batch
-        .as_ref()
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "vote is a singleton; use recover_signed_commitments".to_string(),
-        })?;
-    let digest = batch.digest;
-    let recoveries = {
-        let conn = db.conn();
-        load_vote_batch_recoveries_with_conn(
-            &conn,
-            &db.wallet_id(),
-            round_id,
+        let batch = requested
+            .batch
+            .as_ref()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "vote is a singleton; use recover_signed_commitments".to_string(),
+            })?;
+        let digest = batch.digest;
+        let recoveries = {
+            let conn = db.conn();
+            load_vote_batch_recoveries_with_conn(
+                &conn,
+                &db.wallet_id(),
+                round_id,
+                bundle_index,
+                digest,
+            )?
+        };
+        let mut commitments = Vec::with_capacity(recoveries.len());
+        for recovery in &recoveries {
+            let commit = commit_from_recovery(recovery)?;
+            commitments.push(signed_commitment_from_parts(&commit, recovery)?);
+        }
+        let wire_batch = crate::wire::VoteCommitmentBatchWire {
+            votes: commitments
+                .iter()
+                .map(crate::wire::VoteCommitmentWire::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let batch_json = if batch.delegation_van.is_some() {
+            let delegation =
+                crate::delegate_and_vote_batch::DelegationAuthorization::recover_submission(
+                    &db.conn(),
+                    &db.wallet_id(),
+                    round_id,
+                    bundle_index,
+                    &digest,
+                )?;
+            crate::wire::DelegateAndVoteBatchWire {
+                delegation,
+                batch: wire_batch,
+            }
+            .to_json()?
+        } else {
+            wire_batch.to_json()?
+        };
+
+        Ok(SignedVoteBatch {
             bundle_index,
-            digest,
-        )?
+            commitments,
+            batch_digest: digest,
+            batch_json,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
     };
-    let mut commitments = Vec::with_capacity(recoveries.len());
-    for recovery in &recoveries {
-        let commit = commit_from_recovery(recovery)?;
-        commitments.push(signed_commitment_from_parts(&commit, recovery)?);
-    }
-    let batch_json = crate::wire::VoteCommitmentBatchWire {
-        votes: commitments
-            .iter()
-            .map(crate::wire::VoteCommitmentWire::try_from)
-            .collect::<Result<Vec<_>, _>>()?,
-    }
-    .to_json()?;
-    Ok(SignedVoteBatch {
-        bundle_index,
-        commitments,
-        batch_digest: digest,
-        batch_json,
-    })
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 #[derive(Clone)]
@@ -1590,12 +2847,18 @@ fn validate_captured_batch_state(
     witness: &VanWitness,
     network: Network,
     captured: &[crate::storage::queries::VotePreparationState],
+    delegation_van: Option<[u8; 32]>,
 ) -> Result<(), VotingError> {
     let first = &captured[0];
-    if first.van_position != witness.position {
+    let expected_position = if delegation_van.is_some() {
+        None
+    } else {
+        Some(witness.position)
+    };
+    if first.van_position != expected_position {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "VAN witness position {} does not match current bundle position {} for round={round_id}, bundle={bundle_index}",
+                "VAN witness position {} does not match current bundle position {:?} for round={round_id}, bundle={bundle_index}",
                 witness.position, first.van_position
             ),
         });
@@ -1663,18 +2926,11 @@ fn build_batch_proofs(
     stages: &dyn crate::types::VoteCommitStageReporter,
     max_concurrency: usize,
     plans: &[BatchProofPlan],
+    observations: &crate::ObservationScope,
 ) -> Result<Vec<VoteCommitmentBundle>, VotingError> {
-    let next = AtomicUsize::new(0);
-    let results = Mutex::new(
-        (0..plans.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Result<VoteCommitmentBundle, VotingError>>>>(),
-    );
-    let prove_next = || loop {
-        let index = next.fetch_add(1, Ordering::Relaxed);
-        let Some(plan) = plans.get(index) else {
-            break;
-        };
+    crate::proving_runtime::ensure_cache(crate::proving_runtime::CacheKind::Vote, observations)?;
+    crate::proving_runtime::execute_many(plans.len(), max_concurrency, observations, |index| {
+        let plan = &plans[index];
         stages.on_stage(VoteCommitStage::ProofStarting {
             proposal_id: plan.draft.proposal_id,
             bundle_index,
@@ -1684,7 +2940,7 @@ fn build_batch_proofs(
             bundle_index,
             stages,
         };
-        let result = crate::zkp2::build_vote_commitment(
+        crate::zkp2::build_admitted_vote_commitment(
                         hotkey_seed,
                         plan.state.network,
                         plan.state.zkp2.address_index,
@@ -1701,7 +2957,7 @@ fn build_batch_proofs(
                         plan.proposal_authority,
                         plan.draft.single_share,
                         &progress,
-                    )
+                    observations)
                     .and_then(|bundle| {
                         if bundle.vote_authority_note_new != plan.expected_new_van {
                             return Err(VotingError::Internal {
@@ -1712,42 +2968,8 @@ fn build_batch_proofs(
                             });
                         }
                         Ok(bundle)
-                    });
-        results.lock().expect("batch proof result mutex poisoned")[index] = Some(result);
-    };
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = max_concurrency;
-        prove_next();
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::scope(|scope| -> Result<(), VotingError> {
-        let worker_count = max_concurrency.max(1).min(plans.len());
-        let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            workers.push(scope.spawn(&prove_next));
-        }
-        for worker in workers {
-            worker.join().map_err(|_| VotingError::Internal {
-                message: "vote batch proof worker panicked".to_string(),
-            })?;
-        }
-        Ok(())
-    })?;
-
-    results
-        .into_inner()
-        .map_err(|_| VotingError::Internal {
-            message: "batch proof result mutex poisoned".to_string(),
-        })?
-        .into_iter()
-        .enumerate()
-        .map(|(index, result)| {
-            result.ok_or_else(|| VotingError::Internal {
-                message: format!("vote batch proof worker omitted action {index}"),
-            })?
-        })
-        .collect()
+                    })
+    })
 }
 
 fn prepare_recovered_vote_batch(
@@ -1780,6 +3002,12 @@ fn prepare_recovered_vote_batch(
                     draft.proposal_id
                 ),
             })?;
+        if metadata.delegation_van.is_some() {
+            return Err(VotingError::InvalidInput {
+                message: "combined batch is already persisted; use recover_delegate_and_vote_batch"
+                    .to_string(),
+            });
+        }
         if metadata.index != index as u32 || metadata.size != size {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -1815,6 +3043,7 @@ fn prepare_recovered_vote_batch(
     }
     let batch_json = canonical_batch_json(&commitments)?;
     Ok(PreparedAtomicVoteBatch {
+        delegation: None,
         wallet_id: wallet_id.to_string(),
         round_id: round_id.to_string(),
         bundle_index,
@@ -1946,6 +3175,25 @@ pub struct VoteSubmission {
     pub anchor_height: u32,
 }
 
+/// Browser-wallet compatibility path for recovering a singleton chain request
+/// from the durable vote artifact without rebuilding or re-signing it.
+pub fn submission(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<VoteSubmission, VotingError> {
+    let bundle = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        }
+    })?;
+    ensure_singleton_vote_recovery(&bundle)?;
+    Ok(submission_from_recovery(&bundle))
+}
+
 /// Library-owned vote recovery material persisted after `commit`.
 #[derive(Clone, Debug)]
 pub struct VoteRecoveryBundle {
@@ -1976,6 +3224,8 @@ pub struct VoteRecoveryBundle {
 /// Stable recovery metadata shared by actions in one atomic vote batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoteBatchRecovery {
+    /// Initial ephemeral VAN for combined authorization; absent for ordinary batches.
+    pub delegation_van: Option<[u8; 32]>,
     pub digest: [u8; 32],
     pub index: u32,
     pub size: u32,
@@ -2026,6 +3276,7 @@ pub fn synthetic_recovery_fixtures(
         let size = recoveries.len() as u32;
         for (index, recovery) in recoveries.iter_mut().enumerate() {
             recovery.batch = Some(VoteBatchRecovery {
+                delegation_van: None,
                 digest,
                 index: index as u32,
                 size,
@@ -2132,6 +3383,8 @@ struct VoteRecoveryJson {
     share_comms: Vec<Vec<u8>>,
     #[serde(default)]
     batch_digest: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delegation_van: Option<[u8; 32]>,
     #[serde(default)]
     batch_index: Option<u32>,
     #[serde(default)]
@@ -2162,8 +3415,62 @@ pub fn commit(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<VoteCommit, VotingError> {
-    let prepared = prepare_commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
-    Ok(persist_prepared_commit(db, prepared)?.commit)
+    observe_commit(
+        db,
+        round_id,
+        bundle_index,
+        draft,
+        witness,
+        signer,
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_commit(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    draft: &DraftVote,
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+    observations: &crate::ObservationScope,
+) -> Result<VoteCommit, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let stage = attributed.stage("vote.commit");
+    let observations = stage.scope();
+    let operation_result: Result<VoteCommit, VotingError> = (|| {
+        let prepared = observe_prepare_commit(
+            db,
+            round_id,
+            bundle_index,
+            draft,
+            witness,
+            signer,
+            stages,
+            observations,
+        )?;
+        Ok(observe_persist_prepared_commit(db, prepared, observations)?.commit)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Builds and signs one vote while keeping the SQLite mutation window short.
@@ -2179,147 +3486,207 @@ pub fn prepare_commit(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<PreparedVoteCommit, VotingError> {
-    validate_draft_vote(draft)?;
+    observe_prepare_commit(
+        db,
+        round_id,
+        bundle_index,
+        draft,
+        witness,
+        signer,
+        stages,
+        &crate::ObservationScope::disabled(),
+    )
+}
 
-    let (secret, network) = signer_secret_and_network(signer);
-    db.require_round_network(round_id, network, "vote signer")?;
+pub(crate) fn observe_prepare_commit(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    draft: &DraftVote,
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedVoteCommit, VotingError> {
+    observations.bind_round_id(round_id);
 
-    let wallet_id = db.wallet_id();
-    let recovered = {
-        let mut conn = db.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin recovered vote preparation transaction: {e}"),
-        })?;
-        let recovered =
-            recovery_bundle_with_conn(&tx, &wallet_id, round_id, bundle_index, draft.proposal_id)?;
-        if let Some(recovered) = recovered.as_ref() {
-            ensure_singleton_vote_recovery(recovered)?;
-        }
-        let recovered = recovered
-            .filter(|recovered| recovery_matches_draft(recovered, draft))
-            .map(|recovered| {
-                let state = crate::storage::queries::load_vote_row_state(
-                    &tx,
-                    round_id,
-                    &wallet_id,
-                    bundle_index,
-                    draft.proposal_id,
-                )?
-                .ok_or_else(|| vote_not_found_error(round_id, bundle_index, draft.proposal_id))?;
-                Ok((recovered, CapturedVoteState::Recovered(state)))
-            })
-            .transpose()?;
-        if recovered.is_none() {
-            ensure_no_competing_pending_vote_chain_with_conn(
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("vote::prepare_commit");
+    let observations = observation_stage.scope();
+    let operation = crate::proving_runtime::Operation::for_bundle(db, round_id, bundle_index);
+    let operation_result: Result<PreparedVoteCommit, VotingError> = operation.enter(|| {
+        validate_draft_vote(draft)?;
+
+        let (secret, network) = signer_secret_and_network(signer);
+        db.require_round_network(round_id, network, "vote signer")?;
+
+        let wallet_id = db.wallet_id();
+        let recovered = {
+            let mut conn = db.conn();
+            let tx = conn.transaction().map_err(|e| {
+                VotingError::from_sqlite(
+                    "failed to begin recovered vote preparation transaction",
+                    &e,
+                )
+            })?;
+            let recovered = recovery_bundle_with_conn(
                 &tx,
                 &wallet_id,
                 round_id,
                 bundle_index,
-                &[draft.proposal_id],
+                draft.proposal_id,
             )?;
+            if let Some(recovered) = recovered.as_ref() {
+                ensure_singleton_vote_recovery(recovered)?;
+            }
+            let recovered = recovered
+                .filter(|recovered| recovery_matches_draft(recovered, draft))
+                .map(|recovered| {
+                    let state = crate::storage::queries::load_vote_row_state(
+                        &tx,
+                        round_id,
+                        &wallet_id,
+                        bundle_index,
+                        draft.proposal_id,
+                    )?
+                    .ok_or_else(|| {
+                        vote_not_found_error(round_id, bundle_index, draft.proposal_id)
+                    })?;
+                    Ok::<_, VotingError>((recovered, CapturedVoteState::Recovered(state)))
+                })
+                .transpose()?;
+            if recovered.is_none() {
+                ensure_no_competing_pending_vote_chain_with_conn(
+                    &tx,
+                    &wallet_id,
+                    round_id,
+                    bundle_index,
+                    &[draft.proposal_id],
+                )?;
+            }
+            tx.commit().map_err(|e| {
+                VotingError::from_sqlite(
+                    "failed to finish recovered vote preparation transaction",
+                    &e,
+                )
+            })?;
+            recovered
+        };
+        if let Some((recovered, captured_state)) = recovered {
+            return Ok(PreparedVoteCommit {
+                wallet_id,
+                round_id: round_id.to_string(),
+                bundle_index,
+                draft: draft.clone(),
+                commit: commit_from_recovery(&recovered)?,
+                recovery: recovered,
+                captured_state,
+            });
         }
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to finish recovered vote preparation transaction: {e}"),
-        })?;
-        recovered
-    };
-    if let Some((recovered, captured_state)) = recovered {
-        return Ok(PreparedVoteCommit {
-            wallet_id,
+        db.require_capability_delegations_confirmed(round_id)?;
+        ensure_vote_rebuild_allowed(db, round_id, bundle_index, draft.proposal_id)?;
+
+        stages.on_stage(VoteCommitStage::ProofStarting {
+            proposal_id: draft.proposal_id,
+            bundle_index,
+        });
+        let progress = VoteProofProgressReporter {
+            proposal_id: draft.proposal_id,
+            bundle_index,
+            stages,
+        };
+        let auth_path = witness.auth_path_fixed()?;
+        let prepared_proof = db.prepare_vote_commitment(
+            round_id,
+            bundle_index,
+            secret,
+            network,
+            draft.proposal_id,
+            draft.choice,
+            draft.num_options,
+            &auth_path,
+            witness.position,
+            witness.anchor_height,
+            draft.single_share,
+            &progress,
+            observations,
+        )?;
+        let bundle = prepared_proof.bundle;
+        let wire_shares = bundle
+            .enc_shares
+            .iter()
+            .map(WireEncryptedShare::from)
+            .collect::<Vec<_>>();
+        stages.on_stage(VoteCommitStage::SharePayloadsBuilding {
+            proposal_id: draft.proposal_id,
+            bundle_index,
+        });
+        let share_payloads = db.build_share_payloads(
+            &wire_shares,
+            &bundle,
+            draft.choice,
+            draft.num_options,
+            draft.vc_tree_position,
+            draft.single_share,
+        )?;
+        stages.on_stage(VoteCommitStage::Signing {
+            proposal_id: draft.proposal_id,
+            bundle_index,
+        });
+        let signature = sign_cast_vote_with_signer(
+            signer,
+            CastVoteSigningFields {
+                vote_round_id: &bundle.vote_round_id,
+                r_vpk_bytes: &bundle.r_vpk_bytes,
+                van_nullifier: &bundle.van_nullifier,
+                vote_authority_note_new: &bundle.vote_authority_note_new,
+                vote_commitment: &bundle.vote_commitment,
+                proposal_id: bundle.proposal_id,
+                anchor_height: bundle.anchor_height,
+                alpha_v: &bundle.alpha_v,
+            },
+        )?;
+        let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
+        let recovery = VoteRecoveryBundle::from_parts(bundle_index, draft, bundle, vote_auth_sig)?;
+        let commit = VoteCommit {
+            proposal_id: draft.proposal_id,
+            van_nullifier: recovery.van_nullifier,
+            vote_authority_note_new: recovery.vote_authority_note_new,
+            vote_commitment: recovery.vote_commitment,
+            proof: recovery.proof.clone(),
+            anchor_height: recovery.anchor_height,
+            r_vpk: recovery.r_vpk,
+            vote_auth_sig: recovery.vote_auth_sig,
+            encrypted_shares: wire_shares,
+            share_payloads,
+        };
+
+        Ok(PreparedVoteCommit {
+            wallet_id: prepared_proof.wallet_id,
             round_id: round_id.to_string(),
             bundle_index,
             draft: draft.clone(),
-            commit: commit_from_recovery(&recovered)?,
-            recovery: recovered,
-            captured_state,
-        });
-    }
-    db.require_capability_delegations_confirmed(round_id)?;
-    ensure_vote_rebuild_allowed(db, round_id, bundle_index, draft.proposal_id)?;
-
-    stages.on_stage(VoteCommitStage::ProofStarting {
-        proposal_id: draft.proposal_id,
-        bundle_index,
+            recovery,
+            commit,
+            captured_state: CapturedVoteState::Fresh(prepared_proof.state),
+        })
     });
-    let progress = VoteProofProgressReporter {
-        proposal_id: draft.proposal_id,
-        bundle_index,
-        stages,
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
     };
-    let auth_path = witness.auth_path_fixed()?;
-    let prepared_proof = db.prepare_vote_commitment(
-        round_id,
-        bundle_index,
-        secret,
-        network,
-        draft.proposal_id,
-        draft.choice,
-        draft.num_options,
-        &auth_path,
-        witness.position,
-        witness.anchor_height,
-        draft.single_share,
-        &progress,
-    )?;
-    let bundle = prepared_proof.bundle;
-    let wire_shares = bundle
-        .enc_shares
-        .iter()
-        .map(WireEncryptedShare::from)
-        .collect::<Vec<_>>();
-    stages.on_stage(VoteCommitStage::SharePayloadsBuilding {
-        proposal_id: draft.proposal_id,
-        bundle_index,
-    });
-    let share_payloads = db.build_share_payloads(
-        &wire_shares,
-        &bundle,
-        draft.choice,
-        draft.num_options,
-        draft.vc_tree_position,
-        draft.single_share,
-    )?;
-    stages.on_stage(VoteCommitStage::Signing {
-        proposal_id: draft.proposal_id,
-        bundle_index,
-    });
-    let signature = sign_cast_vote_with_signer(
-        signer,
-        CastVoteSigningFields {
-            vote_round_id: &bundle.vote_round_id,
-            r_vpk_bytes: &bundle.r_vpk_bytes,
-            van_nullifier: &bundle.van_nullifier,
-            vote_authority_note_new: &bundle.vote_authority_note_new,
-            vote_commitment: &bundle.vote_commitment,
-            proposal_id: bundle.proposal_id,
-            anchor_height: bundle.anchor_height,
-            alpha_v: &bundle.alpha_v,
-        },
-    )?;
-    let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
-    let recovery = VoteRecoveryBundle::from_parts(bundle_index, draft, bundle, vote_auth_sig)?;
-    let commit = VoteCommit {
-        proposal_id: draft.proposal_id,
-        van_nullifier: recovery.van_nullifier,
-        vote_authority_note_new: recovery.vote_authority_note_new,
-        vote_commitment: recovery.vote_commitment,
-        proof: recovery.proof.clone(),
-        anchor_height: recovery.anchor_height,
-        r_vpk: recovery.r_vpk,
-        vote_auth_sig: recovery.vote_auth_sig,
-        encrypted_shares: wire_shares,
-        share_payloads,
-    };
-
-    Ok(PreparedVoteCommit {
-        wallet_id: prepared_proof.wallet_id,
-        round_id: round_id.to_string(),
-        bundle_index,
-        draft: draft.clone(),
-        recovery,
-        commit,
-        captured_state: CapturedVoteState::Fresh(prepared_proof.state),
-    })
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Persists one prepared vote in a transaction after optimistic revalidation.
@@ -2327,16 +3694,42 @@ pub fn persist_prepared_commit(
     db: &VotingDb,
     prepared: PreparedVoteCommit,
 ) -> Result<CommittedVote, VotingError> {
-    persist_prepared_commits(db, vec![prepared])?
-        .pop()
-        .ok_or_else(|| VotingError::Internal {
-            message: "single prepared vote persistence returned no vote".to_string(),
-        })
+    observe_persist_prepared_commit(db, prepared, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_persist_prepared_commit(
+    db: &VotingDb,
+    prepared: PreparedVoteCommit,
+    observations: &crate::ObservationScope,
+) -> Result<CommittedVote, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("vote::persist_prepared_commit");
+    let operation_result: Result<CommittedVote, VotingError> = (|| {
+        persist_prepared_commits(db, vec![prepared], None)?
+            .pop()
+            .ok_or_else(|| VotingError::Internal {
+                message: "single prepared vote persistence returned no vote".to_string(),
+            })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 fn persist_prepared_commits(
     db: &VotingDb,
     prepared: Vec<PreparedVoteCommit>,
+    delegation: Option<crate::delegate_and_vote_batch::DelegationAuthorization>,
 ) -> Result<Vec<CommittedVote>, VotingError> {
     if prepared.is_empty() {
         return Err(VotingError::Internal {
@@ -2360,9 +3753,13 @@ fn persist_prepared_commits(
     // SQLITE_BUSY (which WAL often returns without waiting out busy_timeout).
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to begin prepared vote persistence transaction: {e}"),
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to begin prepared vote persistence transaction", &e)
         })?;
+    crate::proving_runtime::check_interruption()?;
+    if let Some(authorization) = &delegation {
+        authorization.validate_fresh(&tx)?;
+    }
     let fresh_proposal_ids = prepared
         .iter()
         .filter(|vote| matches!(&vote.captured_state, CapturedVoteState::Fresh(_)))
@@ -2451,8 +3848,20 @@ fn persist_prepared_commits(
             crate::storage::RoundPhase::VoteReady,
         )?;
     }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit prepared vote persistence transaction: {e}"),
+    if let Some(authorization) = &delegation {
+        let digest = prepared[0]
+            .recovery
+            .batch
+            .as_ref()
+            .ok_or_else(|| VotingError::Internal {
+                message: "combined preparation lost its batch metadata".to_string(),
+            })?
+            .digest;
+        authorization.persist(&tx, &digest)?;
+    }
+    crate::proving_runtime::check_interruption()?;
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("failed to commit prepared vote persistence transaction", &e)
     })?;
     drop(conn);
 
@@ -2517,95 +3926,21 @@ fn recover_commit_with_generation(
     Ok((commit_from_recovery(&recovery)?, commitment_bundle_json))
 }
 
-/// Reconstructs chain-ready cast-vote fields from persisted recovery state.
-pub fn submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<VoteSubmission, VotingError> {
-    recovery_bundle(db, round_id, bundle_index, proposal_id)?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!(
-                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-            ),
-        })
-        .and_then(|bundle| {
-            ensure_singleton_vote_recovery(&bundle)?;
-            Ok(VoteSubmission {
-                vote_round_id: bundle.vote_round_id,
-                proposal_id: bundle.proposal_id,
-                van_nullifier: bundle.van_nullifier,
-                vote_authority_note_new: bundle.vote_authority_note_new,
-                vote_commitment: bundle.vote_commitment,
-                proof: bundle.proof,
-                r_vpk: bundle.r_vpk,
-                vote_auth_sig: bundle.vote_auth_sig,
-                anchor_height: bundle.anchor_height,
-            })
-        })
-}
-
-/// Records the cast-vote transaction hash and marks a singleton vote submitted.
+/// Extracts the chain-visible vote fields from a recovery bundle.
 ///
-/// Atomic batch members must use [`record_batch_submission`].
-pub fn record_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    db.record_vote_submission(round_id, bundle_index, proposal_id, tx_hash)
-}
-
-/// Atomically records one transaction hash for every action in a persisted
-/// vote batch. This is the durable retry point immediately after CheckTx.
-pub fn record_batch_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    batch_digest: &[u8],
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    let batch_digest: [u8; 32] =
-        batch_digest
-            .try_into()
-            .map_err(|_| VotingError::InvalidInput {
-                message: format!("batch_digest must be 32 bytes, got {}", batch_digest.len()),
-            })?;
-    if tx_hash.trim().is_empty() {
-        return Err(VotingError::InvalidInput {
-            message: "tx_hash must not be empty".to_string(),
-        });
+/// Callers that require singleton semantics must validate the bundle first.
+pub(crate) fn submission_from_recovery(bundle: &VoteRecoveryBundle) -> VoteSubmission {
+    VoteSubmission {
+        vote_round_id: bundle.vote_round_id.clone(),
+        proposal_id: bundle.proposal_id,
+        van_nullifier: bundle.van_nullifier,
+        vote_authority_note_new: bundle.vote_authority_note_new,
+        vote_commitment: bundle.vote_commitment,
+        proof: bundle.proof.clone(),
+        r_vpk: bundle.r_vpk,
+        vote_auth_sig: bundle.vote_auth_sig,
+        anchor_height: bundle.anchor_height,
     }
-    let wallet_id = db.wallet_id();
-    let mut conn = db.conn();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin vote batch submission transaction failed: {e}"),
-        })?;
-    let recoveries = load_vote_batch_recoveries_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        batch_digest,
-    )?;
-    for recovery in recoveries {
-        crate::storage::queries::record_vote_submission(
-            &tx,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            recovery.proposal_id,
-            tx_hash,
-        )?;
-    }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote batch submission transaction failed: {e}"),
-    })
 }
 
 pub(crate) fn load_vote_batch_recoveries_with_conn(
@@ -2621,8 +3956,8 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND commitment_bundle_json IS NOT NULL",
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("prepare vote batch recovery query failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("prepare vote batch recovery query failed: {error}"),
         })?;
     let rows = stmt
         .query_map(
@@ -2633,22 +3968,39 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
             },
             |row| row.get::<_, String>(0),
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("query vote batch recovery rows failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("query vote batch recovery rows failed: {error}"),
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|e| VotingError::Internal {
-            message: format!("read vote batch recovery row failed: {e}"),
-        })?)?;
-        if recovery
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.digest == batch_digest)
-        {
-            recoveries.push(recovery);
-        }
+        recoveries.push(parse_recovery(&row.map_err(|error| {
+            VotingError::Storage {
+                message: format!("read vote batch recovery row failed: {error}"),
+            }
+        })?)?);
     }
+    assemble_vote_batch_recoveries(round_id, bundle_index, batch_digest, recoveries)
+}
+
+/// Selects, orders, and validates the members of the atomic batch
+/// `batch_digest` among `candidates`, the recovery bundles persisted on
+/// `bundle_index`. Every member must be present exactly once at its index,
+/// and the batch sighash recomputed from the members must equal the digest.
+pub(crate) fn assemble_vote_batch_recoveries(
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: [u8; 32],
+    candidates: Vec<VoteRecoveryBundle>,
+) -> Result<Vec<VoteRecoveryBundle>, VotingError> {
+    let mut recoveries = candidates
+        .into_iter()
+        .filter(|recovery| {
+            recovery
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.digest == batch_digest)
+        })
+        .collect::<Vec<_>>();
     recoveries.sort_by_key(|recovery| recovery.batch.as_ref().map(|batch| batch.index));
     let expected_size = recoveries
         .first()
@@ -2685,11 +4037,39 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
             },
         )
         .collect::<Vec<_>>();
-    let recomputed = crate::vote_commitment::cast_vote_batch_sighash(
-        round_id,
-        recoveries[0].anchor_height as u64,
-        &actions,
-    )?;
+    let initial_van = recoveries[0]
+        .batch
+        .as_ref()
+        .and_then(|batch| batch.delegation_van);
+    if recoveries.iter().any(|recovery| {
+        recovery
+            .batch
+            .as_ref()
+            .and_then(|batch| batch.delegation_van)
+            != initial_van
+            || (initial_van.is_some() && recovery.anchor_height != 0)
+    }) {
+        return Err(VotingError::InvalidInput {
+            message: "inconsistent combined batch authorization".to_string(),
+        });
+    }
+    let recomputed = match initial_van {
+        Some(van) => crate::delegate_and_vote_batch::delegate_and_vote_batch_sighash(
+            &array32(
+                "round_id",
+                hex::decode(round_id).map_err(|e| VotingError::InvalidInput {
+                    message: e.to_string(),
+                })?,
+            )?,
+            &van,
+            &actions,
+        )?,
+        None => crate::vote_commitment::cast_vote_batch_sighash(
+            round_id,
+            recoveries[0].anchor_height as u64,
+            &actions,
+        )?,
+    };
     if recomputed != batch_digest {
         return Err(VotingError::InvalidInput {
             message: "persisted atomic vote batch digest does not match its actions".to_string(),
@@ -2771,6 +4151,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
 
     let mut batches = Vec::with_capacity(batch_keys.len());
     for (bundle_index, digest) in batch_keys {
+        ensure_vote_recovery_is_not_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            Some(&digest),
+        )?;
         let recoveries =
             load_vote_batch_recoveries_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
         for recovery in &recoveries {
@@ -2795,10 +4183,18 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
                 });
             }
         }
-        batches.push((bundle_index, recoveries));
+        batches.push((bundle_index, digest));
     }
 
     for &(bundle_index, singleton_proposal_id) in &singleton_keys {
+        ensure_vote_recovery_is_not_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            singleton_proposal_id,
+            None,
+        )?;
         let state = crate::storage::queries::load_vote_row_state(
             conn,
             round_id,
@@ -2820,16 +4216,8 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         }
     }
 
-    for (bundle_index, recoveries) in batches {
-        for recovery in recoveries {
-            clear_unsubmitted_vote_recovery_with_conn(
-                conn,
-                wallet_id,
-                round_id,
-                bundle_index,
-                recovery.proposal_id,
-            )?;
-        }
+    for (bundle_index, digest) in batches {
+        clear_vote_batch_recovery_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
     }
     for (bundle_index, singleton_proposal_id) in singleton_keys {
         clear_unsubmitted_vote_recovery_with_conn(
@@ -2844,6 +4232,216 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     Ok(())
 }
 
+/// Rejects intent changes that would erase recovery material still owned by
+/// the chain-submission lifecycle.
+///
+/// Active singleton and batch submissions require their recovery generation.
+/// Rejected batches also retain it because their authoritative member roster is
+/// re-derived from the signed batch recovery rows.
+fn ensure_vote_recovery_is_not_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    batch_digest: Option<&[u8; 32]>,
+) -> Result<(), VotingError> {
+    if vote_recovery_is_lifecycle_owned(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+        batch_digest,
+    )? {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has lifecycle-owned vote recovery and its ballot intent is locked"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Whether an active or terminal chain submission still owns the vote's
+/// recovery generation (singleton by proposal, batch by digest). A storage
+/// failure is returned as such, never folded into the answer.
+fn vote_recovery_is_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    batch_digest: Option<&[u8; 32]>,
+) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT EXISTS(
+                 SELECT 1 FROM chain_submissions
+                  WHERE round_id = :round_id
+                    AND wallet_id = :wallet_id
+                    AND bundle_index = :bundle_index
+                    AND (state IN ('submitting','tracking','recovering','submitted_without_hash')
+                         OR (state = 'rejected' AND kind IN ('vote_batch','delegate_and_cast_vote_batch')))
+                    AND ((kind = 'vote' AND proposal_id = :proposal_id)
+                         OR (kind IN ('vote_batch','delegate_and_cast_vote_batch') AND ordered_batch_digest = :batch_digest))
+             )",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+            ":batch_digest": batch_digest.map(|digest| digest.as_slice()),
+        },
+        |row| row.get(0),
+    )
+    .map_err(|error| VotingError::from_sqlite("check lifecycle-owned vote recovery", &error))
+}
+
+/// Retires the committed but undispatched votes on `bundle_index` whose
+/// proposal is not in `roster`, returning the retired proposal ids.
+///
+/// A vote persisted for a proposal the authenticated roster no longer lists
+/// can never be submitted, yet its commitment would keep the bundle's VAN
+/// reserved and block every later cast on the bundle. Retiring it clears the
+/// unsubmitted recovery the way a changed intent does; a batch is one signed
+/// envelope, so every member of an affected batch is cleared. A vote the
+/// chain lifecycle owns or has finished is left untouched.
+pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    roster: &[u32],
+) -> Result<Vec<u32>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT proposal_id, commitment_bundle_json
+             FROM votes
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND commitment_bundle_json IS NOT NULL
+               AND tx_hash IS NULL
+               AND vc_tree_position IS NULL
+             ORDER BY proposal_id",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare undispatched vote query", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| VotingError::from_sqlite("query undispatched votes", &e))?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (proposal_id, recovery_json) =
+            row.map_err(|e| VotingError::from_sqlite("read undispatched vote", &e))?;
+        let proposal_id = u32::try_from(proposal_id).map_err(|_| VotingError::Internal {
+            message: format!("stored proposal_id must be non-negative, got {proposal_id}"),
+        })?;
+        if roster.contains(&proposal_id) {
+            continue;
+        }
+        candidates.push((proposal_id, parse_recovery(&recovery_json)?));
+    }
+    drop(stmt);
+
+    let mut retired = Vec::new();
+    let mut cleared: Vec<u32> = Vec::new();
+    for (proposal_id, recovery) in candidates {
+        // A batch is cleared whole the first time one of its members is
+        // reached; a later departed member of the same batch has nothing
+        // left to load or clear.
+        if cleared.contains(&proposal_id) {
+            retired.push(proposal_id);
+            continue;
+        }
+        let batch_digest = recovery.batch.as_ref().map(|batch| batch.digest);
+        // Only an explicit lifecycle-owned answer skips the vote; a storage
+        // failure propagates with its own classification.
+        if vote_recovery_is_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            batch_digest.as_ref(),
+        )? {
+            continue;
+        }
+        match batch_digest {
+            Some(digest) => cleared.extend(clear_vote_batch_recovery_with_conn(
+                conn,
+                wallet_id,
+                round_id,
+                bundle_index,
+                digest,
+            )?),
+            None => clear_unsubmitted_vote_recovery_with_conn(
+                conn,
+                wallet_id,
+                round_id,
+                bundle_index,
+                proposal_id,
+            )?,
+        }
+        retired.push(proposal_id);
+    }
+    Ok(retired)
+}
+
+/// Retires every signed, never-confirmed member of one batch digest in the
+/// caller's transaction, returning the proposals cleared in roster order.
+///
+/// The single owner of the "clear a whole batch" sequence: the ballot-driven
+/// roster retirement and the chain lifecycle's rejection retirement both use
+/// it, so a change to what retiring a batch means cannot apply to only one.
+/// Callers decide whether retiring is allowed; this performs it.
+pub(crate) fn clear_vote_batch_recovery_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: [u8; 32],
+) -> Result<Vec<u32>, VotingError> {
+    let members = load_vote_batch_recoveries_with_conn(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        batch_digest,
+    )?;
+    let mut cleared = Vec::with_capacity(members.len());
+    for member in &members {
+        clear_unsubmitted_vote_recovery_with_conn(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            member.proposal_id,
+        )?;
+        cleared.push(member.proposal_id);
+    }
+    if !cleared.is_empty() {
+        retire_combined_authorization_with_conn(conn, wallet_id, round_id, bundle_index)?;
+    }
+    Ok(cleared)
+}
+
+/// Retires one signed, never-confirmed vote in the caller's transaction.
+///
+/// Clears the recovery JSON (which the generation-change triggers turn into
+/// deleted helper plans and immediate-share designation), deletes the vote's
+/// share records, and drops the bundle's combined authorization once no
+/// combined member remains. Refuses a vote that reached the chain.
+///
+/// This is the lifecycle's retirement primitive and deliberately does not
+/// consult `vote_recovery_is_lifecycle_owned`: the chain lifecycle calls it
+/// when it has itself decided that the generation is terminal.
 fn clear_unsubmitted_vote_recovery_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
@@ -2871,9 +4469,12 @@ fn clear_unsubmitted_vote_recovery_with_conn(
             message: format!("clear stale vote recovery failed: {e}"),
         })?;
     if updated != 1 {
+        // Either the vote reached the chain between the caller's decision and
+        // this write, or another writer cleared it first. Both mean the
+        // caller's premise is stale, so it must roll back rather than proceed.
         return Err(VotingError::InvalidInput {
             message: format!(
-                "vote recovery changed while updating ballot intent for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+                "vote recovery changed before it could be retired for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         });
     }
@@ -2896,38 +4497,31 @@ fn clear_unsubmitted_vote_recovery_with_conn(
     Ok(())
 }
 
-/// Records the on-chain vote commitment tree position after confirmation.
+/// Drops a bundle's combined authorization once no signed combined member of
+/// it remains.
 ///
-/// This does not advance the bundle's current VAN position. Prefer
-/// `confirmation::confirm_vote_submission` when recording chain events so all
-/// confirmation fields are stored atomically. Atomic batch members must use
-/// `confirmation::confirm_vote_batch_submission`.
-pub fn record_vc_position(
-    db: &VotingDb,
+/// Run once per batch rather than once per member: the guard scans every
+/// still-signed recovery blob on the bundle, and can only succeed after the
+/// final member is cleared, so per-member evaluation is quadratic work whose
+/// every early pass is known to do nothing.
+fn retire_combined_authorization_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
-    proposal_id: u32,
-    vc_tree_position: u64,
 ) -> Result<(), VotingError> {
-    let wallet_id = db.wallet_id();
-    let mut conn = db.conn();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin vote VC position transaction failed: {e}"),
-        })?;
-    ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
-    record_vc_position_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        proposal_id,
-        vc_tree_position,
-    )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote VC position transaction failed: {e}"),
-    })
+    conn.execute(
+        "DELETE FROM delegate_cast_recovery AS authorization
+         WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3
+           AND NOT EXISTS (SELECT 1 FROM votes v
+             WHERE v.round_id = authorization.round_id AND v.wallet_id = authorization.wallet_id
+               AND v.bundle_index = authorization.bundle_index
+               AND v.commitment_bundle_json IS NOT NULL
+               AND json_extract(v.commitment_bundle_json, '$.delegation_van') IS NOT NULL)",
+        rusqlite::params![round_id, wallet_id, bundle_index],
+    )
+    .map_err(|error| VotingError::from_sqlite("retire combined authorization", &error))?;
+    Ok(())
 }
 
 pub(crate) fn record_vc_position_with_conn(
@@ -3062,13 +4656,16 @@ fn recovery_json_with_conn(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to load vote recovery bundle: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("failed to load vote recovery bundle: {error}"),
         })?;
     Ok(json.flatten())
 }
 
-fn ensure_singleton_vote_recovery(recovery: &VoteRecoveryBundle) -> Result<(), VotingError> {
+/// Rejects recovery bundles that belong to an atomic batch.
+pub(crate) fn ensure_singleton_vote_recovery(
+    recovery: &VoteRecoveryBundle,
+) -> Result<(), VotingError> {
     if recovery.batch.is_some() {
         return Err(VotingError::InvalidInput {
             message: "vote belongs to an atomic batch; use the complete batch lifecycle instead of a per-vote API"
@@ -3128,8 +4725,12 @@ pub fn parse_recovery(json: &str) -> Result<VoteRecoveryBundle, VotingError> {
         || parsed.batch_index.is_some()
         || parsed.batch_size.is_some();
     match parsed.format.as_str() {
-        VOTE_RECOVERY_FORMAT if !has_batch_metadata => {}
-        VOTE_BATCH_RECOVERY_FORMAT if has_batch_metadata => {}
+        VOTE_RECOVERY_FORMAT if !has_batch_metadata && parsed.delegation_van.is_none() => {}
+        VOTE_BATCH_RECOVERY_FORMAT if has_batch_metadata && parsed.delegation_van.is_none() => {}
+        DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT
+            if has_batch_metadata
+                && parsed.delegation_van.is_some()
+                && parsed.anchor_height == 0 => {}
         VOTE_RECOVERY_FORMAT | VOTE_BATCH_RECOVERY_FORMAT => {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -3173,8 +4774,8 @@ pub fn insert_recovery_fixture(
     let commitment = stored_vote_commitment_bytes(bundle)?;
     let wallet_id = db.wallet_id();
     let mut conn = db.conn();
-    let tx = conn.transaction().map_err(|e| VotingError::Internal {
-        message: format!("begin vote recovery fixture transaction failed: {e}"),
+    let tx = conn.transaction().map_err(|e| {
+        VotingError::from_sqlite("begin vote recovery fixture transaction failed", &e)
     })?;
 
     let bundle_exists = tx
@@ -3295,8 +4896,8 @@ pub fn insert_recovery_fixture(
         &recovery_json,
     )?;
 
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote recovery fixture transaction failed: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("commit vote recovery fixture transaction failed", &e)
     })
 }
 
@@ -3441,7 +5042,11 @@ fn invalid_stored_choice_error(stored_choice: i64) -> VotingError {
     }
 }
 
-fn validate_recovery_matches_stored_vote(
+/// Validates that recovery identity, choice, and commitment match a vote row.
+///
+/// Returns an error for malformed stored choices or any stale/replaced
+/// recovery material; it performs no durable writes.
+pub(crate) fn validate_recovery_matches_stored_vote(
     recovery: &VoteRecoveryBundle,
     round_id: &str,
     bundle_index: u32,
@@ -3746,7 +5351,12 @@ fn commit_from_recovery(bundle: &VoteRecoveryBundle) -> Result<VoteCommit, Votin
     })
 }
 
-fn stored_vote_commitment_bytes(bundle: &VoteRecoveryBundle) -> Result<Vec<u8>, VotingError> {
+/// Returns the canonical stored commitment bytes derived from recovery state.
+///
+/// Confirmation-only fields and helper delivery state are excluded.
+pub(crate) fn stored_vote_commitment_bytes(
+    bundle: &VoteRecoveryBundle,
+) -> Result<Vec<u8>, VotingError> {
     serde_json::to_vec(&serde_json::json!({
         "van_nullifier": hex::encode(bundle.van_nullifier),
         "vote_authority_note_new": hex::encode(bundle.vote_authority_note_new),
@@ -3822,9 +5432,14 @@ fn ensure_vote_rebuild_allowed(
 ) -> Result<(), VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
-    let has_tx_hash = conn
+    // Either witness of the vote having reached the chain refuses a rebuild.
+    // A hash exists only for hash-confirmed submissions — the schema requires
+    // `confirmation_source = 'tree'` to carry none — so asking for it alone let
+    // a vote confirmed by an exact-tree scan be rebuilt, producing a competing
+    // generation for a proposal whose authority had already moved.
+    let has_reached_chain = conn
         .query_row(
-            "SELECT tx_hash IS NOT NULL FROM votes
+            "SELECT tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL FROM votes
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
@@ -3843,7 +5458,7 @@ fn ensure_vote_rebuild_allowed(
         })?
         .unwrap_or(false);
 
-    if has_tx_hash {
+    if has_reached_chain {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with requested draft"
@@ -3853,7 +5468,18 @@ fn ensure_vote_rebuild_allowed(
     Ok(())
 }
 
-/// Rejects another pending commitment that would spend the bundle's same current VAN.
+/// Refuses a new vote chain while an earlier one on the same bundle is still
+/// unconfirmed, because both would spend the bundle's same current VAN.
+///
+/// Completion is the commitment-tree position, not the transaction hash.
+/// Confirmation writes the position on both routes, and clears it when a
+/// generation is invalidated, so it is the fact that tracks the vote. A hash
+/// exists only for hash confirmation: the schema requires
+/// `confirmation_source = 'tree'` to carry none, so a vote confirmed by an
+/// exact-tree scan has no hash and never will. Treating a missing hash as
+/// "pending" left such a vote blocking its bundle permanently — every later
+/// proposal on it refused, with a message asking the caller to confirm a vote
+/// that was already confirmed.
 fn ensure_no_competing_pending_vote_chain_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
@@ -3868,7 +5494,7 @@ fn ensure_no_competing_pending_vote_chain_with_conn(
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
                AND commitment_bundle_json IS NOT NULL
-               AND (tx_hash IS NULL OR vc_tree_position IS NULL)
+               AND vc_tree_position IS NULL
              ORDER BY proposal_id",
         )
         .map_err(|e| VotingError::Internal {
@@ -3945,7 +5571,13 @@ impl VoteRecoveryBundle {
 impl From<&VoteRecoveryBundle> for VoteRecoveryJson {
     fn from(bundle: &VoteRecoveryBundle) -> Self {
         Self {
-            format: if bundle.batch.is_some() {
+            format: if bundle
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.delegation_van.is_some())
+            {
+                DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT
+            } else if bundle.batch.is_some() {
                 VOTE_BATCH_RECOVERY_FORMAT
             } else {
                 VOTE_RECOVERY_FORMAT
@@ -3975,6 +5607,7 @@ impl From<&VoteRecoveryBundle> for VoteRecoveryJson {
             share_blinds: bundle.share_blinds.iter().map(|v| v.to_vec()).collect(),
             share_comms: bundle.share_comms.iter().map(|v| v.to_vec()).collect(),
             batch_digest: bundle.batch.as_ref().map(|batch| batch.digest.to_vec()),
+            delegation_van: bundle.batch.as_ref().and_then(|batch| batch.delegation_van),
             batch_index: bundle.batch.as_ref().map(|batch| batch.index),
             batch_size: bundle.batch.as_ref().map(|batch| batch.size),
         }
@@ -4000,6 +5633,7 @@ impl TryFrom<VoteRecoveryJson> for VoteRecoveryBundle {
                         });
                     }
                     Some(VoteBatchRecovery {
+                        delegation_van: value.delegation_van,
                         digest: array32("batch_digest", digest)?,
                         index,
                         size,
@@ -4092,8 +5726,109 @@ fn array32_vec(label: &str, values: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, Votin
         .collect()
 }
 
+// Test-only durable writers.
+//
+// Chain submission is driven exclusively by the `chain_submission` lifecycle,
+// which is the sole authority for submission and confirmation. These helpers
+// write the same durable rows the lifecycle writes so this crate's tests can
+// cover the singleton/batch guards and the position-conflict rules directly.
+// They are compiled only for this crate's own tests and are never part of the
+// library surface, with or without the `test-fixtures` feature.
+
+/// Marks one singleton vote submitted with `tx_hash`.
+#[cfg(test)]
+pub(crate) fn record_submission(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    db.record_vote_submission(round_id, bundle_index, proposal_id, tx_hash)
+}
+
+/// Records one transaction hash for every action in a persisted batch.
+#[cfg(test)]
+pub(crate) fn record_batch_submission(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: &[u8],
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    let batch_digest: [u8; 32] =
+        batch_digest
+            .try_into()
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!("batch_digest must be 32 bytes, got {}", batch_digest.len()),
+            })?;
+    if tx_hash.trim().is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "tx_hash must not be empty".to_string(),
+        });
+    }
+    let wallet_id = db.wallet_id();
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| {
+            VotingError::from_sqlite("begin vote batch submission transaction failed", &e)
+        })?;
+    let recoveries = load_vote_batch_recoveries_with_conn(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+        batch_digest,
+    )?;
+    for recovery in recoveries {
+        crate::storage::queries::record_vote_submission(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            recovery.proposal_id,
+            tx_hash,
+        )?;
+    }
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("commit vote batch submission transaction failed", &e)
+    })
+}
+
+/// Records the confirmed vote-commitment position for one singleton vote.
+#[cfg(test)]
+pub(crate) fn record_vc_position(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    vc_tree_position: u64,
+) -> Result<(), VotingError> {
+    let wallet_id = db.wallet_id();
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::from_sqlite("begin vote VC position transaction failed", &e))?;
+    ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
+    record_vc_position_with_conn(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+        vc_tree_position,
+    )?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit vote VC position transaction failed", &e))
+}
 #[cfg(test)]
 mod tests {
+    mod batch_chain_reports;
+    mod batch_observability;
+    mod batch_wallet_scope;
+    mod tree_confirmed_completion;
+
     use super::*;
     use crate::{
         round::RoundParams,
@@ -4221,11 +5956,13 @@ mod tests {
         )
         .unwrap();
         first.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 0,
             size: 2,
         });
         second.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 1,
             size: 2,
@@ -4355,7 +6092,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let error = validate_atomic_vote_batch(&drafts).unwrap_err();
-        assert!(error.to_string().contains("at most 15 actions"));
+        assert_eq!(MAX_VOTE_BATCH_ACTIONS, MAX_PROPOSAL_ID as usize);
+        assert!(error
+            .to_string()
+            .contains(&format!("at most {MAX_VOTE_BATCH_ACTIONS} actions")));
     }
 
     #[test]
@@ -4369,12 +6109,50 @@ mod tests {
             assert_eq!(
                 parsed.batch,
                 Some(VoteBatchRecovery {
+                    delegation_van: None,
                     digest,
                     index: index as u32,
                     size: 2,
                 })
             );
         }
+    }
+
+    #[test]
+    fn combined_recovery_format_requires_delegation_van_and_anchor_zero() {
+        // The combined format is the batch format plus an initial VAN and a
+        // synthetic anchor. Each half without the other is a different record
+        // wearing the wrong name.
+        let (_, recoveries) = two_action_recovery_batch();
+        let mut combined = recoveries[0].clone();
+        combined.anchor_height = 0;
+        combined.batch.as_mut().unwrap().delegation_van = Some([0x09; 32]);
+        let json = serialize_recovery(&combined).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["format"], DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT);
+        assert_eq!(
+            parse_recovery(&json).unwrap().batch.unwrap().delegation_van,
+            Some([0x09; 32])
+        );
+
+        let mut wrong_name = value.clone();
+        wrong_name["format"] = serde_json::json!(VOTE_BATCH_RECOVERY_FORMAT);
+        assert!(parse_recovery(&wrong_name.to_string()).is_err());
+
+        let mut anchored = value.clone();
+        anchored["anchor_height"] = serde_json::json!(5);
+        assert!(parse_recovery(&anchored.to_string()).is_err());
+
+        let mut without_van = value.clone();
+        without_van["delegation_van"] = serde_json::Value::Null;
+        assert!(parse_recovery(&without_van.to_string()).is_err());
+
+        let mut singleton = value;
+        singleton["format"] = serde_json::json!(VOTE_RECOVERY_FORMAT);
+        for key in ["batch_digest", "batch_index", "batch_size"] {
+            singleton[key] = serde_json::Value::Null;
+        }
+        assert!(parse_recovery(&singleton.to_string()).is_err());
     }
 
     #[test]
@@ -4625,6 +6403,7 @@ mod tests {
         let batch_json = canonical_batch_json(&commitments).unwrap();
 
         PreparedAtomicVoteBatch {
+            delegation: None,
             wallet_id: WALLET_ID.to_string(),
             round_id: ROUND_ID.to_string(),
             bundle_index: 0,
@@ -4846,7 +6625,7 @@ mod tests {
             )
             .unwrap();
             let ask = SpendAuthorizingKey::from(&sk);
-            VerificationKey::from(&ask.randomize(alpha))
+            VerificationKey::from(&ask.randomize(&voting_crypto_deps::spend_auth_randomizer(alpha)))
         }
 
         let hotkey = VotingHotkey::from_stored_secret(&[0xAB; 64], Network::Regtest).unwrap();
@@ -4937,7 +6716,7 @@ mod tests {
         let loaded = recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().unwrap();
         assert_eq!(loaded.vote_commitment, [0x12; 32]);
 
-        let submission = submission(&db, ROUND_ID, 0, 1).unwrap();
+        let submission = submission_from_recovery(&loaded);
         assert_eq!(submission.vote_round_id, ROUND_ID);
         assert_eq!(submission.r_vpk, [0x15; 32]);
         assert_eq!(submission.vote_auth_sig, [0x17; 64]);
@@ -5129,7 +6908,8 @@ mod tests {
             recovered.data().vote_commitment,
             committed.data().vote_commitment
         );
-        let submission = recovered.submission(&db).unwrap();
+        let submission =
+            submission_from_recovery(&recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().unwrap());
         assert_eq!(submission.vote_round_id, ROUND_ID);
         assert_eq!(submission.vote_auth_sig, [0x17; 64]);
 
@@ -5165,12 +6945,12 @@ mod tests {
         crate::share::confirm(&db, ROUND_ID, 0, 1, 0).unwrap();
         assert!(crate::share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
 
-        recovered.record_submission(&db, "vote-tx").unwrap();
+        record_submission(&db, ROUND_ID, 0, 1, "vote-tx").unwrap();
         assert_eq!(
             db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
             Some("vote-tx")
         );
-        recovered.record_vc_position(&db, 789).unwrap();
+        record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
         assert_eq!(
             recovery_bundle(&db, ROUND_ID, 0, 1)
                 .unwrap()
@@ -5240,6 +7020,7 @@ mod tests {
         )
         .unwrap();
         recovery.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 0,
             size: 1,
@@ -6384,5 +8165,11 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = value;
         bytes
+    }
+}
+
+impl PreparedAtomicVoteBatch {
+    pub(crate) fn is_delegate_and_vote_batch(&self) -> bool {
+        self.delegation.is_some()
     }
 }

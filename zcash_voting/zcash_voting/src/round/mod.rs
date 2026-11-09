@@ -5,6 +5,11 @@
 //! the SQLite schema.
 
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -50,6 +55,29 @@ pub struct BundleLayout {
     /// Raw value removed by the privacy tail trim.
     #[serde(default)]
     pub privacy_trim_dropped_value_zatoshi: u64,
+    /// Persisted trailing bundles intentionally removed from this round.
+    #[serde(default)]
+    pub skipped_suffix_bundles: u32,
+    /// Notes contained in the intentionally removed trailing bundles.
+    #[serde(default)]
+    pub skipped_suffix_notes: u32,
+    /// Raw value contained in the intentionally removed trailing bundles.
+    #[serde(default)]
+    pub skipped_suffix_value_zatoshi: u64,
+}
+
+/// The portion of a canonical plan excluded by the round's persisted prefix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkippedBundleSuffix {
+    pub(crate) bundles: u32,
+    pub(crate) notes: u32,
+    pub(crate) value_zatoshi: u64,
+}
+
+/// A canonical plan limited to the bundle rows that still exist for a round.
+pub(crate) struct EffectiveRoundBundlePlan {
+    pub(crate) plan: crate::note_bundling::ChunkResult,
+    pub(crate) skipped_suffix: SkippedBundleSuffix,
 }
 
 /// Validates that `bundle_index` is in `[0, bundle_count)`.
@@ -96,8 +124,25 @@ pub fn bundle_notes_for_index_for_round(
     voting_db: &VotingDb,
     round_id: &str,
 ) -> Result<Vec<NoteInfo>, VotingError> {
-    let policy = voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
-    bundle_notes_for_index_with_policy(round_note_infos, bundle_setup, bundle_index, policy)
+    if bundle_setup.bundle_count == 0 {
+        return Err(VotingError::InvalidInput {
+            message: "No eligible voting bundles were created for delegation".to_string(),
+        });
+    }
+    if bundle_index >= bundle_setup.bundle_count {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "bundle_index {bundle_index} is out of range for {} delegation bundles",
+                bundle_setup.bundle_count
+            ),
+        });
+    }
+    note_bundles_for_round(round_note_infos, voting_db, round_id)?
+        .get(bundle_index as usize)
+        .cloned()
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!("bundle_index {bundle_index} has no eligible note bundle"),
+        })
 }
 
 /// Returns the note rows for one bundle index under an explicit bundle policy.
@@ -151,7 +196,10 @@ pub fn note_bundles_for_round(
     round_id: &str,
 ) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
     let policy = voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
-    note_bundles_with_policy(notes, policy)
+    Ok(voting_db
+        .effective_round_bundle_plan_for_notes(round_id, notes, policy)?
+        .plan
+        .bundles)
 }
 
 /// Returns the eligible note bundles for a round note set under an explicit policy.
@@ -160,6 +208,61 @@ pub fn note_bundles_with_policy(
     policy: BundlePolicy,
 ) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
     Ok(canonical_note_bundle_plan_for_notes(notes, policy)?.bundles)
+}
+
+/// Limits an already validated canonical plan to the round's persisted prefix.
+fn limit_canonical_plan_to_persisted_prefix(
+    mut plan: crate::note_bundling::ChunkResult,
+    persisted_bundle_count: u32,
+) -> Result<EffectiveRoundBundlePlan, VotingError> {
+    if persisted_bundle_count == 0 {
+        return Ok(EffectiveRoundBundlePlan {
+            plan,
+            skipped_suffix: SkippedBundleSuffix::default(),
+        });
+    }
+
+    let prefix_len = persisted_bundle_count as usize;
+    if plan.bundles.len() < prefix_len {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "current note selection produces {} delegation bundles, but {persisted_bundle_count} bundle rows are already persisted",
+                plan.bundles.len()
+            ),
+        });
+    }
+
+    let skipped_bundles = plan.bundles.split_off(prefix_len);
+    let skipped_notes = skipped_bundles.iter().try_fold(0usize, |count, bundle| {
+        count
+            .checked_add(bundle.len())
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "skipped suffix note count overflow".to_string(),
+            })
+    })?;
+    let skipped_value_zatoshi = skipped_bundles.iter().try_fold(0u64, |value, bundle| {
+        value
+            .checked_add(raw_bundle_weight(bundle)?)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "skipped suffix note value overflow".to_string(),
+            })
+    })?;
+    plan.eligible_weight = quantized_bundle_set_weight(&plan.bundles)?;
+
+    Ok(EffectiveRoundBundlePlan {
+        plan,
+        skipped_suffix: SkippedBundleSuffix {
+            bundles: u32::try_from(skipped_bundles.len()).map_err(|_| {
+                VotingError::InvalidInput {
+                    message: "skipped suffix bundle count exceeds u32".to_string(),
+                }
+            })?,
+            notes: u32::try_from(skipped_notes).map_err(|_| VotingError::InvalidInput {
+                message: "skipped suffix note count exceeds u32".to_string(),
+            })?,
+            value_zatoshi: skipped_value_zatoshi,
+        },
+    })
 }
 
 /// Returns the unquantized zatoshi value for a bundle.
@@ -205,6 +308,103 @@ pub fn quantized_bundle_set_weight(bundles: &[Vec<NoteInfo>]) -> Result<u64, Vot
     })
 }
 
+/// One sidecar path's registry state.
+///
+/// `opener` serializes the slow open (busy timeout, migrations, retry sleeps)
+/// for this path alone, so the registry mutex is only ever held to look an
+/// entry up or record a result and never across SQLite work.
+#[cfg(not(target_arch = "wasm32"))]
+struct SidecarRegistryEntry {
+    opener: Arc<Mutex<()>>,
+    shared: Weak<crate::storage::SidecarConnection>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SidecarRegistryEntry {
+    /// An entry is live while a handle on its connection exists or while a
+    /// caller is inside its open.
+    fn is_live(&self) -> bool {
+        self.shared.strong_count() > 0 || Arc::strong_count(&self.opener) > 1
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type SidecarRegistry = Mutex<HashMap<PathBuf, SidecarRegistryEntry>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sidecar_registry() -> &'static SidecarRegistry {
+    static REGISTRY: OnceLock<SidecarRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_sidecar_registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, SidecarRegistryEntry>>
+{
+    sidecar_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Finds or creates the registry entry for `key`, returning its per-path
+/// opener lock and the shared connection if one is already open.
+#[cfg(not(target_arch = "wasm32"))]
+fn registered_sidecar(
+    key: &Path,
+) -> (
+    Arc<Mutex<()>>,
+    Option<Arc<crate::storage::SidecarConnection>>,
+) {
+    let mut registry = lock_sidecar_registry();
+    registry.retain(|_, entry| entry.is_live());
+    let entry = registry
+        .entry(key.to_path_buf())
+        .or_insert_with(|| SidecarRegistryEntry {
+            opener: Arc::new(Mutex::new(())),
+            shared: Weak::new(),
+        });
+    (Arc::clone(&entry.opener), entry.shared.upgrade())
+}
+
+/// The shared connection for `key`, if one is open.
+#[cfg(not(target_arch = "wasm32"))]
+fn registered_sidecar_connection(key: &Path) -> Option<Arc<crate::storage::SidecarConnection>> {
+    lock_sidecar_registry()
+        .get(key)
+        .and_then(|entry| entry.shared.upgrade())
+}
+
+/// Records the connection an open produced for `key`.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_sidecar_connection(key: &Path, shared: &Arc<crate::storage::SidecarConnection>) {
+    if let Some(entry) = lock_sidecar_registry().get_mut(key) {
+        entry.shared = Arc::downgrade(shared);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use crate::storage::sidecar_registry_key;
+
+/// Opening runs migrations, which need the write lock. Another process
+/// finishing its own open can hold that lock briefly, so retry a bounded
+/// number of times before reporting [`VotingError::DbBusy`].
+#[cfg(not(target_arch = "wasm32"))]
+fn open_connection_with_busy_retry(path: &str) -> Result<rusqlite::Connection, VotingError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match VotingDb::open_connection(path) {
+            Ok(conn) => return Ok(conn),
+            Err(error)
+                if error.kind() == crate::VotingErrorKind::DbBusy && attempt < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl VotingDb {
     /// Returns the sidecar voting DB path for a wallet DB path.
     ///
@@ -217,14 +417,56 @@ impl VotingDb {
     }
 
     /// Opens the voting sidecar database for `wallet_db_path` and binds `wallet_id`.
+    ///
+    /// One connection is kept per sidecar path for as long as any handle on
+    /// it is alive; later calls for the same path, for any wallet id, share
+    /// that connection through [`VotingDb::scoped`]. In-process writers then
+    /// serialize on the connection instead of contending for the SQLite file
+    /// lock, and hosts no longer need their own per-path write locks. A
+    /// `SQLITE_BUSY` from another process past the busy timeout surfaces as
+    /// [`VotingError::DbBusy`].
+    ///
+    /// Concurrent opens of one path serialize on that path alone: a slow open
+    /// of one sidecar (busy timeout, migrations, retries) never delays an
+    /// open of a different sidecar.
+    ///
+    /// An empty `wallet_id` is refused with [`VotingError::InvalidInput`]
+    /// before anything is opened: every wallet-scoped row is keyed by the id,
+    /// so an empty scope would silently read and write no wallet's state.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_wallet_sidecar(
         wallet_db_path: &Path,
         wallet_id: &str,
-    ) -> Result<Self, VotingError> {
+    ) -> Result<Arc<Self>, VotingError> {
+        if wallet_id.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "wallet id must not be empty".to_string(),
+            });
+        }
         let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
-        let db = Self::open_path(&sidecar_path)?;
+        let key = sidecar_registry_key(&sidecar_path);
+        let (opener, shared) = registered_sidecar(&key);
+        if let Some(shared) = shared {
+            return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
+        }
+        let _opening = opener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A contender may have finished the same open while this caller
+        // waited for the path's opener lock.
+        if let Some(shared) = registered_sidecar_connection(&key) {
+            return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
+        }
+        let path = sidecar_path
+            .to_str()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "voting database path is not valid UTF-8".to_string(),
+            })?;
+        let conn = open_connection_with_busy_retry(path)?;
+        let db = Self::from_connection(conn, path);
         db.set_wallet_id(wallet_id);
-        Ok(db)
+        register_sidecar_connection(&key, &db.shared_connection());
+        Ok(Arc::new(db))
     }
 
     /// Opens or creates a voting database at `path` and runs migrations.
@@ -263,6 +505,13 @@ impl VotingDb {
     ///
     /// Existing rounds are left unchanged. `session_json` is stored only on the
     /// first insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the round already exists for
+    /// another network or with different parameters (snapshot height,
+    /// election key, or roots): the stored parameters bind the round's
+    /// bundles and proofs, so a caller holding others must not build on it.
     pub fn ensure_round(
         &self,
         network: Network,
@@ -273,13 +522,25 @@ impl VotingDb {
         if self.has_round(&params.vote_round_id)? {
             let conn = self.conn();
             let wallet_id = self.wallet_id();
-            let stored_network =
-                queries::load_round_network(&conn, &params.vote_round_id, &wallet_id)?;
+            let (stored, stored_network) =
+                queries::load_round_params_with_network(&conn, &params.vote_round_id, &wallet_id)?;
             if stored_network != network {
                 return Err(VotingError::InvalidInput {
                     message: format!(
                         "round {} exists for network {:?}, not {:?}",
                         params.vote_round_id, stored_network, network
+                    ),
+                });
+            }
+            // The stored parameters bind every bundle, witness, and proof of
+            // the round. A caller holding different ones for the same id is
+            // working from another snapshot; setting up bundles under the
+            // stored ones would persist rows no later witness can validate.
+            if stored != *params {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {} exists with different parameters: stored snapshot height {} and roots differ from the supplied snapshot height {}",
+                        params.vote_round_id, stored.snapshot_height, params.snapshot_height
                     ),
                 });
             }
@@ -360,9 +621,31 @@ impl VotingDb {
             .collect()
     }
 
-    /// Deletes all persisted state for one round in the current wallet scope.
+    /// Deletes all persisted state for one round in the current wallet scope,
+    /// unless part of that round has already reached the network.
+    ///
+    /// Refuses with `DelegationAlreadyBroadcast` once a delegation transaction
+    /// hash, a VAN position, a chain submission, a vote or a delivered helper
+    /// share exists, because the round's stored setup is then the only thing
+    /// that can reproduce its voting weight. Use
+    /// [`VotingDb::delete_round_discarding_recovery`] to abandon such a round
+    /// on purpose.
     pub fn delete_round(&self, round_id: &str) -> Result<(), VotingError> {
         self.clear_round(round_id)
+    }
+
+    /// Deletes one round even though part of it has reached the network,
+    /// giving up the state that could recover its voting weight.
+    ///
+    /// The escape hatch behind [`VotingDb::delete_round`]'s refusal, for the
+    /// case where the voter has decided to abandon the round: a delegation
+    /// that cannot confirm and is being replaced by a corrected capability
+    /// package, ahead of any vote commitment. The round's governance
+    /// nullifiers are already spent on chain and its `van_comm_rand` cannot be
+    /// recomputed, so its weight does not come back. Every recovery path, and
+    /// every automatic cleanup, must use the checked deletion instead.
+    pub fn delete_round_discarding_recovery(&self, round_id: &str) -> Result<(), VotingError> {
+        self.clear_round_discarding_recovery(round_id)
     }
 
     /// Returns the policy a round's bundle plan must be derived with.
@@ -401,6 +684,36 @@ impl VotingDb {
             return Ok(requested.with_max_privacy_bundles(None));
         }
         Ok(requested)
+    }
+
+    /// Reconstructs the active plan and verifies it describes the persisted rows.
+    ///
+    /// A non-zero persisted bundle count is the authoritative prefix boundary,
+    /// but the count alone is insufficient: the retained canonical bundles must
+    /// also match the note identities stored for that prefix.
+    pub(crate) fn effective_round_bundle_plan_for_notes(
+        &self,
+        round_id: &str,
+        notes: &[NoteInfo],
+        policy: BundlePolicy,
+    ) -> Result<EffectiveRoundBundlePlan, VotingError> {
+        let plan = canonical_note_bundle_plan_for_notes(notes, policy)?;
+        self.effective_round_bundle_plan_for_canonical_plan(round_id, plan)
+    }
+
+    /// Limits a canonical plan to persisted rows and validates their identities.
+    pub(crate) fn effective_round_bundle_plan_for_canonical_plan(
+        &self,
+        round_id: &str,
+        plan: crate::note_bundling::ChunkResult,
+    ) -> Result<EffectiveRoundBundlePlan, VotingError> {
+        let persisted_bundle_count = self.get_bundle_count(round_id)?;
+        let effective_plan =
+            limit_canonical_plan_to_persisted_prefix(plan, persisted_bundle_count)?;
+        if persisted_bundle_count > 0 {
+            validate_persisted_bundle_notes(self, round_id, &effective_plan.plan.bundles)?;
+        }
+        Ok(effective_plan)
     }
 
     /// Creates bundle rows for `notes`, or validates existing bundle rows.
@@ -448,6 +761,9 @@ impl VotingDb {
                 privacy_trim_dropped_bundles: plan.privacy_trim.dropped_bundles,
                 privacy_trim_dropped_notes: plan.privacy_trim.dropped_notes,
                 privacy_trim_dropped_value_zatoshi: plan.privacy_trim.dropped_value,
+                skipped_suffix_bundles: 0,
+                skipped_suffix_notes: 0,
+                skipped_suffix_value_zatoshi: 0,
             });
         }
 
@@ -482,6 +798,9 @@ impl VotingDb {
             privacy_trim_dropped_bundles: plan.privacy_trim.dropped_bundles,
             privacy_trim_dropped_notes: plan.privacy_trim.dropped_notes,
             privacy_trim_dropped_value_zatoshi: plan.privacy_trim.dropped_value,
+            skipped_suffix_bundles: 0,
+            skipped_suffix_notes: 0,
+            skipped_suffix_value_zatoshi: 0,
         })
     }
 
@@ -528,32 +847,36 @@ impl VotingDb {
 
         let policy = self.effective_bundle_policy(round_id, policy)?;
         let plan = canonical_note_bundle_plan_for_notes(notes, policy)?;
-        let privacy_trim = plan.privacy_trim;
-        let bundles = plan.bundles;
-        if bundles.len() < stored_count as usize {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "current note selection produces {} delegation bundles, but {stored_count} bundle rows are already persisted for round {round_id}",
-                    bundles.len()
-                ),
-            });
-        }
-
-        let stored_bundles = &bundles[..stored_count as usize];
-        validate_persisted_bundle_notes(self, round_id, stored_bundles)?;
+        let effective_plan =
+            limit_canonical_plan_to_persisted_prefix(plan, stored_count).map_err(|error| {
+                match error {
+                    VotingError::InvalidInput { message }
+                        if message.contains("bundle rows are already persisted") =>
+                    {
+                        VotingError::InvalidInput {
+                            message: format!("{message} for round {round_id}"),
+                        }
+                    }
+                    other => other,
+                }
+            })?;
+        validate_persisted_bundle_notes(self, round_id, &effective_plan.plan.bundles)?;
         // Record the policy only after it reproduces the persisted prefix,
         // replacing unreadable policy JSON with the validated fallback.
         let conn = self.conn();
         queries::set_round_bundle_policy(&conn, round_id, &self.wallet_id(), policy)?;
         Ok(BundleLayout {
             bundle_count: stored_count,
-            eligible_weight: quantized_bundle_set_weight(stored_bundles)?,
+            eligible_weight: effective_plan.plan.eligible_weight,
             // This view describes the persisted prefix, not notes omitted while
             // planning the original bundle set.
             dropped_count: 0,
-            privacy_trim_dropped_bundles: privacy_trim.dropped_bundles,
-            privacy_trim_dropped_notes: privacy_trim.dropped_notes,
-            privacy_trim_dropped_value_zatoshi: privacy_trim.dropped_value,
+            privacy_trim_dropped_bundles: effective_plan.plan.privacy_trim.dropped_bundles,
+            privacy_trim_dropped_notes: effective_plan.plan.privacy_trim.dropped_notes,
+            privacy_trim_dropped_value_zatoshi: effective_plan.plan.privacy_trim.dropped_value,
+            skipped_suffix_bundles: effective_plan.skipped_suffix.bundles,
+            skipped_suffix_notes: effective_plan.skipped_suffix.notes,
+            skipped_suffix_value_zatoshi: effective_plan.skipped_suffix.value_zatoshi,
         })
     }
 }
@@ -600,6 +923,14 @@ fn round_eligible_weight(
 
     Ok(total.map(|v| v as u64))
 }
+
+#[cfg(test)]
+#[path = "tests/sidecar_registry.rs"]
+mod sidecar_registry_tests;
+
+#[cfg(test)]
+#[path = "tests/ensure_round.rs"]
+mod ensure_round_tests;
 
 #[cfg(test)]
 mod tests {
@@ -652,6 +983,17 @@ mod tests {
         assert_eq!(db.wallet_id(), "wallet-sidecar");
         assert!(db.list_rounds().unwrap().is_empty());
         assert!(sidecar.exists());
+
+        let other = VotingDb::open_wallet_sidecar(&wallet_path, "other-wallet").unwrap();
+        assert!(db.shares_connection_with(&other));
+        assert_eq!(other.wallet_id(), "other-wallet");
+        assert_eq!(db.wallet_id(), "wallet-sidecar");
+
+        drop(other);
+        drop(db);
+        let reopened = VotingDb::open_wallet_sidecar(&wallet_path, "wallet-sidecar").unwrap();
+        assert_eq!(reopened.wallet_id(), "wallet-sidecar");
+        drop(reopened);
 
         std::fs::remove_file(sidecar).ok();
     }
@@ -1272,6 +1614,16 @@ mod tests {
             reused.eligible_weight,
             5 * crate::governance::BALLOT_DIVISOR
         );
+        assert_eq!(reused.skipped_suffix_bundles, 1);
+        assert_eq!(reused.skipped_suffix_notes, 1);
+        assert_eq!(
+            reused.skipped_suffix_value_zatoshi,
+            crate::governance::BALLOT_DIVISOR
+        );
+        assert_eq!(
+            note_bundles_for_round(&notes, &db, ROUND_ID).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1303,6 +1655,50 @@ mod tests {
                 .unwrap(),
             BundlePolicy::default()
         );
+    }
+
+    #[test]
+    fn delete_skipped_bundles_preserves_chain_submission_evidence_atomically() {
+        let db = test_db("wallet-protected-prune");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, generation_digest, state, committed_post_reservations,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4,
+                         'submitting', 1, 10, 10)",
+                rusqlite::params![
+                    vec![0x61_u8; 32],
+                    ROUND_ID,
+                    "wallet-protected-prune",
+                    vec![0x62_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let bundles_before = db.get_bundle_count(ROUND_ID).unwrap();
+        let error = db.delete_skipped_bundles(ROUND_ID, 0).unwrap_err();
+        // Not `Busy`: the evidence is durable, so no wait clears it and a host
+        // retry loop must not be told the call is worth repeating.
+        assert!(
+            matches!(error, crate::VotingError::DelegationAlreadyBroadcast { .. }),
+            "{error:?}"
+        );
+        assert!(!error.retryable());
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), bundles_before);
+        let submissions: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM chain_submissions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(submissions, 1);
     }
 
     #[test]

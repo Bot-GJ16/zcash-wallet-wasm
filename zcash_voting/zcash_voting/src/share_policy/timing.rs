@@ -3,7 +3,7 @@ use crate::types::ShareDelegationRecord;
 use super::{ShareTimingPolicy, ShareTrackingSummary};
 
 /// Seconds to wait after helper submission time before polling share status.
-pub const SHARE_STATUS_CHECK_GRACE_SECONDS: u64 = 10;
+pub(crate) const SHARE_STATUS_CHECK_GRACE_SECONDS: u64 = 10;
 /// Minimum seconds before an unconfirmed share is considered overdue.
 pub const SHARE_MIN_OVERDUE_THRESHOLD_SECONDS: u64 = 30;
 /// Maximum seconds before an unconfirmed share is considered overdue.
@@ -11,11 +11,11 @@ pub const SHARE_MAX_OVERDUE_THRESHOLD_SECONDS: u64 = 60 * 60;
 /// Seconds near the vote end when resubmission should stop.
 pub const SHARE_RESUBMIT_CUTOFF_SECONDS: u64 = 10;
 /// Seconds between polls when all remaining shares are ready but unconfirmed.
-pub const SHARE_READY_POLL_INTERVAL_SECONDS: u64 = 15;
+pub(crate) const SHARE_READY_POLL_INTERVAL_SECONDS: u64 = 15;
 /// Maximum seconds to wait for a future share to become ready.
-pub const SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS: u64 = 30;
+pub(crate) const SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS: u64 = 30;
 /// Minimum seconds to sleep before the next tracking poll.
-pub const SHARE_MIN_TRACKING_DELAY_SECONDS: u64 = 3;
+pub(crate) const SHARE_MIN_TRACKING_DELAY_SECONDS: u64 = 3;
 /// Numerator for the last-moment share window fraction.
 pub const LAST_MOMENT_BUFFER_FRACTION_NUMERATOR: u64 = 2;
 /// Denominator for the last-moment share window fraction.
@@ -79,7 +79,7 @@ pub fn share_recovery_base_time(share: &ShareDelegationRecord) -> u64 {
 }
 
 /// Return true once a helper has had enough time to process this share.
-pub fn is_share_ready_for_status_check(
+pub(crate) fn is_share_ready_for_status_check(
     share: &ShareDelegationRecord,
     now_seconds: u64,
     policy: ShareTimingPolicy,
@@ -141,19 +141,26 @@ pub(crate) fn is_share_resubmission_window_open(
 
 /// Return the next delay after a share-status polling pass completes.
 ///
-/// This mirrors the current wallet polling cadence. If any unconfirmed share is
-/// still before its status-check grace time, the delay is the soonest future
-/// check time capped by `future_check_max_delay_seconds`. If every unconfirmed
-/// share is already ready, the delay is `ready_poll_interval_seconds` so callers
-/// do not tight-loop on past check times. The returned delay is always at least
-/// `min_tracking_delay_seconds`.
-pub fn next_tracking_delay_seconds(
+/// Two clocks compete, and the delay is whichever comes first:
+///
+/// - a share already past its status-check grace time is polled again after
+///   `ready_poll_interval_seconds`, so callers neither tight-loop on it nor
+///   leave it unpolled;
+/// - a share still before its grace time is waited for until it arrives,
+///   capped by `future_check_max_delay_seconds`.
+///
+/// Taking the sooner of the two matters when the two kinds coexist: a ready
+/// share must not queue behind an unrelated share whose check is further out.
+/// The returned delay is always at least `min_tracking_delay_seconds`, and
+/// `None` means no unconfirmed share remains — the signal to stop tracking.
+pub(crate) fn next_tracking_delay_seconds(
     shares: &[ShareDelegationRecord],
     now_seconds: u64,
     policy: ShareTimingPolicy,
 ) -> Option<u64> {
     let mut next_second: Option<u64> = None;
     let mut has_unconfirmed = false;
+    let mut has_ready = false;
 
     for share in shares.iter().filter(|share| !share.confirmed) {
         has_unconfirmed = true;
@@ -161,6 +168,8 @@ pub fn next_tracking_delay_seconds(
         let check_at = base_time.saturating_add(policy.status_check_grace_seconds);
         if check_at > now_seconds {
             next_second = min_second(next_second, check_at);
+        } else {
+            has_ready = true;
         }
     }
 
@@ -168,11 +177,18 @@ pub fn next_tracking_delay_seconds(
         return None;
     }
 
-    let delay_seconds = match next_second {
-        Some(next) => next
-            .saturating_sub(now_seconds)
-            .min(policy.future_check_max_delay_seconds),
-        None => policy.ready_poll_interval_seconds,
+    let future_delay = next_second.map(|next| {
+        next.saturating_sub(now_seconds)
+            .min(policy.future_check_max_delay_seconds)
+    });
+    let ready_delay = has_ready.then_some(policy.ready_poll_interval_seconds);
+    let delay_seconds = match (ready_delay, future_delay) {
+        (Some(ready), Some(future)) => ready.min(future),
+        (Some(ready), None) => ready,
+        (None, Some(future)) => future,
+        // Every unconfirmed share was counted as ready or future, so one of
+        // the two is always set once `has_unconfirmed` holds.
+        (None, None) => policy.ready_poll_interval_seconds,
     };
 
     Some(delay_seconds.max(policy.min_tracking_delay_seconds))

@@ -208,6 +208,21 @@ impl VotingDb {
                     DelegationPhase::Submitted | DelegationPhase::Confirmed
                 )
             {
+                #[cfg(feature = "browser")]
+                if let Some(hash) = self.get_delegation_tx_hash(round, bundle)? {
+                    let preserved: bool = self
+                        .conn()
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM legacy_delegation_evidence
+                             WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3 AND tx_hash=?4)",
+                            params![round, self.wallet_id(), bundle, hash],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| invalid())?;
+                    if preserved {
+                        continue;
+                    }
+                }
                 return Err(invalid());
             }
         }
@@ -417,12 +432,13 @@ impl VotingDb {
         let wallet = self.wallet_id();
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|_| invalid())?;
-        crate::confirmation::record_delegation_confirmation_fields(
+        crate::confirmation::apply_delegation_confirmation_with_conn(
             &tx,
-            round,
             &wallet,
+            round,
             bundle,
-            &confirmation,
+            Some(&confirmation.tx_hash),
+            u64::from(confirmation.van_leaf_position),
         )
         .map_err(|_| invalid())?;
         let changed=tx.execute("UPDATE delegation_attempts SET outcome='accepted',confirmation_tx_hash=?4,confirmation_van_position=?5 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3",
@@ -432,13 +448,79 @@ impl VotingDb {
         }
         tx.commit().map_err(|_| invalid())
     }
+
+    /// Confirm a pre-journal browser delegation using its already-persisted
+    /// transaction hash. This path never creates or broadcasts a transaction.
+    #[cfg(feature = "browser")]
+    pub fn confirm_legacy_delegation(
+        &self,
+        round: &str,
+        bundle: u32,
+        hash: &str,
+        events: &[TxEvent],
+    ) -> Result<(), VotingError> {
+        validate_legacy_tx_hash(hash)?;
+        let confirmation = strict_delegation_confirmation(round, hash, events)?;
+        let wallet = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| invalid())?;
+        let stored: Option<(Option<String>, Option<i64>)> = tx
+            .query_row(
+                "SELECT delegation_tx_hash, van_leaf_position FROM bundles
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3",
+                params![round, wallet, bundle],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| invalid())?;
+        if stored != Some((Some(hash.to_owned()), None))
+            || tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM delegation_attempts
+                     WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3)",
+                    params![round, wallet, bundle],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|_| invalid())?
+            || !tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_delegation_evidence
+                     WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3 AND tx_hash=?4)",
+                    params![round, wallet, bundle, hash],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|_| invalid())?
+        {
+            return Err(invalid());
+        }
+        crate::confirmation::apply_delegation_confirmation_with_conn(
+            &tx,
+            &wallet,
+            round,
+            bundle,
+            Some(&confirmation.tx_hash),
+            u64::from(confirmation.van_leaf_position),
+        )
+        .map_err(|_| invalid())?;
+        tx.commit().map_err(|_| invalid())
+    }
+}
+
+#[cfg(feature = "browser")]
+fn validate_legacy_tx_hash(hash: &str) -> Result<(), VotingError> {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn strict_delegation_confirmation(
     round: &str,
     hash: &str,
     events: &[TxEvent],
-) -> Result<crate::confirmation::DelegationConfirmation, VotingError> {
+) -> Result<LegacyDelegationConfirmation, VotingError> {
     if round.len() != 64
         || !round
             .bytes()
@@ -489,10 +571,15 @@ fn strict_delegation_confirmation(
         return Err(invalid());
     }
     let van_leaf_position = raw_position.parse::<u32>().map_err(|_| invalid())?;
-    Ok(crate::confirmation::DelegationConfirmation {
+    Ok(LegacyDelegationConfirmation {
         tx_hash: hash.into(),
         van_leaf_position,
     })
+}
+
+struct LegacyDelegationConfirmation {
+    tx_hash: String,
+    van_leaf_position: u32,
 }
 
 pub fn delegation_request(base: &str, canonical: &CanonicalDelegation) -> OwnedHttpRequest {
@@ -523,6 +610,23 @@ pub fn delegation_status_request(base: &str, canonical: &CanonicalDelegation) ->
         max_response_bytes: API_LIMIT,
         kind: RequestKind::Idempotent,
     }
+}
+
+#[cfg(feature = "browser")]
+pub fn legacy_delegation_status_request(
+    base: &str,
+    hash: &str,
+) -> Result<OwnedHttpRequest, VotingError> {
+    validate_legacy_tx_hash(hash)?;
+    Ok(OwnedHttpRequest {
+        method: "GET".into(),
+        url: format!("{}/shielded-vote/v1/tx/{hash}", base.trim_end_matches('/')),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: 30_000,
+        max_response_bytes: API_LIMIT,
+        kind: RequestKind::Idempotent,
+    })
 }
 
 #[derive(Deserialize)]

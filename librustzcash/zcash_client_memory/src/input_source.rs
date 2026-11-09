@@ -6,8 +6,8 @@ use zcash_client_backend::{
 };
 use zcash_client_backend::{
     data_api::{
-        AccountMeta, InputSource, MaxSpendMode, NoteFilter, PoolMeta, ReceivedNotes, TargetValue,
-        WalletRead,
+        Account as _, AccountMeta, ChangeReceivers, InputSource, MaxSpendMode, NoteFilter,
+        PoolMeta, ReceivedNotes, TargetValue, WalletRead,
         locking::LockFilter,
         wallet::{ConfirmationsPolicy, TargetHeight},
     },
@@ -47,6 +47,14 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
     type Error = crate::error::Error;
     type AccountId = AccountId;
     type NoteRef = NoteId;
+
+    fn get_change_receivers(&self, account: AccountId) -> Result<ChangeReceivers, Self::Error> {
+        let account = self
+            .accounts
+            .get(account)
+            .ok_or(Error::AccountUnknown(account))?;
+        Ok(ChangeReceivers::from_uivk(&account.uivk()))
+    }
 
     fn anchor_computable(
         &self,
@@ -490,6 +498,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
             sapling_pool_meta,
             orchard_pool_meta,
             ironwood_pool_meta,
+            self.get_change_receivers(account_id)?,
         ))
     }
 }

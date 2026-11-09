@@ -36,12 +36,6 @@ use zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID};
     zcash_unstable = "nutachyon"
 ))]
 use zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID};
-#[cfg(all(
-    any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"),
-    zcash_unstable = "nu7",
-    feature = "zip-233",
-))]
-use zcash_protocol::value::Zatoshis;
 #[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
 use {
     common::{Global, determine_lock_time},
@@ -53,14 +47,7 @@ use {
 };
 
 #[cfg(any(feature = "io-finalizer", feature = "signer"))]
-use zcash_primitives::transaction::sighash_v6::v6_signature_hash;
-#[cfg(any(feature = "io-finalizer", feature = "signer"))]
-use {
-    blake2b_simd::Hash as Blake2bHash,
-    zcash_primitives::transaction::{
-        TxDigests, sighash::SignableInput, sighash_v5::v5_signature_hash,
-    },
-};
+use zcash_primitives::transaction::sighash::{PrecomputedSighashData, SignableInput};
 
 pub mod roles;
 
@@ -235,7 +222,7 @@ pub mod v1 {
             .unwrap()
             .build()
             .unwrap();
-            pczt.ironwood.bsk = Some([1; 32]);
+            pczt.ironwood.bsk = Some(crate::common::SecretKeyBytes::new([1; 32]));
             assert!(matches!(
                 super::Pczt::try_from(pczt),
                 Err(crate::EncodingError::UnsupportedTxVersion)
@@ -420,6 +407,15 @@ pub enum EncodingError {
     RequiresV2,
 }
 
+/// A version of the PCZT serialization format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodingVersion {
+    /// The version 1 encoding, produced by [`v1::Pczt::serialize`].
+    V1,
+    /// The version 2 encoding, produced by [`v2::Pczt::serialize`].
+    V2,
+}
+
 impl Pczt {
     /// Whether this PCZT carries any inputs or outputs in the given pool.
     ///
@@ -461,8 +457,23 @@ impl Pczt {
     /// predate the v2 encoding), and the v2 encoding otherwise.
     ///
     /// To force a specific PCZT version, use [`v1::Pczt`] or [`v2::Pczt`]
-    /// directly.
+    /// directly. To learn the encoding version that was used, use
+    /// [`Pczt::serialize_with_version`].
     pub fn serialize(self) -> Result<Vec<u8>, EncodingError> {
+        self.serialize_with_version().map(|(_, bytes)| bytes)
+    }
+
+    /// Serializes this PCZT, reporting the encoding version it was serialized
+    /// in alongside the encoded bytes.
+    ///
+    /// The encoding version is selected as documented for [`Pczt::serialize`],
+    /// which returns the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EncodingError`] if this PCZT's content cannot be
+    /// represented in any encoding version.
+    pub fn serialize_with_version(self) -> Result<(EncodingVersion, Vec<u8>), EncodingError> {
         // Fast pre-checks for the conditions that most commonly rule out the
         // v1 encoding, avoiding the speculative clone below.
         let requires_v2 = match self.global.tx_version {
@@ -476,10 +487,10 @@ impl Pczt {
             // conversions; attempting the conversion is the single source of
             // truth for them.
             if let Ok(v1) = v1::Pczt::try_from(self.clone()) {
-                return Ok(v1.serialize());
+                return Ok((EncodingVersion::V1, v1.serialize()));
             }
         }
-        Ok(v2::Pczt::try_from(self)?.serialize())
+        Ok((EncodingVersion::V2, v2::Pczt::try_from(self)?.serialize()))
     }
 
     /// Resolves derived or compact field representations carried by this PCZT.
@@ -612,8 +623,6 @@ impl Pczt {
                 consensus_branch_id,
                 lock_time,
                 global.expiry_height.into(),
-                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-                Zatoshis::ZERO,
                 transparent_bundle,
                 sapling_bundle,
                 orchard_bundle,
@@ -624,8 +633,6 @@ impl Pczt {
                 consensus_branch_id,
                 lock_time,
                 global.expiry_height.into(),
-                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-                Zatoshis::ZERO,
                 transparent_bundle,
                 sapling_bundle,
                 orchard_bundle,
@@ -636,8 +643,6 @@ impl Pczt {
                 consensus_branch_id,
                 lock_time,
                 global.expiry_height.into(),
-                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
-                Zatoshis::ZERO,
                 transparent_bundle,
                 None,
                 sapling_bundle,
@@ -700,23 +705,27 @@ impl Authorization for EffectsOnly {
     type OrchardAuth = ::orchard::bundle::EffectsOnly;
 }
 
-/// Helper to produce the correct sighash for a PCZT.
+/// Computes the digests that the signature hashes of `tx_data` commit to.
+///
+/// `global` must be the global data of the PCZT that `tx_data` was extracted from.
+#[cfg(any(feature = "io-finalizer", feature = "signer"))]
+pub(crate) fn precompute_sighash_data(
+    global: &Global,
+    tx_data: TransactionData<EffectsOnly>,
+) -> Result<PrecomputedSighashData<EffectsOnly>, ExtractError> {
+    PrecomputedSighashData::new_zip244(tx_data).map_err(|_| ExtractError::UnsupportedTxVersion {
+        version: global.tx_version,
+        version_group_id: global.version_group_id,
+    })
+}
+
+/// Computes the signature hash of an input to the transaction extracted from a PCZT.
 #[cfg(any(feature = "io-finalizer", feature = "signer"))]
 pub(crate) fn sighash(
-    tx_data: &TransactionData<EffectsOnly>,
+    sighash_data: &PrecomputedSighashData<EffectsOnly>,
     signable_input: &SignableInput,
-    txid_parts: &TxDigests<Blake2bHash>,
 ) -> [u8; 32] {
-    match tx_data.version() {
-        TxVersion::V5 => v5_signature_hash(tx_data, signable_input, txid_parts),
-        TxVersion::V6 => v6_signature_hash(tx_data, signable_input, txid_parts),
-        #[cfg(zcash_unstable = "nutachyon")]
-        TxVersion::V7 => v6_signature_hash(tx_data, signable_input, txid_parts),
-        _ => unreachable!("PCZT only supports V5 and later transaction data"),
-    }
-    .as_ref()
-    .try_into()
-    .expect("correct length")
+    *sighash_data.signature_hash(signable_input).as_ref()
 }
 
 /// Errors that can occur while parsing PCZT bundles and extracting transaction data.
@@ -841,11 +850,48 @@ impl core::error::Error for ParseError {}
 
 #[cfg(all(test, any(feature = "io-finalizer", feature = "signer")))]
 mod extraction_tests {
-    #[cfg(zcash_unstable = "nutachyon")]
-    use zcash_primitives::transaction::TxVersion;
+    use zcash_primitives::transaction::{
+        TxVersion,
+        sighash::{PrecomputedSighashData, SignableInput},
+        txid::{TxIdDigester, to_txid},
+    };
     use zcash_protocol::consensus::BranchId;
 
     use crate::{ExtractError, roles::creator::Creator};
+
+    #[test]
+    fn nu7_pczt_preserves_canonical_v6_digests() {
+        /// Match the independent empty NU7 v6 fixture in the transaction codec tests.
+        const EXPIRY_HEIGHT: u32 = 1;
+        /// Mainnet's registered coin type; no keys or addresses are present in this fixture.
+        const COIN_TYPE: u32 = 133;
+        /// Independently calculated with Python hashlib.blake2b using ZIP 244/229 domains.
+        const EXPECTED_DIGEST: &str =
+            "78296c68a370c2e1f058d997c81c7b011c4562c52fc5ca2994ad59cd179fbe9e";
+        let pczt = Creator::new(BranchId::Nu7.into(), EXPIRY_HEIGHT, COIN_TYPE, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let data = pczt.into_effects().unwrap();
+        assert_eq!(data.version(), TxVersion::V6);
+        let digests = data.digest(TxIdDigester);
+        let expected = hex::decode(EXPECTED_DIGEST).unwrap();
+        assert_eq!(
+            to_txid(data.version(), data.consensus_branch_id(), &digests)
+                .expect("Creator::new returns a compatible version")
+                .as_ref()
+                .as_slice(),
+            expected
+        );
+        assert_eq!(
+            PrecomputedSighashData::new_zip244(data)
+                .unwrap()
+                .signature_hash(&SignableInput::Shielded)
+                .as_ref()
+                .as_slice(),
+            expected
+        );
+    }
 
     #[test]
     fn v5_pczt_with_ironwood_data_does_not_extract() {
@@ -859,7 +905,7 @@ mod extraction_tests {
         .unwrap()
         .build()
         .unwrap();
-        pczt.ironwood.bsk = Some([1; 32]);
+        pczt.ironwood.bsk = Some(crate::common::SecretKeyBytes::new([1; 32]));
         assert!(matches!(
             pczt.into_effects(),
             Err(ExtractError::IronwoodNotSupported)
@@ -909,7 +955,7 @@ mod extraction_tests {
 mod serialize_tests {
     use zcash_protocol::consensus::BranchId;
 
-    use crate::roles::creator::Creator;
+    use crate::{EncodingVersion, roles::creator::Creator};
 
     fn encoding_version(bytes: &[u8]) -> u32 {
         assert_eq!(&bytes[..4], crate::MAGIC_BYTES);
@@ -936,7 +982,7 @@ mod serialize_tests {
 
         // Non-canonical Ironwood data forces the v2 encoding.
         let mut with_ironwood = pczt.clone();
-        with_ironwood.ironwood.bsk = Some([1; 32]);
+        with_ironwood.ironwood.bsk = Some(crate::common::SecretKeyBytes::new([1; 32]));
         assert_eq!(
             encoding_version(&with_ironwood.serialize().unwrap()),
             crate::PCZT_VERSION_2,
@@ -966,5 +1012,46 @@ mod serialize_tests {
             encoding_version(&v6.serialize().unwrap()),
             crate::PCZT_VERSION_2,
         );
+    }
+
+    #[test]
+    fn serialize_with_version_reports_the_encoding_used() {
+        // A v1-representable (v5, canonical-empty Ironwood) PCZT.
+        let v5 = Creator::new(
+            BranchId::Nu6.into(),
+            10_000_000,
+            133,
+            Some([0; 32]),
+            Some([0; 32]),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        // A v6 transaction, which the v1 encoding cannot represent.
+        let v6 = Creator::new(
+            BranchId::Nu6_3.into(),
+            10_000_000,
+            133,
+            Some([0; 32]),
+            Some([0; 32]),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        for (pczt, expected, expected_header) in [
+            (v5, EncodingVersion::V1, crate::PCZT_VERSION_1),
+            (v6, EncodingVersion::V2, crate::PCZT_VERSION_2),
+        ] {
+            let (version, bytes) = pczt.clone().serialize_with_version().unwrap();
+
+            // The reported version is the one the encoding's header carries.
+            assert_eq!(version, expected);
+            assert_eq!(encoding_version(&bytes), expected_header);
+
+            // `serialize` produces exactly these bytes.
+            assert_eq!(pczt.serialize().unwrap(), bytes);
+        }
     }
 }
