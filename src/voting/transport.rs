@@ -6,15 +6,12 @@ use futures_util::lock::{Mutex, MutexGuard};
 use std::{cell::Cell, sync::LazyLock};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use zcash_voting::platform::{
-    HttpTransport, OwnedHttpRequest, OwnedHttpResponse, TransportError, TransportFuture,
-};
+use zcash_voting::platform::{HttpTransport, OwnedHttpRequest, OwnedHttpResponse, TransportError, TransportFuture};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BrowserFetchTransport;
 
-static FETCH_SLOTS: LazyLock<[Mutex<()>; 16]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+static FETCH_SLOTS: LazyLock<[Mutex<()>; 16]> = LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
 
 struct ActiveFetch {
     // Struct fields drop in declaration order: abort before waking queued dispatches.
@@ -30,20 +27,15 @@ impl HttpTransport for BrowserFetchTransport {
         let kind = request.kind;
         let (mut sender, receiver) = oneshot::channel();
         spawn_local(async move {
-            let result =
-                match select(Box::pin(sender.cancellation()), Box::pin(fetch(request))).await {
-                    Either::Left(_) => return,
-                    Either::Right((result, _)) => result,
-                };
+            let result = match select(Box::pin(sender.cancellation()), Box::pin(fetch(request))).await {
+                Either::Left(_) => return,
+                Either::Right((result, _)) => result,
+            };
             let _ = sender.send(result);
         });
         // Only owned Rust data crosses this Send future. Lost local execution
         // cannot prove that a non-idempotent request was never dispatched.
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or_else(|_| Err(TransportError::after_dispatch(kind)))
-        })
+        Box::pin(async move { receiver.await.unwrap_or_else(|_| Err(TransportError::after_dispatch(kind))) })
     }
 }
 
@@ -64,10 +56,7 @@ impl Drop for FetchCleanup {
 }
 
 fn method(value: &wasm_bindgen::JsValue, name: &str) -> Result<js_sys::Function, ()> {
-    js_sys::Reflect::get(value, &name.into())
-        .map_err(|_| ())?
-        .dyn_into()
-        .map_err(|_| ())
+    js_sys::Reflect::get(value, &name.into()).map_err(|_| ())?.dyn_into().map_err(|_| ())
 }
 
 struct ReaderCleanup(wasm_bindgen::JsValue);
@@ -88,10 +77,7 @@ impl Drop for ReaderCleanup {
     }
 }
 
-async fn read_bounded_body(
-    response: &web_sys::Response,
-    request: &OwnedHttpRequest,
-) -> Result<Vec<u8>, TransportError> {
+async fn read_bounded_body(response: &web_sys::Response, request: &OwnedHttpRequest) -> Result<Vec<u8>, TransportError> {
     let failure = || TransportError::after_dispatch(request.kind);
     let stream = js_sys::Reflect::get(response, &"body".into()).map_err(|_| failure())?;
     if stream.is_null() {
@@ -109,8 +95,7 @@ async fn read_bounded_body(
     let mut body = Vec::new();
     loop {
         let remaining = request.max_response_bytes.saturating_sub(body.len());
-        let buffer =
-            js_sys::Uint8Array::new_with_length(remaining.saturating_add(1).min(16 * 1024) as u32);
+        let buffer = js_sys::Uint8Array::new_with_length(remaining.saturating_add(1).min(16 * 1024) as u32);
         let promise: js_sys::Promise = method(&reader.0, "read")
             .map_err(|_| failure())?
             .call1(&reader.0, &buffer)
@@ -129,10 +114,7 @@ async fn read_bounded_body(
             let bytes: js_sys::Uint8Array = value.dyn_into().map_err(|_| failure())?;
             body.extend_from_slice(&bytes.to_vec());
         }
-        match js_sys::Reflect::get(&result, &"done".into())
-            .map_err(|_| failure())?
-            .as_bool()
-        {
+        match js_sys::Reflect::get(&result, &"done".into()).map_err(|_| failure())?.as_bool() {
             Some(true) => return Ok(body),
             Some(false) => {}
             None => return Err(failure()),
@@ -151,17 +133,14 @@ async fn fetch(request: OwnedHttpRequest) -> Result<OwnedHttpResponse, Transport
     init.set_signal(Some(&controller.signal()));
     let headers = web_sys::Headers::new().map_err(|_| TransportError::Definite)?;
     for (name, value) in &request.headers {
-        headers
-            .append(name, value)
-            .map_err(|_| TransportError::Definite)?;
+        headers.append(name, value).map_err(|_| TransportError::Definite)?;
     }
     init.set_headers(&headers);
     if !request.body.is_empty() {
         let body = js_sys::Uint8Array::from(request.body.as_slice());
         init.set_body(&body);
     }
-    let js_request = web_sys::Request::new_with_str_and_init(&request.url, &init)
-        .map_err(|_| TransportError::Definite)?;
+    let js_request = web_sys::Request::new_with_str_and_init(&request.url, &init).map_err(|_| TransportError::Definite)?;
     let fetch = method(&global, "fetch").map_err(|_| TransportError::Definite)?;
 
     let (timeout_sender, timeout_receiver) = oneshot::channel::<()>();
@@ -175,11 +154,7 @@ async fn fetch(request: OwnedHttpRequest) -> Result<OwnedHttpResponse, Transport
     });
     let timeout_id = method(&global, "setTimeout")
         .map_err(|_| TransportError::Definite)?
-        .call2(
-            &global,
-            timeout_callback.as_ref().unchecked_ref(),
-            &(request.timeout_ms as f64).into(),
-        )
+        .call2(&global, timeout_callback.as_ref().unchecked_ref(), &(request.timeout_ms as f64).into())
         .map_err(|_| TransportError::Definite)?
         .as_f64()
         .ok_or(TransportError::Definite)? as i32;
@@ -195,9 +170,7 @@ async fn fetch(request: OwnedHttpRequest) -> Result<OwnedHttpResponse, Transport
     let response = async {
         // Queue time is covered by the already-running request timer. Capacity
         // follows the local Fetch lifetime, not the Send receiver's lifetime.
-        let (permit, _, _) =
-            futures_util::future::select_all(FETCH_SLOTS.iter().map(|slot| Box::pin(slot.lock())))
-                .await;
+        let (permit, _, _) = futures_util::future::select_all(FETCH_SLOTS.iter().map(|slot| Box::pin(slot.lock()))).await;
         let _active = ActiveFetch {
             _cleanup: cleanup,
             _permit: permit,
@@ -210,19 +183,11 @@ async fn fetch(request: OwnedHttpRequest) -> Result<OwnedHttpResponse, Transport
             .map_err(|_| after_dispatch())?
             .dyn_into()
             .map_err(|_| after_dispatch())?;
-        let value = JsFuture::from(promise)
-            .await
-            .map_err(|_| after_dispatch())?;
+        let value = JsFuture::from(promise).await.map_err(|_| after_dispatch())?;
         let response: web_sys::Response = value.dyn_into().map_err(|_| after_dispatch())?;
-        let content_length = response
-            .headers()
-            .get("Content-Length")
-            .map_err(|_| after_dispatch())?;
+        let content_length = response.headers().get("Content-Length").map_err(|_| after_dispatch())?;
         request.check_content_length(content_length.as_deref())?;
-        let content_type = response
-            .headers()
-            .get("Content-Type")
-            .map_err(|_| after_dispatch())?;
+        let content_type = response.headers().get("Content-Type").map_err(|_| after_dispatch())?;
         let body = read_bounded_body(&response, &request).await?;
         Ok(OwnedHttpResponse {
             status: response.status(),
@@ -232,11 +197,7 @@ async fn fetch(request: OwnedHttpRequest) -> Result<OwnedHttpResponse, Transport
     };
     let result = match select(Box::pin(response), timeout_receiver).await {
         Either::Left((result, _)) => result,
-        Either::Right((_, _)) => Err(if dispatched.get() {
-            after_dispatch()
-        } else {
-            TransportError::Definite
-        }),
+        Either::Right((_, _)) => Err(if dispatched.get() { after_dispatch() } else { TransportError::Definite }),
     };
     result
 }
@@ -244,10 +205,7 @@ async fn fetch(request: OwnedHttpRequest) -> Result<OwnedHttpResponse, Transport
 /// Local HTTP fixture entry point, returning `[status, body]` to JavaScript.
 #[cfg(debug_assertions)]
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = votingTestFetch)]
-pub async fn voting_test_fetch(
-    url: String,
-    limit: usize,
-) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
+pub async fn voting_test_fetch(url: String, limit: usize) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
     use zcash_voting::platform::RequestKind;
 
     let response = BrowserFetchTransport
@@ -262,6 +220,5 @@ pub async fn voting_test_fetch(
         })
         .await
         .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
-    serde_wasm_bindgen::to_value(&(response.status, response.body))
-        .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))
+    serde_wasm_bindgen::to_value(&(response.status, response.body)).map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))
 }

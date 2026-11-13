@@ -20,12 +20,7 @@ pub(crate) mod tests {
             assert_eq!(req.kind, RequestKind::Idempotent);
             assert!(req.max_response_bytes == CONFIG_LIMIT || req.max_response_bytes == API_LIMIT);
             self.urls.lock().unwrap().push(req.url);
-            let reply = self
-                .replies
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("unexpected request");
+            let reply = self.replies.lock().unwrap().pop_front().expect("unexpected request");
             Box::pin(async { reply })
         }
     }
@@ -43,10 +38,7 @@ pub(crate) mod tests {
         }
     }
     fn source() -> String {
-        format!(
-            "https://example.com/static.json?checksum=sha256:{}",
-            hex::encode(Sha256::digest(STATIC))
-        )
+        format!("https://example.com/static.json?checksum=sha256:{}", hex::encode(Sha256::digest(STATIC)))
     }
     pub(crate) fn active() -> serde_json::Value {
         serde_json::json!({"vote_round_id": BASE64.encode(hex::decode(ID).unwrap()), "snapshot_height": 100,
@@ -58,23 +50,12 @@ pub(crate) mod tests {
     fn envelope(entries: Vec<serde_json::Value>) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"rounds": entries})).unwrap()
     }
-    pub(crate) async fn discover(
-        entries: Vec<serde_json::Value>,
-        now: u64,
-    ) -> (VotingDiscovery, BTreeMap<String, TrustedRound>) {
+    pub(crate) async fn discover(entries: Vec<serde_json::Value>, now: u64) -> (VotingDiscovery, BTreeMap<String, TrustedRound>) {
         discover_for(VotingNetwork::Testnet, entries, now).await
     }
-    pub(crate) async fn discover_for(
-        network: VotingNetwork,
-        entries: Vec<serde_json::Value>,
-        now: u64,
-    ) -> (VotingDiscovery, BTreeMap<String, TrustedRound>) {
+    pub(crate) async fn discover_for(network: VotingNetwork, entries: Vec<serde_json::Value>, now: u64) -> (VotingDiscovery, BTreeMap<String, TrustedRound>) {
         discover_with_source(
-            &fixture(vec![
-                ok(STATIC.to_vec()),
-                ok(DYNAMIC.to_vec()),
-                ok(envelope(entries)),
-            ]),
+            &fixture(vec![ok(STATIC.to_vec()), ok(DYNAMIC.to_vec()), ok(envelope(entries))]),
             network,
             &source(),
             now,
@@ -101,16 +82,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn discovery_binds_optional_service_network_to_selected_context() {
         for (context, accepted, rejected) in [
-            (
-                VotingNetwork::Testnet,
-                ["test", "testnet"],
-                ["main", "mainnet"],
-            ),
-            (
-                VotingNetwork::Mainnet,
-                ["main", "mainnet"],
-                ["test", "testnet"],
-            ),
+            (VotingNetwork::Testnet, ["test", "testnet"], ["main", "mainnet"]),
+            (VotingNetwork::Mainnet, ["main", "mainnet"], ["test", "testnet"]),
         ] {
             let mut absent = active();
             absent.as_object_mut().unwrap().remove("network");
@@ -136,11 +109,7 @@ pub(crate) mod tests {
                 entry["network"] = value.clone();
                 let (discovery, rounds) = discover_for(context, vec![entry], 1500).await;
                 assert!(rounds.is_empty(), "{context:?}: {value}");
-                assert_eq!(
-                    discovery.rejected[0].code,
-                    VotingErrorCode::NetworkMismatch,
-                    "{context:?}: {value}"
-                );
+                assert_eq!(discovery.rejected[0].code, VotingErrorCode::NetworkMismatch, "{context:?}: {value}");
             }
         }
     }
@@ -170,20 +139,15 @@ pub(crate) mod tests {
             let clock = Arc::new(AtomicU64::new(initial));
             let samples = AtomicUsize::new(0);
             let transport = AdvancingTransport {
-                fixture: fixture(vec![
-                    ok(STATIC.to_vec()),
-                    ok(DYNAMIC.to_vec()),
-                    ok(envelope(vec![active()])),
-                ]),
+                fixture: fixture(vec![ok(STATIC.to_vec()), ok(DYNAMIC.to_vec()), ok(envelope(vec![active()]))]),
                 clock: clock.clone(),
             };
-            let (discovery, trusted) =
-                discover_with_clock(&transport, VotingNetwork::Testnet, &source(), || {
-                    samples.fetch_add(1, Ordering::SeqCst);
-                    Ok(clock.load(Ordering::SeqCst))
-                })
-                .await
-                .unwrap();
+            let (discovery, trusted) = discover_with_clock(&transport, VotingNetwork::Testnet, &source(), || {
+                samples.fetch_add(1, Ordering::SeqCst);
+                Ok(clock.load(Ordering::SeqCst))
+            })
+            .await
+            .unwrap();
             assert_eq!(clock.load(Ordering::SeqCst), initial + 3);
             assert_eq!(samples.load(Ordering::SeqCst), 1);
             assert_eq!(trusted.is_empty(), expired, "initial clock {initial}");
@@ -204,10 +168,7 @@ pub(crate) mod tests {
         let (discovery, trusted) = discover(vec![entry, other], 1500).await;
         assert_eq!(discovery.accepted.len(), 1);
         assert_eq!(discovery.rejected.len(), 1);
-        assert_eq!(
-            discovery.rejected[0].code,
-            VotingErrorCode::RoundUnauthenticated
-        );
+        assert_eq!(discovery.rejected[0].code, VotingErrorCode::RoundUnauthenticated);
         let round = &trusted[ID];
         assert_eq!(round.params.ea_pk, [7; 32]);
         assert_eq!(round.vote_server_urls, ["https://vote.example.com"]);
@@ -216,18 +177,13 @@ pub(crate) mod tests {
         let identity = round.identity();
         assert_eq!(
             round
-                .compare_identity(
-                    &serde_json::from_slice(&serde_json::to_vec(&identity).unwrap()).unwrap()
-                )
+                .compare_identity(&serde_json::from_slice(&serde_json::to_vec(&identity).unwrap()).unwrap())
                 .unwrap(),
             ()
         );
         let mut changed = round.clone();
         changed.params.nc_root[0] ^= 1;
-        assert_eq!(
-            changed.compare_identity(&identity).unwrap_err().code,
-            VotingErrorCode::RecoveryConflict
-        );
+        assert_eq!(changed.compare_identity(&identity).unwrap_err().code, VotingErrorCode::RecoveryConflict);
         changed = round.clone();
         changed.proposals[0].title.push('!');
         assert!(changed.compare_identity(&identity).is_err());
@@ -236,17 +192,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn invalid_dynamic_round_does_not_block_authenticated_discovery() {
         let mut dynamic: Value = serde_json::from_slice(DYNAMIC).unwrap();
-        dynamic["rounds"]["7ce96992c8eb47cf4c75ec40fbc000917ecd35489c048b35b08f15226ee34d47"] =
-            dynamic["rounds"][ID].clone();
+        dynamic["rounds"]["7ce96992c8eb47cf4c75ec40fbc000917ecd35489c048b35b08f15226ee34d47"] = dynamic["rounds"][ID].clone();
         let transport = fixture(vec![
             ok(STATIC.to_vec()),
             ok(serde_json::to_vec(&dynamic).unwrap()),
             ok(envelope(vec![active()])),
         ]);
 
-        let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500)
-            .await
-            .unwrap();
+        let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500).await.unwrap();
         assert_eq!(discovery.accepted.len(), 1);
         assert!(discovery.rejected.is_empty());
         assert!(trusted.contains_key(ID));
@@ -256,10 +209,7 @@ pub(crate) mod tests {
     async fn static_hash_and_dynamic_signatures_fail_closed_with_ordered_failover() {
         let f = fixture(vec![ok(b"{}".to_vec())]);
         assert_eq!(
-            discover_stage_with_source(&f, &source(), 1500)
-                .await
-                .unwrap_err()
-                .code,
+            discover_stage_with_source(&f, &source(), 1500).await.unwrap_err().code,
             VotingErrorCode::ConfigUntrusted
         );
         assert_eq!(f.urls.lock().unwrap().len(), 1);
@@ -271,15 +221,7 @@ pub(crate) mod tests {
             ok(DYNAMIC.to_vec()),
             ok(envelope(vec![active()])),
         ]);
-        assert_eq!(
-            discover_stage_with_source(&f, &source(), 1500)
-                .await
-                .unwrap()
-                .0
-                .accepted
-                .len(),
-            1
-        );
+        assert_eq!(discover_stage_with_source(&f, &source(), 1500).await.unwrap().0.accepted.len(), 1);
         assert_eq!(
             *f.urls.lock().unwrap(),
             vec![
@@ -290,15 +232,8 @@ pub(crate) mod tests {
             ]
         );
         let bad = serde_json::to_vec(&bad).unwrap();
-        let f = fixture(vec![
-            ok(STATIC.to_vec()),
-            ok(bad.clone()),
-            ok(bad),
-            ok(envelope(vec![active()])),
-        ]);
-        let (d, t) = discover_stage_with_source(&f, &source(), 1500)
-            .await
-            .unwrap();
+        let f = fixture(vec![ok(STATIC.to_vec()), ok(bad.clone()), ok(bad), ok(envelope(vec![active()]))]);
+        let (d, t) = discover_stage_with_source(&f, &source(), 1500).await.unwrap();
         assert!(d.accepted.is_empty());
         assert!(t.is_empty());
         assert!(!d.rejected.is_empty());
@@ -306,46 +241,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn malformed_expired_network_roots_and_colliding_ids_are_rejected() {
         for (key, value, code) in [
-            (
-                "network",
-                serde_json::json!("mainnet"),
-                VotingErrorCode::NetworkMismatch,
-            ),
-            (
-                "network",
-                serde_json::json!("regtest"),
-                VotingErrorCode::NetworkMismatch,
-            ),
-            (
-                "vote_end_time",
-                serde_json::json!(1500),
-                VotingErrorCode::RoundExpired,
-            ),
-            (
-                "nc_root",
-                serde_json::json!("bad"),
-                VotingErrorCode::RoundUnauthenticated,
-            ),
+            ("network", serde_json::json!("mainnet"), VotingErrorCode::NetworkMismatch),
+            ("network", serde_json::json!("regtest"), VotingErrorCode::NetworkMismatch),
+            ("vote_end_time", serde_json::json!(1500), VotingErrorCode::RoundExpired),
+            ("nc_root", serde_json::json!("bad"), VotingErrorCode::RoundUnauthenticated),
             (
                 "nullifier_imt_root",
                 serde_json::json!(BASE64.encode([255; 32])),
                 VotingErrorCode::RoundUnauthenticated,
             ),
-            (
-                "snapshot_height",
-                serde_json::json!(u64::MAX),
-                VotingErrorCode::RoundUnauthenticated,
-            ),
-            (
-                "status",
-                serde_json::json!(2),
-                VotingErrorCode::RoundUnauthenticated,
-            ),
-            (
-                "vote_round_id",
-                serde_json::json!("payload secret"),
-                VotingErrorCode::RoundUnauthenticated,
-            ),
+            ("snapshot_height", serde_json::json!(u64::MAX), VotingErrorCode::RoundUnauthenticated),
+            ("status", serde_json::json!(2), VotingErrorCode::RoundUnauthenticated),
+            ("vote_round_id", serde_json::json!("payload secret"), VotingErrorCode::RoundUnauthenticated),
         ] {
             let mut a = active();
             a[key] = value;
@@ -360,17 +267,10 @@ pub(crate) mod tests {
         let (d, t) = discover(vec![active(), hex], 1500).await;
         assert!(t.is_empty());
         assert_eq!(d.rejected.len(), 2);
-        for id in [
-            "ff".repeat(32),
-            format!(" {ID}"),
-            BASE64.encode(ID.as_bytes()),
-        ] {
+        for id in ["ff".repeat(32), format!(" {ID}"), BASE64.encode(ID.as_bytes())] {
             assert!(normalize_round_id(&id).is_err());
         }
-        assert_eq!(
-            normalize_round_id(&BASE64.encode(hex::decode(ID).unwrap())).unwrap(),
-            ID
-        );
+        assert_eq!(normalize_round_id(&BASE64.encode(hex::decode(ID).unwrap())).unwrap(), ID);
     }
     #[tokio::test]
     async fn fetch_limits_status_and_unsupported_mirrors_fail_closed() {
@@ -385,10 +285,7 @@ pub(crate) mod tests {
         ] {
             let f = fixture(vec![failure]);
             assert_eq!(
-                discover_stage_with_source(&f, &source(), 1500)
-                    .await
-                    .unwrap_err()
-                    .code,
+                discover_stage_with_source(&f, &source(), 1500).await.unwrap_err().code,
                 VotingErrorCode::ConfigFetchFailed
             );
         }
@@ -401,50 +298,27 @@ pub(crate) mod tests {
                 ok(DYNAMIC.to_vec()),
                 ok(envelope(vec![active()])),
             ]);
-            assert_eq!(
-                discover_stage_with_source(&f, &source(), 1500)
-                    .await
-                    .unwrap()
-                    .0
-                    .accepted
-                    .len(),
-                1
-            );
+            assert_eq!(discover_stage_with_source(&f, &source(), 1500).await.unwrap().0.accepted.len(), 1);
         }
     }
 
     #[tokio::test]
     async fn signed_material_tampering_never_accepts_an_active_round() {
-        for field in [
-            "ea_pk",
-            "layout",
-            "round_id",
-            "legacy_auth_version",
-            "unsupported_auth_version",
-        ] {
+        for field in ["ea_pk", "layout", "round_id", "legacy_auth_version", "unsupported_auth_version"] {
             let mut doc: Value = serde_json::from_slice(DYNAMIC).unwrap();
             match field {
                 "ea_pk" => doc["rounds"][ID]["ea_pk"] = serde_json::json!(BASE64.encode([8; 32])),
                 "layout" => doc["pir_layout"]["poly_len"] = serde_json::json!(2048),
                 "legacy_auth_version" => doc["rounds"][ID]["auth_version"] = serde_json::json!(1),
-                "unsupported_auth_version" => {
-                    doc["rounds"][ID]["auth_version"] = serde_json::json!(99)
-                }
+                "unsupported_auth_version" => doc["rounds"][ID]["auth_version"] = serde_json::json!(99),
                 _ => {
                     let round = doc["rounds"].as_object_mut().unwrap().remove(ID).unwrap();
                     doc["rounds"]["01".repeat(32)] = round;
                 }
             }
             let bytes = serde_json::to_vec(&doc).unwrap();
-            let f = fixture(vec![
-                ok(STATIC.to_vec()),
-                ok(bytes.clone()),
-                ok(bytes),
-                ok(envelope(vec![active()])),
-            ]);
-            let (d, t) = discover_stage_with_source(&f, &source(), 1500)
-                .await
-                .unwrap();
+            let f = fixture(vec![ok(STATIC.to_vec()), ok(bytes.clone()), ok(bytes), ok(envelope(vec![active()]))]);
+            let (d, t) = discover_stage_with_source(&f, &source(), 1500).await.unwrap();
             assert!(d.accepted.is_empty(), "{field}");
             assert!(t.is_empty());
         }
@@ -457,44 +331,24 @@ pub(crate) mod tests {
             include_bytes!("fixtures/dynamic-identity-key.json").as_slice(),
         ] {
             let anchor = resolve_static_voting_config(&source(), STATIC).unwrap();
-            let resolved = resolve_dynamic_voting_config(
-                anchor,
-                dynamic,
-                ResolveVotingConfigOptions::default(),
-            )
-            .unwrap();
-            assert_eq!(
-                resolved.authenticated_rounds.len(),
-                1,
-                "signature must authenticate"
-            );
-            let transport = fixture(vec![
-                ok(STATIC.to_vec()),
-                ok(dynamic.to_vec()),
-                ok(envelope(vec![active()])),
-            ]);
-            let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500)
-                .await
-                .unwrap();
+            let resolved = resolve_dynamic_voting_config(anchor, dynamic, ResolveVotingConfigOptions::default()).unwrap();
+            assert_eq!(resolved.authenticated_rounds.len(), 1, "signature must authenticate");
+            let transport = fixture(vec![ok(STATIC.to_vec()), ok(dynamic.to_vec()), ok(envelope(vec![active()]))]);
+            let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500).await.unwrap();
             assert!(trusted.is_empty());
             assert!(discovery.accepted.is_empty());
-            assert_eq!(
-                discovery.rejected[0].code,
-                VotingErrorCode::RoundUnauthenticated
-            );
-            assert_eq!(
-                discovery.rejected[0].message,
-                "Voting round could not be authenticated."
-            );
+            assert_eq!(discovery.rejected[0].code, VotingErrorCode::RoundUnauthenticated);
+            assert_eq!(discovery.rejected[0].message, "Voting round could not be authenticated.");
         }
     }
 
     #[tokio::test]
     async fn active_endpoint_failover_is_ordered_bounded_and_handles_empty_round() {
         let mut doc: Value = serde_json::from_slice(DYNAMIC).unwrap();
-        doc["vote_servers"].as_array_mut().unwrap().push(
-            serde_json::json!({"url":"https://vote2.example.com/mount/","label":"secondary"}),
-        );
+        doc["vote_servers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"url":"https://vote2.example.com/mount/","label":"secondary"}));
         for bad in [
             Err(TransportError::Definite),
             ok(vec![0; API_LIMIT + 1]),
@@ -511,15 +365,7 @@ pub(crate) mod tests {
                 bad,
                 ok(serde_json::to_vec(&serde_json::json!({"round":active()})).unwrap()),
             ]);
-            assert_eq!(
-                discover_stage_with_source(&f, &source(), 1500)
-                    .await
-                    .unwrap()
-                    .0
-                    .accepted
-                    .len(),
-                1
-            );
+            assert_eq!(discover_stage_with_source(&f, &source(), 1500).await.unwrap().0.accepted.len(), 1);
             assert_eq!(
                 f.urls.lock().unwrap().last().unwrap(),
                 "https://vote2.example.com/mount/shielded-vote/v1/rounds/active"
@@ -534,9 +380,7 @@ pub(crate) mod tests {
             }),
         ] {
             let f = fixture(vec![ok(STATIC.to_vec()), ok(DYNAMIC.to_vec()), response]);
-            let (d, t) = discover_stage_with_source(&f, &source(), 1500)
-                .await
-                .unwrap();
+            let (d, t) = discover_stage_with_source(&f, &source(), 1500).await.unwrap();
             assert!(d.accepted.is_empty());
             assert!(t.is_empty());
         }
@@ -574,9 +418,7 @@ pub(crate) mod tests {
                 }),
                 response,
             ]);
-            let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500)
-                .await
-                .unwrap();
+            let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500).await.unwrap();
             assert!(discovery.accepted.is_empty());
             assert!(discovery.rejected.is_empty());
             assert!(trusted.is_empty());
@@ -592,24 +434,18 @@ pub(crate) mod tests {
             }),
             ok(envelope(vec![active()])),
         ]);
-        let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500)
-            .await
-            .unwrap();
+        let (discovery, trusted) = discover_stage_with_source(&transport, &source(), 1500).await.unwrap();
         assert!(discovery.accepted.is_empty());
         assert!(trusted.is_empty());
         assert_eq!(discovery.rejected.len(), 1);
         assert_eq!(discovery.rejected[0].round_id, ID);
-        assert_eq!(
-            discovery.rejected[0].code,
-            VotingErrorCode::RoundUnauthenticated
-        );
+        assert_eq!(discovery.rejected[0].code, VotingErrorCode::RoundUnauthenticated);
     }
 
     #[tokio::test]
     async fn service_layout_versions_proposals_and_helpers_are_strictly_checked() {
         let mut out_of_range = active();
-        out_of_range["proposals"][0]["id"] =
-            serde_json::json!(zcash_voting::types::MAX_PROPOSAL_ID + 1);
+        out_of_range["proposals"][0]["id"] = serde_json::json!(zcash_voting::types::MAX_PROPOSAL_ID + 1);
         assert!(discover(vec![out_of_range], 1500).await.1.is_empty());
         for (key, value) in [
             (
@@ -644,18 +480,12 @@ pub(crate) mod tests {
 
     #[test]
     fn eligibility_separates_sync_from_minimum_policy() {
-        assert_eq!(
-            eligibility_for_inputs("01", 10, 9, &[]).unwrap_err().code,
-            VotingErrorCode::WalletNotSynced
-        );
+        assert_eq!(eligibility_for_inputs("01", 10, 9, &[]).unwrap_err().code, VotingErrorCode::WalletNotSynced);
         let result = eligibility_for_inputs("01", 10, 10, &[]).unwrap();
         assert!(!result.eligible);
         assert_eq!(result.snapshot_voting_value_zats, "0");
         assert_eq!(result.minimum_required_zats, "12500000");
-        assert_eq!(
-            result.reason_code,
-            Some(VotingEligibilityReason::InsufficientSnapshotValue)
-        );
+        assert_eq!(result.reason_code, Some(VotingEligibilityReason::InsufficientSnapshotValue));
         assert_eq!(result.selected_value_zats, "0");
         assert_eq!(result.voting_power, "0");
         assert_eq!(result.bundle_count, 0);
@@ -664,10 +494,7 @@ pub(crate) mod tests {
     #[test]
     fn network_mismatch_error_is_network_neutral() {
         let error = VotingApiError::new(VotingErrorCode::NetworkMismatch);
-        assert_eq!(
-            error.message,
-            "Voting network does not match the selected wallet."
-        );
+        assert_eq!(error.message, "Voting network does not match the selected wallet.");
     }
 
     #[tokio::test]
@@ -675,10 +502,7 @@ pub(crate) mod tests {
         let (_, original) = discover(vec![active()], 1500).await;
         let saved = original[ID].identity();
         for (key, value) in [
-            (
-                "snapshot_blockhash",
-                serde_json::json!(BASE64.encode([3; 32])),
-            ),
+            ("snapshot_blockhash", serde_json::json!(BASE64.encode([3; 32]))),
             ("proposals_hash", serde_json::json!(BASE64.encode([4; 32]))),
         ] {
             let mut changed = active();
@@ -713,133 +537,74 @@ pub(crate) mod tests {
                 result.reason_code,
                 (value < divisor).then_some(VotingEligibilityReason::InsufficientSnapshotValue)
             );
-            assert_eq!(
-                result.voting_power,
-                if value >= divisor { divisor } else { 0 }.to_string()
-            );
+            assert_eq!(result.voting_power, if value >= divisor { divisor } else { 0 }.to_string());
         }
         let fragmented = (0..20).map(|i| note(2_000_000, i)).collect::<Vec<_>>();
         let fragmented_result = eligibility_for_inputs(ID, 100, 100, &fragmented).unwrap();
         assert_eq!(fragmented_result.snapshot_voting_value_zats, "40000000");
-        assert_eq!(
-            fragmented_result.reason_code,
-            Some(VotingEligibilityReason::InsufficientVotingPower)
-        );
+        assert_eq!(fragmented_result.reason_code, Some(VotingEligibilityReason::InsufficientVotingPower));
         let big = 1000 * divisor;
-        let notes: Vec<_> = (0..3)
-            .map(|i| note(big, i))
-            .chain((3..23).map(|i| note(big / 500, i)))
-            .collect();
-        let (status, plan) = zcash_voting::minimum_voting_eligibility_and_plan_for_notes(
-            &notes,
-            zcash_voting::BundlePolicy::default(),
-        )
-        .unwrap();
+        let notes: Vec<_> = (0..3).map(|i| note(big, i)).chain((3..23).map(|i| note(big / 500, i))).collect();
+        let (status, plan) = zcash_voting::minimum_voting_eligibility_and_plan_for_notes(&notes, zcash_voting::BundlePolicy::default()).unwrap();
         assert!(plan.privacy_trim.dropped_value > 0);
         let result = eligibility_for_inputs(ID, 100, 100, &notes).unwrap();
-        assert_eq!(
-            result.trimmed_value_zats,
-            plan.privacy_trim.dropped_value.to_string()
-        );
+        assert_eq!(result.trimmed_value_zats, plan.privacy_trim.dropped_value.to_string());
         assert_eq!(result.voting_power, status.eligible_weight.to_string());
         assert_eq!(
             result.selected_value_zats,
-            plan.bundles
-                .iter()
-                .flatten()
-                .map(|n| n.value)
-                .sum::<u64>()
-                .to_string()
+            plan.bundles.iter().flatten().map(|n| n.value).sum::<u64>().to_string()
         );
     }
 
     #[tokio::test]
     async fn eligibility_wallet_boundary_is_read_only_and_display_safe() {
-        use zcash_client_backend::data_api::{
-            Account as _, AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation,
-        };
+        use zcash_client_backend::data_api::{Account as _, AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation};
         use zcash_protocol::consensus::BlockHeight;
         let network = crate::Network::TestNetwork;
         let mut db = zcash_client_memory::MemoryWalletDb::new(network, 100);
         let birthday = AccountBirthday::from_parts(
-            zcash_client_backend::data_api::chain::ChainState::empty(
-                BlockHeight::from_u32(3_000_000),
-                zcash_primitives::block::BlockHash([0; 32]),
-            ),
+            zcash_client_backend::data_api::chain::ChainState::empty(BlockHeight::from_u32(3_000_000), zcash_primitives::block::BlockHash([0; 32])),
             None,
         );
-        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-            &network,
-            &[17; 32],
-            zip32::AccountId::ZERO,
-        )
-        .unwrap()
-        .to_unified_full_viewing_key();
-        let derivation = Zip32Derivation::new(
-            zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32]).unwrap(),
-            zip32::AccountId::ZERO,
-        );
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &[17; 32], zip32::AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let derivation = Zip32Derivation::new(zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32]).unwrap(), zip32::AccountId::ZERO);
         let id = db
-            .import_account_ufvk(
-                "fixture",
-                &ufvk,
-                &birthday,
-                AccountPurpose::Spending {
-                    derivation: Some(derivation),
-                },
-                None,
-            )
+            .import_account_ufvk("fixture", &ufvk, &birthday, AccountPurpose::Spending { derivation: Some(derivation) }, None)
             .unwrap()
             .id();
-        let wallet =
-            crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap();
+        let wallet = crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap();
         let (_, rounds) = discover(vec![active()], 1500).await;
         let before = wallet.db_to_bytes().await.unwrap();
         assert_eq!(
-            check_eligibility(&wallet, id, &rounds[ID])
-                .await
-                .unwrap_err()
-                .code,
+            check_eligibility(&wallet, id, &rounds[ID]).await.unwrap_err().code,
             VotingErrorCode::WalletNotSynced
         );
         assert_eq!(
-            check_eligibility(&wallet, 999.into(), &rounds[ID])
-                .await
-                .unwrap_err()
-                .code,
+            check_eligibility(&wallet, 999.into(), &rounds[ID]).await.unwrap_err().code,
             VotingErrorCode::NotEligible
         );
         assert_eq!(wallet.db_to_bytes().await.unwrap(), before);
         assert!(wallet.db.try_write().is_ok());
-        let error = VotingApiError::from(WalletInputError::Wallet(
-            "private notes keys roots payload".into(),
-        ));
+        let error = VotingApiError::from(WalletInputError::Wallet("private notes keys roots payload".into()));
         assert_eq!(error.message, "Voting inputs are unavailable.");
     }
 
     #[tokio::test]
     async fn eligibility_rejects_a_wallet_from_the_other_authenticated_round_network() {
-        use zcash_client_backend::data_api::{
-            Account as _, AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation,
-        };
+        use zcash_client_backend::data_api::{Account as _, AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation};
         use zcash_protocol::consensus::BlockHeight;
 
         let network = crate::Network::TestNetwork;
         let mut db = zcash_client_memory::MemoryWalletDb::new(network, 100);
         let birthday = AccountBirthday::from_parts(
-            zcash_client_backend::data_api::chain::ChainState::empty(
-                BlockHeight::from_u32(3_000_000),
-                zcash_primitives::block::BlockHash([0; 32]),
-            ),
+            zcash_client_backend::data_api::chain::ChainState::empty(BlockHeight::from_u32(3_000_000), zcash_primitives::block::BlockHash([0; 32])),
             None,
         );
-        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-            &network,
-            &[18; 32],
-            zip32::AccountId::ZERO,
-        )
-        .unwrap()
-        .to_unified_full_viewing_key();
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &[18; 32], zip32::AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
         let id = db
             .import_account_ufvk(
                 "mainnet fixture",
@@ -855,17 +620,13 @@ pub(crate) mod tests {
             )
             .unwrap()
             .id();
-        let wallet =
-            crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap();
+        let wallet = crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap();
         let mut entry = active();
         entry.as_object_mut().unwrap().remove("network");
         let (_, rounds) = discover_for(VotingNetwork::Mainnet, vec![entry], 1500).await;
 
         assert_eq!(
-            check_eligibility(&wallet, id, &rounds[ID])
-                .await
-                .unwrap_err()
-                .code,
+            check_eligibility(&wallet, id, &rounds[ID]).await.unwrap_err().code,
             VotingErrorCode::NetworkMismatch
         );
     }
@@ -880,10 +641,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use tonic_web_wasm_client::Client;
-use zcash_voting::config::{
-    PinnedConfigSource, ResolveVotingConfigOptions, ResolvedVotingConfig,
-    resolve_dynamic_voting_config, resolve_static_voting_config,
-};
+use zcash_voting::config::{PinnedConfigSource, ResolveVotingConfigOptions, ResolvedVotingConfig, resolve_dynamic_voting_config, resolve_static_voting_config};
 use zcash_voting::transport::{HttpTransport, OwnedHttpRequest, RequestKind};
 
 #[cfg(target_arch = "wasm32")]
@@ -892,17 +650,12 @@ pub(crate) async fn discover_rounds(
     network: VotingNetwork,
 ) -> Result<(VotingDiscovery, BTreeMap<String, TrustedRound>), VotingApiError> {
     discover_with_clock(transport, network, network.static_source(), || {
-        u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
-            .map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))
+        u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))
     })
     .await
 }
 
-async fn fetch(
-    transport: &impl HttpTransport,
-    url: String,
-    limit: usize,
-) -> Result<(u16, Vec<u8>), VotingApiError> {
+async fn fetch(transport: &impl HttpTransport, url: String, limit: usize) -> Result<(u16, Vec<u8>), VotingApiError> {
     let request = OwnedHttpRequest {
         method: "GET".into(),
         url,
@@ -912,16 +665,12 @@ async fn fetch(
         max_response_bytes: limit,
         kind: RequestKind::Idempotent,
     };
-    request
-        .validate()
-        .map_err(|_| VotingApiError::new(VotingErrorCode::ConfigFetchFailed))?;
+    request.validate().map_err(|_| VotingApiError::new(VotingErrorCode::ConfigFetchFailed))?;
     let response = transport
         .execute(request)
         .await
         .map_err(|_| VotingApiError::new(VotingErrorCode::ConfigFetchFailed))?;
-    if response.body.len() > limit
-        || (!(200..300).contains(&response.status) && response.status != 404)
-    {
+    if response.body.len() > limit || (!(200..300).contains(&response.status) && response.status != 404) {
         return Err(VotingApiError::new(VotingErrorCode::ConfigFetchFailed));
     }
     Ok((response.status, response.body))
@@ -934,8 +683,7 @@ async fn discover_with_clock(
     source: &str,
     clock: impl Fn() -> Result<u64, VotingApiError>,
 ) -> Result<(VotingDiscovery, BTreeMap<String, TrustedRound>), VotingApiError> {
-    let pin = PinnedConfigSource::parse(source)
-        .map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))?;
+    let pin = PinnedConfigSource::parse(source).map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))?;
     if pin.sha256.is_none() {
         return Err(VotingApiError::new(VotingErrorCode::ConfigUntrusted));
     }
@@ -943,8 +691,7 @@ async fn discover_with_clock(
     if status == 404 {
         return Err(VotingApiError::new(VotingErrorCode::ConfigFetchFailed));
     }
-    let anchor = resolve_static_voting_config(source, &bytes)
-        .map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))?;
+    let anchor = resolve_static_voting_config(source, &bytes).map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))?;
     let mut resolved = None;
     let mut roundless = None;
     let mut fetched = false;
@@ -956,11 +703,7 @@ async fn discover_with_clock(
             continue;
         }
         fetched = true;
-        let Ok(candidate) = resolve_dynamic_voting_config(
-            anchor.clone(),
-            &bytes,
-            ResolveVotingConfigOptions::default(),
-        ) else {
+        let Ok(candidate) = resolve_dynamic_voting_config(anchor.clone(), &bytes, ResolveVotingConfigOptions::default()) else {
             continue;
         };
         if candidate.authenticated_rounds.is_empty() {
@@ -986,15 +729,8 @@ async fn discover_with_clock(
     };
     let mut active = None;
     for endpoint in &resolved.vote_servers {
-        let base = endpoint_base(&endpoint.url)
-            .map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))?;
-        let Ok((status, bytes)) = fetch(
-            transport,
-            format!("{base}/shielded-vote/v1/rounds/active"),
-            API_LIMIT,
-        )
-        .await
-        else {
+        let base = endpoint_base(&endpoint.url).map_err(|_| VotingApiError::new(VotingErrorCode::ConfigUntrusted))?;
+        let Ok((status, bytes)) = fetch(transport, format!("{base}/shielded-vote/v1/rounds/active"), API_LIMIT).await else {
             continue;
         };
         if status == 404 {
@@ -1009,22 +745,14 @@ async fn discover_with_clock(
             break;
         }
         if let Some(round) = value.get("round") {
-            active = Some(if round.is_null() {
-                vec![]
-            } else {
-                vec![round.clone()]
-            });
+            active = Some(if round.is_null() { vec![] } else { vec![round.clone()] });
             break;
         }
     }
     let active = active.ok_or_else(|| VotingApiError::new(VotingErrorCode::ConfigFetchFailed))?;
     let mut counts = BTreeMap::new();
     for entry in &active {
-        if let Some(id) = entry
-            .get("vote_round_id")
-            .and_then(Value::as_str)
-            .and_then(|id| normalize_round_id(id).ok())
-        {
+        if let Some(id) = entry.get("vote_round_id").and_then(Value::as_str).and_then(|id| normalize_round_id(id).ok()) {
             *counts.entry(id).or_insert(0usize) += 1;
         }
     }
@@ -1035,13 +763,7 @@ async fn discover_with_clock(
             .and_then(Value::as_str)
             .and_then(|id| normalize_round_id(id).ok())
             .unwrap_or_default();
-        if id.is_empty()
-            || counts[&id] != 1
-            || !resolved
-                .authenticated_rounds
-                .iter()
-                .any(|round| round.round_id == id)
-        {
+        if id.is_empty() || counts[&id] != 1 || !resolved.authenticated_rounds.iter().any(|round| round.round_id == id) {
             reject(&mut discovery, &id, VotingErrorCode::RoundUnauthenticated);
             continue;
         }
@@ -1070,10 +792,7 @@ pub(crate) fn normalize_round_id(value: &str) -> Result<String, VotingApiError> 
     let bytes = if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
         hex::decode(value).ok()
     } else if value.len() == 44 {
-        BASE64
-            .decode(value)
-            .ok()
-            .filter(|bytes| BASE64.encode(bytes) == value)
+        BASE64.decode(value).ok().filter(|bytes| BASE64.encode(bytes) == value)
     } else {
         None
     };
@@ -1085,8 +804,7 @@ fn unauthed() -> VotingApiError {
     VotingApiError::new(VotingErrorCode::RoundUnauthenticated)
 }
 fn endpoint_base(url: &str) -> Result<String, VotingApiError> {
-    let canonical =
-        zcash_voting::helper::url::canonicalize_helper_base_url(url).map_err(|_| unauthed())?;
+    let canonical = zcash_voting::helper::url::canonicalize_helper_base_url(url).map_err(|_| unauthed())?;
     if !canonical.starts_with("https://") {
         return Err(unauthed());
     }
@@ -1115,19 +833,10 @@ fn root(value: &Value) -> Result<Vec<u8>, VotingApiError> {
     hex::decode(id).map_err(|_| unauthed())
 }
 
-fn trusted_round(
-    config: &ResolvedVotingConfig,
-    network: VotingNetwork,
-    id: &str,
-    entry: &Value,
-    now: u64,
-) -> Result<TrustedRound, VotingApiError> {
+fn trusted_round(config: &ResolvedVotingConfig, network: VotingNetwork, id: &str, entry: &Value, now: u64) -> Result<TrustedRound, VotingApiError> {
     // The built-in trust context supplies the network when the service omits it.
     if let Some(service_network) = entry.get("network") {
-        if !service_network
-            .as_str()
-            .is_some_and(|name| network.accepts_service_network(name))
-        {
+        if !service_network.as_str().is_some_and(|name| network.accepts_service_network(name)) {
             return Err(VotingApiError::new(VotingErrorCode::NetworkMismatch));
         }
     }
@@ -1147,29 +856,18 @@ fn trusted_round(
         return Err(VotingApiError::new(VotingErrorCode::RoundExpired));
     }
     if let Some(layout) = entry.get("pir_layout") {
-        if serde_json::from_value::<zcash_voting::wire::PirLayout>(layout.clone())
-            .map_err(|_| unauthed())?
-            != config.pir_layout
-        {
+        if serde_json::from_value::<zcash_voting::wire::PirLayout>(layout.clone()).map_err(|_| unauthed())? != config.pir_layout {
             return Err(unauthed());
         }
     }
     if let Some(versions) = entry.get("supported_versions") {
-        if serde_json::from_value::<zcash_voting::config::SupportedVersions>(versions.clone())
-            .map_err(|_| unauthed())?
-            != config.supported_versions
-        {
+        if serde_json::from_value::<zcash_voting::config::SupportedVersions>(versions.clone()).map_err(|_| unauthed())? != config.supported_versions {
             return Err(unauthed());
         }
     }
     // These roots still require independent frontier/PIR verification in preparation.
     let params = config
-        .trusted_voting_round_params(
-            id.into(),
-            height,
-            root(&entry["nc_root"])?,
-            root(&entry["nullifier_imt_root"])?,
-        )
+        .trusted_voting_round_params(id.into(), height, root(&entry["nc_root"])?, root(&entry["nullifier_imt_root"])?)
         .map_err(|_| unauthed())?;
     let mut proposals = vec![];
     let mut ids = BTreeSet::new();
@@ -1210,43 +908,20 @@ fn trusted_round(
         for item in items.as_array().ok_or_else(unauthed)? {
             let id = text_field(&item["id"])?;
             let url = endpoint_base(item["url"].as_str().ok_or_else(unauthed)?)?;
-            let public_key = BASE64
-                .decode(item["public_key"].as_str().ok_or_else(unauthed)?)
-                .map_err(|_| unauthed())?;
-            if public_key.len() != 32
-                || !helper_ids.insert(id.clone())
-                || !helper_urls.insert(url.clone())
-            {
+            let public_key = BASE64.decode(item["public_key"].as_str().ok_or_else(unauthed)?).map_err(|_| unauthed())?;
+            if public_key.len() != 32 || !helper_ids.insert(id.clone()) || !helper_urls.insert(url.clone()) {
                 return Err(unauthed());
             }
-            helpers.push(HelperEndpoint {
-                id,
-                url,
-                public_key,
-            });
+            helpers.push(HelperEndpoint { id, url, public_key });
         }
     }
-    let vote_server_urls = config
-        .vote_servers
-        .iter()
-        .map(|e| endpoint_base(&e.url))
-        .collect::<Result<Vec<_>, _>>()?;
-    let pir_urls = config
-        .pir_endpoints
-        .iter()
-        .map(|e| endpoint_base(&e.url))
-        .collect::<Result<Vec<_>, _>>()?;
+    let vote_server_urls = config.vote_servers.iter().map(|e| endpoint_base(&e.url)).collect::<Result<Vec<_>, _>>()?;
+    let pir_urls = config.pir_endpoints.iter().map(|e| endpoint_base(&e.url)).collect::<Result<Vec<_>, _>>()?;
     let tree_url = vote_server_urls.first().ok_or_else(unauthed)?.clone();
-    let name = entry
-        .get("title")
-        .map(text_field)
-        .transpose()?
-        .unwrap_or_else(|| id.into());
+    let name = entry.get("title").map(text_field).transpose()?.unwrap_or_else(|| id.into());
     let mut metadata = entry.clone();
     metadata["vote_round_id"] = Value::String(id.into());
-    let service_metadata_fingerprint = hex::encode(Sha256::digest(
-        serde_json::to_vec(&metadata).map_err(|_| unauthed())?,
-    ));
+    let service_metadata_fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&metadata).map_err(|_| unauthed())?));
     Ok(TrustedRound {
         network,
         service_metadata_fingerprint,
@@ -1277,25 +952,16 @@ impl VotingApiError {
             VotingErrorCode::ConfigUntrusted => "Voting configuration could not be authenticated.",
             VotingErrorCode::RoundUnauthenticated => "Voting round could not be authenticated.",
             VotingErrorCode::RoundExpired => "Voting round has expired.",
-            VotingErrorCode::NetworkMismatch => {
-                "Voting network does not match the selected wallet."
-            }
+            VotingErrorCode::NetworkMismatch => "Voting network does not match the selected wallet.",
             VotingErrorCode::WalletNotSynced => "Sync the wallet through the voting snapshot.",
             VotingErrorCode::RecoveryConflict => "Saved voting configuration no longer matches.",
             VotingErrorCode::OperationInProgress => "Another voting operation is in progress.",
-            VotingErrorCode::PersistenceFailed => {
-                "Voting state could not be saved. Export or retry saving this session."
-            }
-            VotingErrorCode::SubmissionUnknown => {
-                "Voting submission outcome is unknown. Resume from saved state."
-            }
+            VotingErrorCode::PersistenceFailed => "Voting state could not be saved. Export or retry saving this session.",
+            VotingErrorCode::SubmissionUnknown => "Voting submission outcome is unknown. Resume from saved state.",
             VotingErrorCode::SubmissionRejected => "Voting submission was rejected.",
             _ => "Voting inputs are unavailable.",
         };
-        Self {
-            code,
-            message: message.into(),
-        }
+        Self { code, message: message.into() }
     }
 }
 
@@ -1304,47 +970,22 @@ impl From<WalletInputError> for VotingApiError {
         Self::new(match error {
             WalletInputError::NetworkMismatch => VotingErrorCode::NetworkMismatch,
             WalletInputError::WalletNotSynced { .. } => VotingErrorCode::WalletNotSynced,
-            WalletInputError::AccountUnknown
-            | WalletInputError::Wallet(_)
-            | WalletInputError::Voting(_) => VotingErrorCode::NotEligible,
+            WalletInputError::AccountUnknown | WalletInputError::Wallet(_) | WalletInputError::Voting(_) => VotingErrorCode::NotEligible,
         })
     }
 }
 
-pub(crate) async fn check_eligibility(
-    wallet: &MemoryWallet<Client>,
-    account_id: AccountId,
-    round: &TrustedRound,
-) -> Result<VotingEligibility, VotingApiError> {
-    let input = gather_eligibility_inputs(
-        wallet,
-        account_id,
-        round.network.network(),
-        round.params.snapshot_height,
-    )
-    .await?;
-    eligibility_for_inputs(
-        &round.summary.round_id,
-        round.params.snapshot_height,
-        input.scanned_height,
-        &input.notes,
-    )
+pub(crate) async fn check_eligibility(wallet: &MemoryWallet<Client>, account_id: AccountId, round: &TrustedRound) -> Result<VotingEligibility, VotingApiError> {
+    let input = gather_eligibility_inputs(wallet, account_id, round.network.network(), round.params.snapshot_height).await?;
+    eligibility_for_inputs(&round.summary.round_id, round.params.snapshot_height, input.scanned_height, &input.notes)
 }
 
-fn eligibility_for_inputs(
-    round_id: &str,
-    snapshot: u64,
-    scanned: u64,
-    notes: &[zcash_voting::NoteInfo],
-) -> Result<VotingEligibility, VotingApiError> {
+fn eligibility_for_inputs(round_id: &str, snapshot: u64, scanned: u64, notes: &[zcash_voting::NoteInfo]) -> Result<VotingEligibility, VotingApiError> {
     if scanned < snapshot {
         return Err(VotingApiError::new(VotingErrorCode::WalletNotSynced));
     }
-    let (status, plan) = zcash_voting::minimum_voting_eligibility_and_plan_for_notes(
-        notes,
-        zcash_voting::BundlePolicy::default(),
-    )
-    .map_err(|_| VotingApiError::new(VotingErrorCode::NotEligible))?;
+    let (status, plan) = zcash_voting::minimum_voting_eligibility_and_plan_for_notes(notes, zcash_voting::BundlePolicy::default())
+        .map_err(|_| VotingApiError::new(VotingErrorCode::NotEligible))?;
     let snapshot_value = notes
         .iter()
         .try_fold(0u128, |sum, note| sum.checked_add(u128::from(note.value)))
@@ -1371,10 +1012,8 @@ fn eligibility_for_inputs(
         reason_code,
         selected_value_zats: selected.to_string(),
         voting_power: status.eligible_weight.to_string(),
-        selected_note_count: u32::try_from(status.distinct_note_count)
-            .map_err(|_| VotingApiError::new(VotingErrorCode::NotEligible))?,
-        bundle_count: u32::try_from(plan.bundles.len())
-            .map_err(|_| VotingApiError::new(VotingErrorCode::NotEligible))?,
+        selected_note_count: u32::try_from(status.distinct_note_count).map_err(|_| VotingApiError::new(VotingErrorCode::NotEligible))?,
+        bundle_count: u32::try_from(plan.bundles.len()).map_err(|_| VotingApiError::new(VotingErrorCode::NotEligible))?,
         trimmed_value_zats: plan.privacy_trim.dropped_value.to_string(),
     })
 }

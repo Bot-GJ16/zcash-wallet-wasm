@@ -8,14 +8,7 @@ impl zcash_voting::tree_sync::AsyncTransport for BrowserFetchTransport {
         &self,
         url: String,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        zcash_voting::tree_sync::AsyncTransportResponse,
-                        zcash_voting::tree_sync::AsyncTransportError,
-                    >,
-                > + Send,
-        >,
+        Box<dyn std::future::Future<Output = Result<zcash_voting::tree_sync::AsyncTransportResponse, zcash_voting::tree_sync::AsyncTransportError>> + Send>,
     > {
         let response = self.execute(OwnedHttpRequest {
             method: "GET".into(),
@@ -33,11 +26,7 @@ impl zcash_voting::tree_sync::AsyncTransport for BrowserFetchTransport {
                     status: response.status,
                     body: response.body,
                 })
-                .map_err(|_| {
-                    zcash_voting::tree_sync::AsyncTransportError::Request(
-                        "browser tree request failed".into(),
-                    )
-                })
+                .map_err(|_| zcash_voting::tree_sync::AsyncTransportError::Request("browser tree request failed".into()))
         })
     }
 }
@@ -54,12 +43,7 @@ pub fn voting_test_tree_fixture() -> Vec<String> {
 pub async fn voting_test_tree_sync(base_url: String) -> Result<bool, wasm_bindgen::JsValue> {
     let failed = || super::types::VotingApiError::new(super::types::VotingErrorCode::ProofFailed);
     let round_id = "0303030303030303030303030303030303030303030303030303030303030303";
-    let db = zcash_voting::storage::VotingDb::open_browser(
-        "browser-tree-runtime",
-        zcash_voting::Network::Testnet,
-        None,
-    )
-    .map_err(|_| failed())?;
+    let db = zcash_voting::storage::VotingDb::open_browser("browser-tree-runtime", zcash_voting::Network::Testnet, None).map_err(|_| failed())?;
     db.create_round(
         zcash_voting::Network::Testnet,
         &zcash_voting::round::RoundParams {
@@ -72,12 +56,7 @@ pub async fn voting_test_tree_sync(base_url: String) -> Result<bool, wasm_bindge
         None,
     )
     .map_err(|_| failed())?;
-    let api = zcash_voting::tree_sync::AsyncHttpTreeSyncApi::new(
-        base_url,
-        round_id,
-        std::sync::Arc::new(BrowserFetchTransport),
-    )
-    .map_err(|_| failed())?;
+    let api = zcash_voting::tree_sync::AsyncHttpTreeSyncApi::new(base_url, round_id, std::sync::Arc::new(BrowserFetchTransport)).map_err(|_| failed())?;
     let height = zcash_voting::tree_sync::VoteTreeSync::new()
         .sync_with_async_api(&db, round_id, &api)
         .await

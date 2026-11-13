@@ -24,11 +24,7 @@ pub struct UnifiedAddresses {
     pub address_index: Option<u32>,
 }
 
-pub(crate) fn unified_addresses_from_full<P>(
-    address: &zcash_keys::address::UnifiedAddress,
-    params: &P,
-    address_index: Option<u32>,
-) -> UnifiedAddresses
+pub(crate) fn unified_addresses_from_full<P>(address: &zcash_keys::address::UnifiedAddress, params: &P, address_index: Option<u32>) -> UnifiedAddresses
 where
     P: zcash_protocol::consensus::Parameters,
 {
@@ -37,19 +33,16 @@ where
 
     let orchard_receiver = address.orchard().cloned();
     let sapling_receiver = address.sapling().cloned();
-    let shielded_unified =
-        ZcashUnifiedAddress::from_receivers(orchard_receiver, sapling_receiver, None, None, None)
-            .expect("all-available unified address should include a shielded receiver");
+    let shielded_unified = ZcashUnifiedAddress::from_receivers(orchard_receiver, sapling_receiver, None, None, None)
+        .expect("all-available unified address should include a shielded receiver");
 
-    let orchard = orchard_receiver.as_ref().and_then(|receiver| {
-        ZcashUnifiedAddress::from_receivers(Some(*receiver), None, None, None, None)
-            .map(|ua| ua.encode(params))
-    });
+    let orchard = orchard_receiver
+        .as_ref()
+        .and_then(|receiver| ZcashUnifiedAddress::from_receivers(Some(*receiver), None, None, None, None).map(|ua| ua.encode(params)));
 
-    let sapling = sapling_receiver.as_ref().and_then(|receiver| {
-        ZcashUnifiedAddress::from_receivers(None, Some(*receiver), None, None, None)
-            .map(|ua| ua.encode(params))
-    });
+    let sapling = sapling_receiver
+        .as_ref()
+        .and_then(|receiver| ZcashUnifiedAddress::from_receivers(None, Some(*receiver), None, None, None).map(|ua| ua.encode(params)));
 
     UnifiedAddresses {
         unified: shielded_unified.encode(params),
@@ -62,10 +55,7 @@ where
     }
 }
 
-pub(crate) fn transparent_address_index(
-    address: &zcash_keys::address::UnifiedAddress,
-    diversifier_index: zip32::DiversifierIndex,
-) -> Option<u32> {
+pub(crate) fn transparent_address_index(address: &zcash_keys::address::UnifiedAddress, diversifier_index: zip32::DiversifierIndex) -> Option<u32> {
     address.transparent()?;
 
     let (low_4_bytes, rest) = diversifier_index.as_bytes().split_at(4);
@@ -148,8 +138,7 @@ pub fn validate_mnemonic(phrase: &str) -> Result<(), Error> {
 /// ```
 #[wasm_bindgen]
 pub fn mnemonic_to_seed(phrase: &str, passphrase: &str) -> Result<Vec<u8>, Error> {
-    let mnemonic: Mnemonic<English> =
-        Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
+    let mnemonic: Mnemonic<English> = Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
 
     let mut seed = mnemonic.to_seed(passphrase);
     let result = seed.to_vec();
@@ -182,15 +171,9 @@ pub fn mnemonic_to_seed(phrase: &str, passphrase: &str) -> Result<Vec<u8>, Error
 /// );
 /// ```
 #[wasm_bindgen]
-pub fn mnemonic_to_spending_key(
-    network: &str,
-    phrase: &str,
-    passphrase: &str,
-    account_index: u32,
-) -> Result<UnifiedSpendingKey, Error> {
+pub fn mnemonic_to_spending_key(network: &str, phrase: &str, passphrase: &str, account_index: u32) -> Result<UnifiedSpendingKey, Error> {
     // Convert mnemonic to seed
-    let mnemonic: Mnemonic<English> =
-        Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
+    let mnemonic: Mnemonic<English> = Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
 
     let mut seed = mnemonic.to_seed(passphrase);
 
@@ -221,13 +204,9 @@ pub fn mnemonic_to_spending_key(
 /// );
 /// ```
 #[wasm_bindgen]
-pub fn mnemonic_to_seed_fingerprint(
-    phrase: &str,
-    passphrase: &str,
-) -> Result<SeedFingerprint, Error> {
+pub fn mnemonic_to_seed_fingerprint(phrase: &str, passphrase: &str) -> Result<SeedFingerprint, Error> {
     // Convert mnemonic to seed
-    let mnemonic: Mnemonic<English> =
-        Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
+    let mnemonic: Mnemonic<English> = Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
 
     let mut seed = mnemonic.to_seed(passphrase);
 
@@ -256,27 +235,19 @@ pub struct TransparentAddressInfo {
 /// * `account_index` - The account index for HD derivation (usually 0)
 /// * `address_index` - The external transparent child address index
 #[wasm_bindgen]
-pub fn mnemonic_to_transparent_address(
-    network: &str,
-    phrase: &str,
-    passphrase: &str,
-    account_index: u32,
-    address_index: u32,
-) -> Result<JsValue, Error> {
+pub fn mnemonic_to_transparent_address(network: &str, phrase: &str, passphrase: &str, account_index: u32, address_index: u32) -> Result<JsValue, Error> {
     use std::str::FromStr;
     use transparent::keys::{IncomingViewingKey, NonHardenedChildIndex, TransparentKeyScope};
     use zcash_client_backend::encoding::AddressCodec;
 
-    let mnemonic: Mnemonic<English> =
-        Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
+    let mnemonic: Mnemonic<English> = Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
     let mut seed = mnemonic.to_seed(passphrase);
     let usk = UnifiedSpendingKey::new(network, seed.to_vec().into_boxed_slice(), account_index);
     seed.zeroize();
     let usk = usk?;
 
     let net = crate::Network::from_str(network)?;
-    let address_index = NonHardenedChildIndex::from_index(address_index)
-        .ok_or_else(|| Error::Generic("Invalid transparent child index".into()))?;
+    let address_index = NonHardenedChildIndex::from_index(address_index).ok_or_else(|| Error::Generic("Invalid transparent child index".into()))?;
     let usk_inner: zcash_keys::keys::UnifiedSpendingKey = usk.into();
     let transparent_key = usk_inner.transparent();
 
@@ -294,10 +265,7 @@ pub fn mnemonic_to_transparent_address(
         .map_err(|e| Error::Generic(format!("Failed to derive public key: {e:?}")))?;
     let pubkey = hex::encode(public_key.serialize_uncompressed());
 
-    Ok(serde_wasm_bindgen::to_value(&TransparentAddressInfo {
-        address,
-        pubkey,
-    })?)
+    Ok(serde_wasm_bindgen::to_value(&TransparentAddressInfo { address, pubkey })?)
 }
 
 /// Get all addresses (shielded unified, orchard, sapling, transparent) from a mnemonic phrase.
@@ -326,18 +294,12 @@ pub fn mnemonic_to_transparent_address(
 /// // Display the selected receiver in the wallet UI; avoid logging account addresses.
 /// ```
 #[wasm_bindgen]
-pub fn mnemonic_to_addresses(
-    network: &str,
-    phrase: &str,
-    passphrase: &str,
-    account_index: u32,
-) -> Result<JsValue, Error> {
+pub fn mnemonic_to_addresses(network: &str, phrase: &str, passphrase: &str, account_index: u32) -> Result<JsValue, Error> {
     use std::str::FromStr;
     use zcash_keys::keys::UnifiedAddressRequest;
 
     // Convert mnemonic to seed
-    let mnemonic: Mnemonic<English> =
-        Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
+    let mnemonic: Mnemonic<English> = Mnemonic::from_phrase(phrase).map_err(|_| Error::InvalidSeedPhrase)?;
 
     let mut seed = mnemonic.to_seed(passphrase);
 
@@ -356,8 +318,7 @@ pub fn mnemonic_to_addresses(
     let uivk = ufvk.as_inner().to_unified_incoming_viewing_key();
 
     // Generate the first address that includes every receiver supported by the UIVK.
-    let (address, diversifier_index) =
-        uivk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
+    let (address, diversifier_index) = uivk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
     let address_index = transparent_address_index(&address, diversifier_index);
 
     let result = unified_addresses_from_full(&address, &net, address_index);
@@ -397,8 +358,7 @@ pub fn parse_unified_address(network: &str, unified_address: &str) -> Result<JsV
     // Get the network
     let net = crate::Network::from_str(network)?;
 
-    let (parsed_net, revision, ua) =
-        unified::Address::decode(unified_address).map_err(|_| Error::InvalidAddress)?;
+    let (parsed_net, revision, ua) = unified::Address::decode(unified_address).map_err(|_| Error::InvalidAddress)?;
 
     // Verify network matches
     if parsed_net != net.network_type() {
@@ -418,22 +378,16 @@ pub fn parse_unified_address(network: &str, unified_address: &str) -> Result<JsV
             unified::Receiver::Orchard(data) => {
                 shielded_receivers.push(unified::Receiver::Orchard(data));
                 // Create a unified address with only Orchard receiver
-                let single_ua = unified::Address::try_from_items(
-                    revision,
-                    vec![unified::Uitem::Data(unified::Receiver::Orchard(data))],
-                )
-                .map_err(|_| Error::InvalidAddress)?;
+                let single_ua = unified::Address::try_from_items(revision, vec![unified::Uitem::Data(unified::Receiver::Orchard(data))])
+                    .map_err(|_| Error::InvalidAddress)?;
                 // Encode the single-receiver UA
                 orchard_addr = Some(single_ua.encode(&parsed_net));
             }
             unified::Receiver::Sapling(data) => {
                 shielded_receivers.push(unified::Receiver::Sapling(data));
                 // Create a unified address with only Sapling receiver
-                let single_ua = unified::Address::try_from_items(
-                    revision,
-                    vec![unified::Uitem::Data(unified::Receiver::Sapling(data))],
-                )
-                .map_err(|_| Error::InvalidAddress)?;
+                let single_ua = unified::Address::try_from_items(revision, vec![unified::Uitem::Data(unified::Receiver::Sapling(data))])
+                    .map_err(|_| Error::InvalidAddress)?;
                 // Encode the single-receiver UA
                 sapling_addr = Some(single_ua.encode(&parsed_net));
 
@@ -454,14 +408,8 @@ pub fn parse_unified_address(network: &str, unified_address: &str) -> Result<JsV
         }
     }
 
-    let shielded_ua = unified::Address::try_from_items(
-        revision,
-        shielded_receivers
-            .into_iter()
-            .map(unified::Uitem::Data)
-            .collect(),
-    )
-    .map_err(|_| Error::InvalidAddress)?;
+    let shielded_ua =
+        unified::Address::try_from_items(revision, shielded_receivers.into_iter().map(unified::Uitem::Data).collect()).map_err(|_| Error::InvalidAddress)?;
 
     // Create the result structure
     let result = UnifiedAddresses {
@@ -486,10 +434,7 @@ mod tests {
     #[test]
     fn generate_mnemonic_only_allows_24_words() {
         for word_count in [12, 15, 18, 21] {
-            assert!(matches!(
-                generate_mnemonic(word_count),
-                Err(Error::InvalidSeedPhrase)
-            ));
+            assert!(matches!(generate_mnemonic(word_count), Err(Error::InvalidSeedPhrase)));
         }
 
         let mnemonic = generate_mnemonic(24).expect("24-word mnemonic generation should succeed");

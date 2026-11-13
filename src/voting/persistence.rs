@@ -9,11 +9,7 @@ use zcash_voting::transport::TransportError;
 #[derive(Default)]
 pub(crate) struct Revision(Cell<u64>);
 impl Revision {
-    pub(crate) async fn checkpoint<F, Fut>(
-        &self,
-        serialize: impl FnOnce() -> Result<Vec<u8>, VotingApiError>,
-        persist: F,
-    ) -> Result<(), VotingApiError>
+    pub(crate) async fn checkpoint<F, Fut>(&self, serialize: impl FnOnce() -> Result<Vec<u8>, VotingApiError>, persist: F) -> Result<(), VotingApiError>
     where
         F: FnOnce(Vec<u8>, u64) -> Fut,
         Fut: Future<Output = Result<(), VotingApiError>>,
@@ -44,9 +40,7 @@ where
     checkpoint().await?;
     let result = dispatch().await;
     record(&result).map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
-    checkpoint()
-        .await
-        .map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
+    checkpoint().await.map_err(|_| VotingApiError::new(VotingErrorCode::SubmissionUnknown))?;
     result.map_err(|error| {
         VotingApiError::new(if matches!(error, TransportError::Ambiguous) {
             VotingErrorCode::SubmissionUnknown
@@ -70,10 +64,7 @@ impl Persistence {
 
     // Session mutations and helper checkpoints serialize access to this boundary.
     // Failure or dropping the future must not acknowledge the in-memory snapshot.
-    pub(crate) async fn checkpoint_with<F>(
-        &self,
-        checkpoint: impl FnOnce() -> F,
-    ) -> Result<(), VotingApiError>
+    pub(crate) async fn checkpoint_with<F>(&self, checkpoint: impl FnOnce() -> F) -> Result<(), VotingApiError>
     where
         F: Future<Output = Result<(), VotingApiError>>,
     {
@@ -93,25 +84,15 @@ impl Persistence {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn checkpoint(
-        &self,
-        db: &zcash_voting::storage::VotingDb,
-    ) -> Result<(), VotingApiError> {
+    pub(crate) async fn checkpoint(&self, db: &zcash_voting::storage::VotingDb) -> Result<(), VotingApiError> {
         self.revision
             .checkpoint(
-                || {
-                    db.serialize_bytes()
-                        .map_err(|_| VotingApiError::new(VotingErrorCode::PersistenceFailed))
-                },
+                || db.serialize_bytes().map_err(|_| VotingApiError::new(VotingErrorCode::PersistenceFailed)),
                 |bytes, revision| async move {
                     let copied = js_sys::Uint8Array::from(bytes.as_slice());
                     let result = self
                         .callback
-                        .call2(
-                            &JsValue::UNDEFINED,
-                            &copied,
-                            &js_sys::BigInt::from(revision),
-                        )
+                        .call2(&JsValue::UNDEFINED, &copied, &js_sys::BigInt::from(revision))
                         .map_err(|_| VotingApiError::new(VotingErrorCode::PersistenceFailed))?;
                     wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
                         .await
@@ -152,9 +133,7 @@ mod tests {
             assert!(persistence.has_pending_checkpoint());
             assert!(
                 persistence
-                    .checkpoint_with(|| async {
-                        Err(VotingApiError::new(VotingErrorCode::PersistenceFailed))
-                    })
+                    .checkpoint_with(|| async { Err(VotingApiError::new(VotingErrorCode::PersistenceFailed)) })
                     .await
                     .is_err()
             );
@@ -213,16 +192,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            *events.borrow(),
-            [
-                "intent",
-                "checkpoint",
-                "dispatch:create",
-                "result",
-                "checkpoint"
-            ]
-        );
+        assert_eq!(*events.borrow(), ["intent", "checkpoint", "dispatch:create", "result", "checkpoint"]);
     }
     #[tokio::test]
     async fn checkpoint_before_dispatch_and_after_result() {
@@ -253,16 +223,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            *events.borrow(),
-            [
-                "db:intent",
-                "checkpoint:1",
-                "post",
-                "db:result",
-                "checkpoint:2"
-            ]
-        );
+        assert_eq!(*events.borrow(), ["db:intent", "checkpoint:1", "post", "db:result", "checkpoint:2"]);
     }
     #[tokio::test]
     async fn failed_checkpoint_never_dispatches() {
@@ -315,10 +276,7 @@ mod tests {
         let fail = || VotingApiError::new(VotingErrorCode::PersistenceFailed);
         assert!(
             revision
-                .checkpoint(
-                    || Err(fail()),
-                    |_, _| async { panic!("serialization failed") }
-                )
+                .checkpoint(|| Err(fail()), |_, _| async { panic!("serialization failed") })
                 .await
                 .is_err()
         );

@@ -1,0 +1,6 @@
+# Vendored trees are not ours to format. Reformatted `macro_rules!` bodies inside
+# zcash_voting/browser-deps/rusqlite broke `cfg_select!` invocations and stopped every
+# `--features voting` build; `ignore` only takes effect on nightly, which is what this repo pins.
+unstable_features = true
+max_width = 160
+ignore = ["zcash_voting", "librustzcash", "local-docs", "local-manual-pages"]

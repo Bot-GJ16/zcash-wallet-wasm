@@ -50,14 +50,7 @@ async fn legacy_delegation_hash_without_a_journal_is_polled_without_reposting() 
 
     let (initial, round) = BallotFixture::session_and_round(VotingNetwork::Testnet, false).await;
     let envelope = VotingSessionEnvelope::encode(initial.network, &round.identity()).unwrap();
-    initial
-        .db
-        .init_round(
-            VotingNetwork::Testnet.network(),
-            &round.params,
-            Some(&envelope),
-        )
-        .unwrap();
+    initial.db.init_round(VotingNetwork::Testnet.network(), &round.params, Some(&envelope)).unwrap();
     let canonical = delegation_fixture::prepare_for_stored_network(&initial.db, &round.params, 17);
     let old_bytes = delegation_fixture::corrupt(
         &initial.db.serialize_bytes().unwrap(),
@@ -68,17 +61,8 @@ async fn legacy_delegation_hash_without_a_journal_is_polled_without_reposting() 
             canonical.tx_hash()
         ),
     );
-    let session = VotingSessionInner::open(
-        initial.wallet.clone(),
-        initial.account_id,
-        Some(&old_bytes),
-        Persistence::default(),
-    )
-    .unwrap();
-    session
-        .trusted_rounds
-        .borrow_mut()
-        .insert(ID.into(), round.clone());
+    let session = VotingSessionInner::open(initial.wallet.clone(), initial.account_id, Some(&old_bytes), Persistence::default()).unwrap();
+    session.trusted_rounds.borrow_mut().insert(ID.into(), round.clone());
     let chain = DelegationChain {
         canonical,
         requests: Mutex::new(Vec::new()),
@@ -102,13 +86,7 @@ async fn legacy_delegation_hash_without_a_journal_is_polled_without_reposting() 
     assert_eq!(session.db.load_van_position(ID, 0).unwrap(), 41);
     session.validate_submission_state(ID).unwrap();
     assert_eq!(
-        chain
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|request| request.method.as_str())
-            .collect::<Vec<_>>(),
+        chain.requests.lock().unwrap().iter().map(|request| request.method.as_str()).collect::<Vec<_>>(),
         vec!["GET"]
     );
 }
@@ -125,17 +103,9 @@ async fn mainnet_prepare_delegation_ballot_confirmation_and_reload_stay_bound() 
             ID,
             |trusted| {
                 assert_eq!(trusted.network, VotingNetwork::Mainnet);
-                let envelope =
-                    VotingSessionEnvelope::encode(session.network, &trusted.identity()).unwrap();
-                session
-                    .db
-                    .init_round(session.network.network(), &trusted.params, Some(&envelope))
-                    .unwrap();
-                let canonical = delegation_fixture::prepare_for_stored_network(
-                    &session.db,
-                    &trusted.params,
-                    17,
-                );
+                let envelope = VotingSessionEnvelope::encode(session.network, &trusted.identity()).unwrap();
+                session.db.init_round(session.network.network(), &trusted.params, Some(&envelope)).unwrap();
+                let canonical = delegation_fixture::prepare_for_stored_network(&session.db, &trusted.params, 17);
                 generated.replace(Some(canonical));
                 std::future::ready(Ok(PreparedVotingRound {
                     round_id: ID.into(),
@@ -159,12 +129,7 @@ async fn mainnet_prepare_delegation_ballot_confirmation_and_reload_stay_bound() 
         canonical: canonical.clone(),
         requests: Mutex::new(Vec::new()),
     };
-    let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-        &crate::Network::MainNetwork,
-        &[17; 32],
-        zip32::AccountId::ZERO,
-    )
-    .unwrap();
+    let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&crate::Network::MainNetwork, &[17; 32], zip32::AccountId::ZERO).unwrap();
     let fingerprint = zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32]).unwrap();
     let delegated = session
         .submit_delegation_with(
@@ -185,11 +150,7 @@ async fn mainnet_prepare_delegation_ballot_confirmation_and_reload_stay_bound() 
     assert_eq!(delegated.phase, VotingRoundPhase::DelegationConfirmed);
     let delegation_requests = chain.requests.lock().unwrap();
     assert_eq!(delegation_requests.len(), 2);
-    assert!(
-        delegation_requests
-            .iter()
-            .all(|request| fixture_url(&round.vote_server_urls, &request.url))
-    );
+    assert!(delegation_requests.iter().all(|request| fixture_url(&round.vote_server_urls, &request.url)));
     drop(delegation_requests);
 
     let fixture = BallotFixture::from_confirmed_delegation(session, round, false);
@@ -199,18 +160,10 @@ async fn mainnet_prepare_delegation_ballot_confirmation_and_reload_stay_bound() 
         .session
         .submit_ballot_with(
             ID,
-            Some(vec![BallotDecision::Choice {
-                proposal_id: 1,
-                option: 0,
-            }]),
+            Some(vec![BallotDecision::Choice { proposal_id: 1, option: 0 }]),
             &transport,
             || std::future::ready(Ok(fixture.round.clone())),
-            |_, _, _| {
-                std::future::ready(Ok(BallotFixture::store(
-                    &fixture.session.db,
-                    &fixture.recoveries,
-                )))
-            },
+            |_, _, _| std::future::ready(Ok(BallotFixture::store(&fixture.session.db, &fixture.recoveries))),
             || async {
                 *durable.lock().unwrap() = fixture.session.export_state().unwrap();
                 Ok(())
@@ -230,23 +183,13 @@ async fn mainnet_prepare_delegation_ballot_confirmation_and_reload_stay_bound() 
     );
     let helper_requests = transport.helper_requests.lock().unwrap();
     assert!(!helper_requests.is_empty());
-    assert!(
-        helper_requests
-            .iter()
-            .all(|request| fixture_url(&fixture.round.vote_server_urls, &request.url))
-    );
+    assert!(helper_requests.iter().all(|request| fixture_url(&fixture.round.vote_server_urls, &request.url)));
 
     let exported = durable.lock().unwrap().clone();
     let reopened = fixture.reopen(&exported);
     assert_eq!(reopened.network, VotingNetwork::Mainnet);
-    assert_eq!(
-        reopened.round_status_at(ID, 1500).unwrap().phase,
-        VotingRoundPhase::SharesConfirmed
-    );
-    assert_eq!(
-        reopened.saved_identity(ID).unwrap(),
-        Some(fixture.round.identity())
-    );
+    assert_eq!(reopened.round_status_at(ID, 1500).unwrap().phase, VotingRoundPhase::SharesConfirmed);
+    assert_eq!(reopened.saved_identity(ID).unwrap(), Some(fixture.round.identity()));
 }
 
 fn fixture_url(bases: &[String], url: &str) -> bool {
@@ -265,10 +208,7 @@ async fn mainnet_atomic_batch_confirmation_and_reload_use_the_stored_network() {
     let decisions = fixture
         .roster()
         .into_iter()
-        .map(|proposal_id| BallotDecision::Choice {
-            proposal_id,
-            option: 0,
-        })
+        .map(|proposal_id| BallotDecision::Choice { proposal_id, option: 0 })
         .collect();
     let result = fixture
         .session
@@ -277,12 +217,7 @@ async fn mainnet_atomic_batch_confirmation_and_reload_use_the_stored_network() {
             Some(decisions),
             &transport,
             || std::future::ready(Ok(fixture.round.clone())),
-            |_, _, _| {
-                std::future::ready(Ok(BallotFixture::store(
-                    &fixture.session.db,
-                    &fixture.recoveries,
-                )))
-            },
+            |_, _, _| std::future::ready(Ok(BallotFixture::store(&fixture.session.db, &fixture.recoveries))),
             || async {
                 *durable.lock().unwrap() = fixture.session.export_state().unwrap();
                 Ok(())
@@ -293,11 +228,7 @@ async fn mainnet_atomic_batch_confirmation_and_reload_use_the_stored_network() {
         .unwrap();
     assert_eq!(result.phase, VotingRoundPhase::SharesConfirmed);
     assert_eq!(
-        fixture
-            .reopen(&durable.lock().unwrap())
-            .round_status_at(ID, 1500)
-            .unwrap()
-            .confirmed_helpers,
+        fixture.reopen(&durable.lock().unwrap()).round_status_at(ID, 1500).unwrap().confirmed_helpers,
         32
     );
 }
@@ -314,18 +245,10 @@ async fn mainnet_failed_checkpoint_before_vote_dispatch_has_no_network_effect() 
         .session
         .submit_ballot_with(
             ID,
-            Some(vec![BallotDecision::Choice {
-                proposal_id: 1,
-                option: 0,
-            }]),
+            Some(vec![BallotDecision::Choice { proposal_id: 1, option: 0 }]),
             &transport,
             || std::future::ready(Ok(fixture.round.clone())),
-            |_, _, _| {
-                std::future::ready(Ok(BallotFixture::store(
-                    &fixture.session.db,
-                    &fixture.recoveries,
-                )))
-            },
+            |_, _, _| std::future::ready(Ok(BallotFixture::store(&fixture.session.db, &fixture.recoveries))),
             || async {
                 checkpoints.set(checkpoints.get() + 1);
                 if checkpoints.get() == 3 {
@@ -354,18 +277,10 @@ async fn mainnet_unknown_vote_post_resumes_by_polling_without_reposting() {
         .session
         .submit_ballot_with(
             ID,
-            Some(vec![BallotDecision::Choice {
-                proposal_id: 1,
-                option: 0,
-            }]),
+            Some(vec![BallotDecision::Choice { proposal_id: 1, option: 0 }]),
             &transport,
             || std::future::ready(Ok(fixture.round.clone())),
-            |_, _, _| {
-                std::future::ready(Ok(BallotFixture::store(
-                    &fixture.session.db,
-                    &fixture.recoveries,
-                )))
-            },
+            |_, _, _| std::future::ready(Ok(BallotFixture::store(&fixture.session.db, &fixture.recoveries))),
             || async {
                 *durable.lock().unwrap() = fixture.session.export_state().unwrap();
                 Ok(())
@@ -375,16 +290,7 @@ async fn mainnet_unknown_vote_post_resumes_by_polling_without_reposting() {
         .await
         .unwrap();
     assert_eq!(pending.next_action, "poll_vote");
-    assert_eq!(
-        transport
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| request.method == "POST")
-            .count(),
-        1
-    );
+    assert_eq!(transport.requests.lock().unwrap().iter().filter(|request| request.method == "POST").count(), 1);
 
     let reopened = fixture.reopen(&durable.lock().unwrap());
     let mut resumed = fixture.transport(durable.clone(), Stop::None);
@@ -407,9 +313,11 @@ async fn mainnet_unknown_vote_post_resumes_by_polling_without_reposting() {
     assert_eq!(result.phase, VotingRoundPhase::SharesConfirmed);
     let requests = resumed.requests.lock().unwrap();
     assert_eq!(requests[0].method, "GET");
-    assert!(requests.iter().all(|request| {
-        request.method != "POST" || !request.url.ends_with("/shielded-vote/v1/cast-vote")
-    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.method != "POST" || !request.url.ends_with("/shielded-vote/v1/cast-vote") })
+    );
 }
 
 #[tokio::test]

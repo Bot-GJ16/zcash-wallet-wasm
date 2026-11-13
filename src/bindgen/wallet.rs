@@ -33,10 +33,7 @@ pub type MemoryWallet<T> = Wallet<MemoryWalletDb<Network>, T>;
 pub type AccountId = <MemoryWalletDb<Network> as WalletRead>::AccountId;
 pub type NoteRef = <MemoryWalletDb<Network> as InputSource>::NoteRef;
 
-fn is_user_facing_shielded_address(
-    address: &zcash_keys::address::UnifiedAddress,
-    default_address: &zcash_keys::address::UnifiedAddress,
-) -> bool {
+fn is_user_facing_shielded_address(address: &zcash_keys::address::UnifiedAddress, default_address: &zcash_keys::address::UnifiedAddress) -> bool {
     let has_shielded_receiver = address.has_orchard() || address.has_sapling();
     has_shielded_receiver && (address == default_address || address.transparent().is_none())
 }
@@ -81,12 +78,8 @@ impl TryFrom<ConfirmationsPolicyOptions> for ConfirmationsPolicy {
     type Error = Error;
 
     fn try_from(options: ConfirmationsPolicyOptions) -> Result<Self, Self::Error> {
-        Self::new(
-            options.trusted,
-            options.untrusted,
-            Self::default().allow_zero_conf_shielding(),
-        )
-        .map_err(|error| Error::Generic(format!("Invalid confirmations policy: {error}")))
+        Self::new(options.trusted, options.untrusted, Self::default().allow_zero_conf_shielding())
+            .map_err(|error| Error::Generic(format!("Invalid confirmations policy: {error}")))
     }
 }
 
@@ -170,9 +163,7 @@ impl WebWallet {
         // serde-wasm-bindgen does not reject unknown object keys on its own.
         for key in js_sys::Reflect::own_keys(&value).map_err(Error::Js)? {
             if !matches!(key.as_string().as_deref(), Some("urls" | "sendTimeoutMs")) {
-                return Err(Error::Generic(
-                    "Zero-indexer options contain an unsupported key".into(),
-                ));
+                return Err(Error::Generic("Zero-indexer options contain an unsupported key".into()));
             }
         }
         let options: ZeroIndexerOptions = serde_wasm_bindgen::from_value(value)?;
@@ -220,11 +211,7 @@ impl WebWallet {
         }
     }
 
-    async fn diagnose_transfer_result<T>(
-        &self,
-        account_id: AccountId,
-        result: Result<T, Error>,
-    ) -> Result<T, Error> {
+    async fn diagnose_transfer_result<T>(&self, account_id: AccountId, result: Result<T, Error>) -> Result<T, Error> {
         if matches!(&result, Err(Error::InsufficientTransferFunds(_))) {
             self.ensure_spendability_consistent(account_id).await?;
         }
@@ -240,15 +227,10 @@ impl WebWallet {
     pub fn new(
         network: &str,
         lightwalletd_url: &str,
-        #[wasm_bindgen(unchecked_optional_param_type = "Uint8Array | null")] db_bytes: Option<
-            Box<[u8]>,
-        >,
-        #[wasm_bindgen(unchecked_optional_param_type = "ConfirmationsPolicy | null")]
-        confirmations_policy: JsValue,
-        #[wasm_bindgen(unchecked_optional_param_type = "CompactBlockCdnOptions | null")]
-        compact_block_cdn: JsValue,
-        #[wasm_bindgen(unchecked_optional_param_type = "ZeroIndexerOptions | null")]
-        zero_indexer_options: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "Uint8Array | null")] db_bytes: Option<Box<[u8]>>,
+        #[wasm_bindgen(unchecked_optional_param_type = "ConfirmationsPolicy | null")] confirmations_policy: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "CompactBlockCdnOptions | null")] compact_block_cdn: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "ZeroIndexerOptions | null")] zero_indexer_options: JsValue,
     ) -> Result<WebWallet, Error> {
         let network = Network::from_str(network)?;
         let confirmations_policy = if confirmations_policy.is_null_or_undefined() {
@@ -257,32 +239,23 @@ impl WebWallet {
             // serde-wasm-bindgen's struct deserializer does not visit unknown keys.
             for key in js_sys::Reflect::own_keys(&confirmations_policy).map_err(Error::Js)? {
                 if !matches!(key.as_string().as_deref(), Some("trusted" | "untrusted")) {
-                    return Err(Error::Generic(
-                        "Confirmations policy only accepts trusted and untrusted".into(),
-                    ));
+                    return Err(Error::Generic("Confirmations policy only accepts trusted and untrusted".into()));
                 }
             }
-            let options: ConfirmationsPolicyOptions =
-                serde_wasm_bindgen::from_value(confirmations_policy)?;
+            let options: ConfirmationsPolicyOptions = serde_wasm_bindgen::from_value(confirmations_policy)?;
             options.try_into()?
         };
         let client = Client::new(lightwalletd_url.to_string());
         let compact_block_cdn = if compact_block_cdn.is_null_or_undefined() {
             None
         } else {
-            Some(
-                serde_wasm_bindgen::from_value::<CompactBlockCdnOptions>(compact_block_cdn)?
-                    .try_into()?,
-            )
+            Some(serde_wasm_bindgen::from_value::<CompactBlockCdnOptions>(compact_block_cdn)?.try_into()?)
         };
-        let (zero_indexer_clients, zero_indexer_send_timeout) =
-            Self::parse_zero_indexer_options(zero_indexer_options)?;
+        let (zero_indexer_clients, zero_indexer_send_timeout) = Self::parse_zero_indexer_options(zero_indexer_options)?;
 
         let db = match db_bytes {
             Some(bytes) => {
-                tracing::info!(
-                    "Serialized db was provided to constructor. Attempting to deserialize"
-                );
+                tracing::info!("Serialized db was provided to constructor. Attempting to deserialize");
                 MemoryWalletDb::decode_new(bytes.as_ref(), network, PRUNING_DEPTH)?
             }
             None => MemoryWalletDb::new(network, PRUNING_DEPTH),
@@ -301,10 +274,7 @@ impl WebWallet {
         })
     }
 
-    pub fn set_zero_indexer_options(
-        &mut self,
-        #[wasm_bindgen(unchecked_param_type = "ZeroIndexerOptions | null")] options: JsValue,
-    ) -> Result<(), Error> {
+    pub fn set_zero_indexer_options(&mut self, #[wasm_bindgen(unchecked_param_type = "ZeroIndexerOptions | null")] options: JsValue) -> Result<(), Error> {
         let (clients, timeout) = Self::parse_zero_indexer_options(options)?;
         self.inner.set_zero_indexer_options(clients, timeout);
         Ok(())
@@ -383,11 +353,7 @@ impl WebWallet {
     }
 
     pub async fn get_wallet_summary(&self) -> Result<Option<WalletSummary>, Error> {
-        let Some((summary, shieldable_balances)) = self
-            .inner
-            .get_wallet_summary_with_shieldable_balances()
-            .await?
-        else {
+        let Some((summary, shieldable_balances)) = self.inner.get_wallet_summary_with_shieldable_balances().await? else {
             return Ok(None);
         };
         let mut summary = WalletSummary::try_from(summary)?;
@@ -419,9 +385,7 @@ impl WebWallet {
     /// console.log(`Account ${accountId} birthday height: ${birthdayHeight}`);
     /// ```
     pub async fn get_account_birthday(&self, account_id: u32) -> Result<u32, Error> {
-        self.inner
-            .get_account_birthday(AccountId::from(account_id))
-            .await
+        self.inner.get_account_birthday(AccountId::from(account_id)).await
     }
 
     /// Get the Unix timestamp of a block at a given height
@@ -510,11 +474,7 @@ impl WebWallet {
     /// Returns null if fully synced, or Uint8Array with journal entry data.
     /// When `refresh` is false, session setup is skipped (call `sync_session_setup`
     /// once at the start of the catch-up session first).
-    pub async fn prepare_sync_batch(
-        &self,
-        batch_size: Option<u32>,
-        refresh: bool,
-    ) -> Result<Option<Box<[u8]>>, Error> {
+    pub async fn prepare_sync_batch(&self, batch_size: Option<u32>, refresh: bool) -> Result<Option<Box<[u8]>>, Error> {
         let start_time = js_sys::Date::now();
 
         let result = self.inner.prepare_sync_batch(batch_size, refresh).await?;
@@ -529,10 +489,7 @@ impl WebWallet {
                 );
             }
             None => {
-                tracing::info!(
-                    "⏱️ prepare_sync_batch: fully synced ({:.2}s)",
-                    elapsed_seconds
-                );
+                tracing::info!("⏱️ prepare_sync_batch: fully synced ({:.2}s)", elapsed_seconds);
             }
         }
 
@@ -555,22 +512,13 @@ impl WebWallet {
     /// as JSON `{"subtree","setup","download","scan"}`, or undefined when synced.
     /// When `refresh` is false, session setup is skipped (call
     /// `sync_session_setup` once first).
-    pub async fn bench_prepare_sync_batch_timed(
-        &self,
-        batch_size: Option<u32>,
-        refresh: bool,
-    ) -> Result<Option<String>, Error> {
-        self.inner
-            .bench_prepare_sync_batch_timed(batch_size, refresh)
-            .await
+    pub async fn bench_prepare_sync_batch_timed(&self, batch_size: Option<u32>, refresh: bool) -> Result<Option<String>, Error> {
+        self.inner.bench_prepare_sync_batch_timed(batch_size, refresh).await
     }
 
     /// Optimized journal-aware sync: same as [`prepare_sync_batch`] but uses
     /// External-only IVK scanning for contiguous forward ranges.
-    pub async fn prepare_sync_batch_optimized(
-        &self,
-        batch_size: Option<u32>,
-    ) -> Result<Option<Box<[u8]>>, Error> {
+    pub async fn prepare_sync_batch_optimized(&self, batch_size: Option<u32>) -> Result<Option<Box<[u8]>>, Error> {
         let start_time = js_sys::Date::now();
 
         let result = self.inner.prepare_sync_batch_optimized(batch_size).await?;
@@ -585,10 +533,7 @@ impl WebWallet {
                 );
             }
             None => {
-                tracing::info!(
-                    "⏱️ prepare_sync_batch_optimized: fully synced ({:.2}s)",
-                    elapsed_seconds
-                );
+                tracing::info!("⏱️ prepare_sync_batch_optimized: fully synced ({:.2}s)", elapsed_seconds);
             }
         }
 
@@ -603,20 +548,13 @@ impl WebWallet {
         let has_more = self.inner.scan_journal_entry(journal_data).await?;
 
         let elapsed_seconds = (js_sys::Date::now() - start_time) / 1000.0;
-        tracing::info!(
-            "⏱️ scan_journal_entry completed in {:.2}s, has_more: {}",
-            elapsed_seconds,
-            has_more
-        );
+        tracing::info!("⏱️ scan_journal_entry completed in {:.2}s, has_more: {}", elapsed_seconds, has_more);
 
         Ok(has_more)
     }
 
     /// Replay multiple journal entries in sequence (for recovery).
-    pub async fn replay_journal_entries(
-        &self,
-        entries: Vec<js_sys::Uint8Array>,
-    ) -> Result<(), Error> {
+    pub async fn replay_journal_entries(&self, entries: Vec<js_sys::Uint8Array>) -> Result<(), Error> {
         let entries: Vec<Vec<u8>> = entries.iter().map(|e| e.to_vec()).collect();
 
         let start_time = js_sys::Date::now();
@@ -711,21 +649,15 @@ impl WebWallet {
         use zcash_client_backend::data_api::{Account, AccountPurpose, AccountSource};
 
         let db = self.inner.db.read().await;
-        let account = db
-            .get_account(account_id.into())?
-            .ok_or(Error::AccountNotFound(account_id))?;
+        let account = db.get_account(account_id.into())?.ok_or(Error::AccountNotFound(account_id))?;
 
         // Get the derivation info from the account
         match account.source() {
-            AccountSource::Derived { derivation, .. } => {
-                Ok(Some(u32::from(derivation.account_index())))
-            }
+            AccountSource::Derived { derivation, .. } => Ok(Some(u32::from(derivation.account_index()))),
             AccountSource::Imported { purpose, .. } => {
                 // Imported accounts can also have derivation info in their purpose
                 match purpose {
-                    AccountPurpose::Spending { derivation } => {
-                        Ok(derivation.as_ref().map(|d| u32::from(d.account_index())))
-                    }
+                    AccountPurpose::Spending { derivation } => Ok(derivation.as_ref().map(|d| u32::from(d.account_index()))),
                     AccountPurpose::ViewOnly => Ok(None),
                 }
             }
@@ -758,23 +690,15 @@ impl WebWallet {
         use zcash_keys::keys::UnifiedAddressRequest;
 
         let db = self.inner.db.read().await;
-        let account = db
-            .get_account(account_id.into())?
-            .ok_or(Error::AccountNotFound(account_id))?;
+        let account = db.get_account(account_id.into())?.ok_or(Error::AccountNotFound(account_id))?;
 
         // Get the unified incoming viewing key from the account
         let uivk = account.uivk();
 
         // Generate the first address that includes every receiver supported by the UIVK.
-        let (full_address, diversifier_index) =
-            uivk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
-        let address_index =
-            crate::bindgen::mnemonic::transparent_address_index(&full_address, diversifier_index);
-        let result = crate::bindgen::mnemonic::unified_addresses_from_full(
-            &full_address,
-            &self.inner.network,
-            address_index,
-        );
+        let (full_address, diversifier_index) = uivk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
+        let address_index = crate::bindgen::mnemonic::transparent_address_index(&full_address, diversifier_index);
+        let result = crate::bindgen::mnemonic::unified_addresses_from_full(&full_address, &self.inner.network, address_index);
 
         Ok(serde_wasm_bindgen::to_value(&result)?)
     }
@@ -798,9 +722,7 @@ impl WebWallet {
 
         let account_ref = AccountId::from(account_id);
         let mut db = self.inner.db.write().await;
-        let account = db
-            .get_account(account_ref)?
-            .ok_or(Error::AccountNotFound(account_id))?;
+        let account = db.get_account(account_ref)?.ok_or(Error::AccountNotFound(account_id))?;
         let uivk = account.uivk();
 
         let request = UnifiedAddressRequest::custom(
@@ -821,11 +743,7 @@ impl WebWallet {
         let (address, _) = db
             .get_next_available_address(account_ref, request)?
             .ok_or_else(|| Error::Generic("Account cannot generate new addresses".into()))?;
-        let result = crate::bindgen::mnemonic::unified_addresses_from_full(
-            &address,
-            &self.inner.network,
-            None,
-        );
+        let result = crate::bindgen::mnemonic::unified_addresses_from_full(&address, &self.inner.network, None);
 
         Ok(serde_wasm_bindgen::to_value(&result)?)
     }
@@ -843,26 +761,16 @@ impl WebWallet {
 
         let account_ref = AccountId::from(account_id);
         let db = self.inner.db.read().await;
-        let account = db
-            .get_account(account_ref)?
-            .ok_or(Error::AccountNotFound(account_id))?;
-        let (default_address, _) = account
-            .uivk()
-            .default_address(UnifiedAddressRequest::AllAvailableKeys)?;
+        let account = db.get_account(account_ref)?.ok_or(Error::AccountNotFound(account_id))?;
+        let (default_address, _) = account.uivk().default_address(UnifiedAddressRequest::AllAvailableKeys)?;
 
         let mut seen = HashSet::new();
         let addresses = db
             .list_addresses(account_ref)?
             .into_iter()
             .filter_map(|info| match info.address() {
-                Address::Unified(address)
-                    if is_user_facing_shielded_address(address, &default_address) =>
-                {
-                    let result = crate::bindgen::mnemonic::unified_addresses_from_full(
-                        address,
-                        &self.inner.network,
-                        None,
-                    );
+                Address::Unified(address) if is_user_facing_shielded_address(address, &default_address) => {
+                    let result = crate::bindgen::mnemonic::unified_addresses_from_full(address, &self.inner.network, None);
                     seen.insert(result.unified.clone()).then_some(result)
                 }
                 _ => None,
@@ -884,13 +792,9 @@ impl WebWallet {
         memo: Option<Vec<u8>>,
     ) -> Result<String, Error> {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
-        let pczt = self
-            .inner
-            .pczt_create(AccountId::from(account_id), to_address, value, memo)
-            .await?;
+        let pczt = self.inner.pczt_create(AccountId::from(account_id), to_address, value, memo).await?;
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -901,8 +805,7 @@ impl WebWallet {
         to_address: String,
         value: u64,
         usk: super::UnifiedSpendingKey,
-        #[wasm_bindgen(unchecked_param_type = "\"shielded\" | \"transparent\"")]
-        funding_source: String,
+        #[wasm_bindgen(unchecked_param_type = "\"shielded\" | \"transparent\"")] funding_source: String,
         memo: Option<Vec<u8>>,
         marginal_fee_zats: Option<u64>,
         expiry_delta_blocks: Option<u32>,
@@ -942,13 +845,9 @@ impl WebWallet {
         memo: Option<Vec<u8>>,
     ) -> Result<String, Error> {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
-        let pczt = self
-            .inner
-            .pczt_create_transparent(AccountId::from(account_id), to_address, value, memo)
-            .await?;
+        let pczt = self.inner.pczt_create_transparent(AccountId::from(account_id), to_address, value, memo).await?;
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     pub async fn oneclick_pczt_shield(
@@ -960,8 +859,7 @@ impl WebWallet {
     ) -> Result<String, Error> {
         let pczt = self.inner.pczt_shield(account_id.into()).await?;
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     /// Import a watch-only spending account from an encoded UFVK (hardware wallet flow).
@@ -985,19 +883,10 @@ impl WebWallet {
         birthday_height: Option<u32>,
         key_source: Option<String>,
     ) -> Result<u32, Error> {
-        let seed_fp: [u8; 32] = seed_fingerprint
-            .try_into()
-            .map_err(|_| Error::SeedFingerprint)?;
+        let seed_fp: [u8; 32] = seed_fingerprint.try_into().map_err(|_| Error::SeedFingerprint)?;
 
         self.inner
-            .create_account_ufvk(
-                account_name,
-                ufvk,
-                seed_fp,
-                account_hd_index,
-                birthday_height,
-                key_source.as_deref(),
-            )
+            .create_account_ufvk(account_name, ufvk, seed_fp, account_hd_index, birthday_height, key_source.as_deref())
             .await
             .map(|id| *id)
     }
@@ -1008,23 +897,11 @@ impl WebWallet {
     /// (e.g. Keystone) can locate its keys. Serialize it with `Pczt.serialize()`
     /// before transporting via QR. `marginal_fee_zats` selects the ZIP-317 fee
     /// tier so hardware sends honor the same dynamic-fee tiers as software sends.
-    pub async fn pczt_create(
-        &self,
-        account_id: u32,
-        to_address: String,
-        value: u64,
-        memo: Option<Vec<u8>>,
-        marginal_fee_zats: u64,
-    ) -> Result<WasmPczt, Error> {
+    pub async fn pczt_create(&self, account_id: u32, to_address: String, value: u64, memo: Option<Vec<u8>>, marginal_fee_zats: u64) -> Result<WasmPczt, Error> {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
         let account_id = AccountId::from(account_id);
-        let result = self
-            .inner
-            .pczt_create_dynamic_fee(account_id, to_address, value, memo, marginal_fee_zats)
-            .await;
-        self.diagnose_transfer_result(account_id, result)
-            .await
-            .map(Into::into)
+        let result = self.inner.pczt_create_dynamic_fee(account_id, to_address, value, memo, marginal_fee_zats).await;
+        self.diagnose_transfer_result(account_id, result).await.map(Into::into)
     }
 
     /// Create an unsigned, unproven PCZT funded only by transparent inputs.
@@ -1039,13 +916,7 @@ impl WebWallet {
     ) -> Result<WasmPczt, Error> {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
         self.inner
-            .pczt_create_transparent_hardware_dynamic_fee(
-                AccountId::from(account_id),
-                to_address,
-                value,
-                memo,
-                marginal_fee_zats,
-            )
+            .pczt_create_transparent_hardware_dynamic_fee(AccountId::from(account_id), to_address, value, memo, marginal_fee_zats)
             .await
             .map(Into::into)
     }
@@ -1053,15 +924,8 @@ impl WebWallet {
     /// Create an unsigned, unproven shielding PCZT (transparent -> Orchard) for
     /// external signing (hardware wallet flow). `marginal_fee_zats` selects the
     /// ZIP-317 fee tier so hardware shields honor the dynamic-fee tiers too.
-    pub async fn pczt_shield_create(
-        &self,
-        account_id: u32,
-        marginal_fee_zats: u64,
-    ) -> Result<WasmPczt, Error> {
-        self.inner
-            .pczt_shield_dynamic_fee(account_id.into(), marginal_fee_zats)
-            .await
-            .map(Into::into)
+    pub async fn pczt_shield_create(&self, account_id: u32, marginal_fee_zats: u64) -> Result<WasmPczt, Error> {
+        self.inner.pczt_shield_dynamic_fee(account_id.into(), marginal_fee_zats).await.map(Into::into)
     }
 
     /// Create a V6 PCZT that sweeps spendable Orchard funds to this account's Ironwood pool.
@@ -1075,13 +939,7 @@ impl WebWallet {
     ) -> Result<WasmPczt, Error> {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
         self.inner
-            .pczt_create_orchard_migration(
-                account_id.into(),
-                to_address,
-                memo,
-                marginal_fee_zats,
-                expiry_delta_blocks,
-            )
+            .pczt_create_orchard_migration(account_id.into(), to_address, memo, marginal_fee_zats, expiry_delta_blocks)
             .await
             .map(Into::into)
     }
@@ -1101,17 +959,10 @@ impl WebWallet {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
         let pczt = self
             .inner
-            .pczt_create_orchard_migration(
-                account_id.into(),
-                to_address,
-                memo,
-                marginal_fee_zats,
-                expiry_delta_blocks,
-            )
+            .pczt_create_orchard_migration(account_id.into(), to_address, memo, marginal_fee_zats, expiry_delta_blocks)
             .await?;
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     pub async fn estimate_orchard_migration_fee(
@@ -1155,35 +1006,19 @@ impl WebWallet {
         let pczt = match expiry_delta_blocks {
             Some(expiry_delta_blocks) => {
                 self.inner
-                    .pczt_create_dynamic_fee_with_expiry_delta(
-                        AccountId::from(account_id),
-                        to_address,
-                        value,
-                        memo,
-                        marginal_fee_zats,
-                        expiry_delta_blocks,
-                    )
+                    .pczt_create_dynamic_fee_with_expiry_delta(AccountId::from(account_id), to_address, value, memo, marginal_fee_zats, expiry_delta_blocks)
                     .await
             }
             None => {
                 self.inner
-                    .pczt_create_dynamic_fee(
-                        AccountId::from(account_id),
-                        to_address,
-                        value,
-                        memo,
-                        marginal_fee_zats,
-                    )
+                    .pczt_create_dynamic_fee(AccountId::from(account_id), to_address, value, memo, marginal_fee_zats)
                     .await
             }
         };
 
-        let pczt = self
-            .diagnose_transfer_result(AccountId::from(account_id), pczt)
-            .await?;
+        let pczt = self.diagnose_transfer_result(AccountId::from(account_id), pczt).await?;
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1215,19 +1050,12 @@ impl WebWallet {
             }
             None => {
                 self.inner
-                    .pczt_create_transparent_dynamic_fee(
-                        AccountId::from(account_id),
-                        to_address,
-                        value,
-                        memo,
-                        marginal_fee_zats,
-                    )
+                    .pczt_create_transparent_dynamic_fee(AccountId::from(account_id), to_address, value, memo, marginal_fee_zats)
                     .await?
             }
         };
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     pub async fn oneclick_pczt_shield_dynamic_fee(
@@ -1242,22 +1070,13 @@ impl WebWallet {
         let pczt = match expiry_delta_blocks {
             Some(expiry_delta_blocks) => {
                 self.inner
-                    .pczt_shield_dynamic_fee_with_expiry_delta(
-                        account_id.into(),
-                        marginal_fee_zats,
-                        expiry_delta_blocks,
-                    )
+                    .pczt_shield_dynamic_fee_with_expiry_delta(account_id.into(), marginal_fee_zats, expiry_delta_blocks)
                     .await?
             }
-            None => {
-                self.inner
-                    .pczt_shield_dynamic_fee(account_id.into(), marginal_fee_zats)
-                    .await?
-            }
+            None => self.inner.pczt_shield_dynamic_fee(account_id.into(), marginal_fee_zats).await?,
         };
 
-        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key)
-            .await
+        self.sign_prove_and_send_pczt(pczt, usk, seed_fp, sapling_proof_gen_key).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1267,8 +1086,7 @@ impl WebWallet {
         account_id: u32,
         to_address: String,
         value: u64,
-        #[wasm_bindgen(unchecked_param_type = "\"shielded\" | \"transparent\"")]
-        funding_source: String,
+        #[wasm_bindgen(unchecked_param_type = "\"shielded\" | \"transparent\"")] funding_source: String,
         memo: Option<Vec<u8>>,
         marginal_fee_zats: Option<u64>,
         expiry_delta_blocks: Option<u32>,
@@ -1324,13 +1142,7 @@ impl WebWallet {
     ) -> Result<u64, Error> {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
         self.inner
-            .estimate_pczt_transparent_transfer_fee(
-                AccountId::from(account_id),
-                to_address,
-                value,
-                memo,
-                marginal_fee_zats,
-            )
+            .estimate_pczt_transparent_transfer_fee(AccountId::from(account_id), to_address, value, memo, marginal_fee_zats)
             .await
     }
 
@@ -1350,10 +1162,7 @@ impl WebWallet {
 
         let account_id = AccountId::from(account_id);
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
-        let result = self
-            .inner
-            .estimate_pczt_max_transfer(account_id, to_address, memo, marginal_fee_zats)
-            .await;
+        let result = self.inner.estimate_pczt_max_transfer(account_id, to_address, memo, marginal_fee_zats).await;
         let (max_amount_zats, fee_zats) = self.diagnose_transfer_result(account_id, result).await?;
 
         serde_wasm_bindgen::to_value(&MaxTransferEstimate {
@@ -1380,12 +1189,7 @@ impl WebWallet {
         let to_address = ZcashAddress::try_from_encoded(&to_address)?;
         let (max_amount_zats, fee_zats) = self
             .inner
-            .estimate_pczt_max_transparent_transfer(
-                AccountId::from(account_id),
-                to_address,
-                memo,
-                marginal_fee_zats,
-            )
+            .estimate_pczt_max_transparent_transfer(AccountId::from(account_id), to_address, memo, marginal_fee_zats)
             .await?;
 
         serde_wasm_bindgen::to_value(&MaxTransferEstimate {
@@ -1395,14 +1199,8 @@ impl WebWallet {
         .map_err(Error::from)
     }
 
-    pub async fn estimate_pczt_shield_fee(
-        &self,
-        account_id: u32,
-        marginal_fee_zats: u64,
-    ) -> Result<u64, Error> {
-        self.inner
-            .estimate_pczt_shield_fee(account_id.into(), marginal_fee_zats)
-            .await
+    pub async fn estimate_pczt_shield_fee(&self, account_id: u32, marginal_fee_zats: u64) -> Result<u64, Error> {
+        self.inner.estimate_pczt_shield_fee(account_id.into(), marginal_fee_zats).await
     }
 
     /// Sign, prove locally, and send a PCZT transaction.
@@ -1430,8 +1228,7 @@ impl WebWallet {
         let proof_gen_key = sapling_proof_gen_key.map(Into::into);
 
         // Sign the PCZT
-        let signed_pczt =
-            pczt_sign_inner(self.inner.network, pczt, usk.into(), seed_fp.into()).await?;
+        let signed_pczt = pczt_sign_inner(self.inner.network, pczt, usk.into(), seed_fp.into()).await?;
 
         // Prove the PCZT locally.
         let proved_pczt = self.inner.pczt_prove(signed_pczt, proof_gen_key).await?;
@@ -1513,9 +1310,7 @@ impl TryFrom<zcash_client_backend::data_api::AccountBalance> for AccountBalance 
     fn try_from(balance: zcash_client_backend::data_api::AccountBalance) -> Result<Self, Error> {
         use zcash_protocol::value::Zatoshis;
 
-        fn pending_value(
-            balance: &zcash_client_backend::data_api::Balance,
-        ) -> Result<Zatoshis, Error> {
+        fn pending_value(balance: &zcash_client_backend::data_api::Balance) -> Result<Zatoshis, Error> {
             (balance.change_pending_confirmation() + balance.value_pending_spendability())
                 .ok_or(zcash_protocol::value::BalanceError::Overflow)
                 .map_err(Error::from)
@@ -1525,10 +1320,9 @@ impl TryFrom<zcash_client_backend::data_api::AccountBalance> for AccountBalance 
         let orchard_pending_balance = pending_value(balance.orchard_balance())?;
         let ironwood_pending_balance = pending_value(balance.ironwood_balance())?;
         let unshielded_pending_balance = pending_value(&balance.unshielded_balance())?;
-        let pending_balance = (balance.change_pending_confirmation()
-            + balance.value_pending_spendability())
-        .ok_or(zcash_protocol::value::BalanceError::Overflow)
-        .map_err(Error::from)?;
+        let pending_balance = (balance.change_pending_confirmation() + balance.value_pending_spendability())
+            .ok_or(zcash_protocol::value::BalanceError::Overflow)
+            .map_err(Error::from)?;
 
         Ok(AccountBalance {
             sapling_balance: balance.sapling_balance().spendable_value().into(),
@@ -1561,9 +1355,7 @@ where
         let mut account_balances: Vec<_> = summary
             .account_balances()
             .iter()
-            .map(|(k, v)| {
-                AccountBalance::try_from(*v).map(|balance| (*(*k).clone().deref(), balance))
-            })
+            .map(|(k, v)| AccountBalance::try_from(*v).map(|balance| (*(*k).clone().deref(), balance)))
             .collect::<Result<_, _>>()?;
 
         account_balances.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1596,10 +1388,7 @@ mod confirmations_policy_tests {
             .unwrap();
             assert_eq!(u32::from(policy.trusted()), trusted);
             assert_eq!(u32::from(policy.untrusted()), untrusted);
-            assert_eq!(
-                policy.allow_zero_conf_shielding(),
-                ConfirmationsPolicy::default().allow_zero_conf_shielding()
-            );
+            assert_eq!(policy.allow_zero_conf_shielding(), ConfirmationsPolicy::default().allow_zero_conf_shielding());
         }
     }
 
@@ -1616,49 +1405,32 @@ mod confirmations_policy_tests {
 
     #[test]
     fn shielded_address_history_excludes_transparent_discovery_records() {
-        let spending_key = UnifiedSpendingKey::new("main", vec![0; 32].into_boxed_slice(), 0)
-            .expect("test spending key should be valid");
+        let spending_key = UnifiedSpendingKey::new("main", vec![0; 32].into_boxed_slice(), 0).expect("test spending key should be valid");
         let viewing_key = spending_key.to_unified_full_viewing_key();
         let incoming_viewing_key = viewing_key.as_inner().to_unified_incoming_viewing_key();
         let (default_address, _) = incoming_viewing_key
             .default_address(UnifiedAddressRequest::AllAvailableKeys)
             .expect("default address should be available");
 
-        let shielded_request = UnifiedAddressRequest::custom(
-            ReceiverRequirement::Require,
-            ReceiverRequirement::Require,
-            ReceiverRequirement::Omit,
-        )
-        .expect("shielded-only request should be valid");
+        let shielded_request = UnifiedAddressRequest::custom(ReceiverRequirement::Require, ReceiverRequirement::Require, ReceiverRequirement::Omit)
+            .expect("shielded-only request should be valid");
         let (rotated_address, _) = incoming_viewing_key
             .find_address(DiversifierIndex::new(), shielded_request)
             .expect("shielded-only address should be available");
 
         let mut index = DiversifierIndex::new();
         let transparent_discovery_address = loop {
-            if let Ok(address) =
-                incoming_viewing_key.address(index, UnifiedAddressRequest::ALLOW_ALL)
+            if let Ok(address) = incoming_viewing_key.address(index, UnifiedAddressRequest::ALLOW_ALL)
                 && address != default_address
                 && address.transparent().is_some()
             {
                 break address;
             }
-            index
-                .increment()
-                .expect("test should find a transparent discovery address");
+            index.increment().expect("test should find a transparent discovery address");
         };
 
-        assert!(is_user_facing_shielded_address(
-            &default_address,
-            &default_address
-        ));
-        assert!(is_user_facing_shielded_address(
-            &rotated_address,
-            &default_address
-        ));
-        assert!(!is_user_facing_shielded_address(
-            &transparent_discovery_address,
-            &default_address
-        ));
+        assert!(is_user_facing_shielded_address(&default_address, &default_address));
+        assert!(is_user_facing_shielded_address(&rotated_address, &default_address));
+        assert!(!is_user_facing_shielded_address(&transparent_discovery_address, &default_address));
     }
 }

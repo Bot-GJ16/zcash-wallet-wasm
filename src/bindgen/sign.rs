@@ -75,12 +75,7 @@ fn pczt_sign_owned(
                 if spend
                     .zip32_derivation()
                     .as_ref()
-                    .and_then(|derivation| {
-                        derivation.extract_account_index(
-                            &seed_fp,
-                            zip32::ChildIndex::hardened(network.network_type().coin_type()),
-                        )
-                    })
+                    .and_then(|derivation| derivation.extract_account_index(&seed_fp, zip32::ChildIndex::hardened(network.network_type().coin_type())))
                     .is_some()
                 {
                     spends_to_sign.push(KeyRef::Sapling { index });
@@ -99,14 +94,8 @@ fn pczt_sign_owned(
                     // This matches the coin_type with hardened flag set
                     let coin_type_value = network.network_type().coin_type() | HARDENED_FLAG;
 
-                    if let Some((_, scope, address_index)) =
-                        derivation.extract_bip_44_fields(&seed_fp, coin_type_value.into())
-                    {
-                        spends_to_sign.push(KeyRef::Transparent {
-                            index,
-                            scope,
-                            address_index,
-                        });
+                    if let Some((_, scope, address_index)) = derivation.extract_bip_44_fields(&seed_fp, coin_type_value.into()) {
+                        spends_to_sign.push(KeyRef::Transparent { index, scope, address_index });
                     }
                 }
             }
@@ -162,9 +151,7 @@ fn pczt_sign_owned(
                             let diversifier = recipient.diversifier();
                             if external_vk.to_payment_address(*diversifier) == Some(*recipient) {
                                 external_proof_gen_key.clone()
-                            } else if internal_vk.to_payment_address(*diversifier)
-                                == Some(*recipient)
-                            {
+                            } else if internal_vk.to_payment_address(*diversifier) == Some(*recipient) {
                                 internal_proof_gen_key.clone()
                             } else {
                                 // Neither key matches; use external as fallback.
@@ -182,9 +169,7 @@ fn pczt_sign_owned(
 
                 // Add the correct proof generation key to each spend
                 for (index, key) in spends_needing_key {
-                    updater.update_spend_with(index, |mut spend_updater| {
-                        spend_updater.set_proof_generation_key(key)
-                    })?;
+                    updater.update_spend_with(index, |mut spend_updater| spend_updater.set_proof_generation_key(key))?;
                 }
 
                 Ok(())
@@ -193,8 +178,7 @@ fn pczt_sign_owned(
             .finish()
     };
 
-    let mut signer = Signer::new(pczt)
-        .map_err(|e| Error::PcztSign(format!("Failed to initialize signer: {e:?}")))?;
+    let mut signer = Signer::new(pczt).map_err(|e| Error::PcztSign(format!("Failed to initialize signer: {e:?}")))?;
     for keyref in spends_to_sign {
         match keyref {
             KeyRef::Orchard { index } => {
@@ -204,9 +188,7 @@ fn pczt_sign_owned(
                         index,
                         &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
                     )
-                    .map_err(|e| {
-                        Error::PcztSign(format!("Failed to sign Orchard spend {index}: {e:?}"))
-                    })?;
+                    .map_err(|e| Error::PcztSign(format!("Failed to sign Orchard spend {index}: {e:?}")))?;
             }
             KeyRef::Ironwood { index } => {
                 signer
@@ -215,42 +197,22 @@ fn pczt_sign_owned(
                         index,
                         &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
                     )
-                    .map_err(|e| {
-                        Error::PcztSign(format!("Failed to sign Ironwood spend {index}: {e:?}"))
-                    })?;
+                    .map_err(|e| Error::PcztSign(format!("Failed to sign Ironwood spend {index}: {e:?}")))?;
             }
             KeyRef::Sapling { index } => {
                 signer
-                    .sign_sapling(
-                        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
-                        index,
-                        usk.sapling().expsk().ask(),
-                    )
-                    .map_err(|e| {
-                        Error::PcztSign(format!("Failed to sign Sapling spend {index}: {e:?}"))
-                    })?;
+                    .sign_sapling(rand::rand_core::UnwrapErr(rand::rngs::SysRng), index, usk.sapling().expsk().ask())
+                    .map_err(|e| Error::PcztSign(format!("Failed to sign Sapling spend {index}: {e:?}")))?;
             }
-            KeyRef::Transparent {
-                index,
-                scope,
-                address_index,
-            } => {
+            KeyRef::Transparent { index, scope, address_index } => {
                 signer
                     .sign_transparent(
                         index,
                         &usk.transparent()
                             .derive_secret_key(scope, address_index)
-                            .map_err(|e| {
-                                Error::PcztSign(format!(
-                                    "Failed to derive transparent key at .../{scope:?}/{address_index:?}: {e:?}",
-                                ))
-                            })?,
+                            .map_err(|e| Error::PcztSign(format!("Failed to derive transparent key at .../{scope:?}/{address_index:?}: {e:?}",)))?,
                     )
-                    .map_err(|e| {
-                        Error::PcztSign(format!(
-                            "Failed to sign transparent input {index}: {e:?}"
-                        ))
-                    })?;
+                    .map_err(|e| Error::PcztSign(format!("Failed to sign transparent input {index}: {e:?}")))?;
             }
         }
     }
@@ -270,8 +232,7 @@ pub(crate) fn sign_delegation_owned(
     use crate::voting::types::{VotingApiError, VotingErrorCode};
     let invalid = || VotingApiError::new(VotingErrorCode::RecoveryConflict);
     if expected.seed_fingerprint != fingerprint.to_bytes()
-        || expected.orchard_fvk_bytes
-            != orchard::keys::FullViewingKey::from(usk.orchard()).to_bytes()
+        || expected.orchard_fvk_bytes != orchard::keys::FullViewingKey::from(usk.orchard()).to_bytes()
         || !pczt.orchard().actions().is_empty()
         || !pczt.sapling().spends().is_empty()
         || !pczt.sapling().outputs().is_empty()
@@ -285,12 +246,11 @@ pub(crate) fn sign_delegation_owned(
     let pczt = Verifier::new(pczt)
         .with_ironwood::<(), _>(|bundle| {
             let spend = bundle.actions()[action_index].spend();
-            let index = spend.zip32_derivation().as_ref().and_then(|path| {
-                path.extract_account_index(&fingerprint, zip32::ChildIndex::hardened(1))
-            });
-            if index.map(u32::from) != Some(expected.account_index)
-                || spend.spend_auth_sig().is_some()
-            {
+            let index = spend
+                .zip32_derivation()
+                .as_ref()
+                .and_then(|path| path.extract_account_index(&fingerprint, zip32::ChildIndex::hardened(1)));
+            if index.map(u32::from) != Some(expected.account_index) || spend.spend_auth_sig().is_some() {
                 return Err(pczt::roles::verifier::OrchardError::Custom(()));
             }
             Ok(())
@@ -298,11 +258,7 @@ pub(crate) fn sign_delegation_owned(
         .map_err(|_| invalid())?
         .finish();
     pczt_sign_owned(Network::TestNetwork, pczt, usk, fingerprint)
-        .and_then(|signed| {
-            signed
-                .serialize()
-                .map_err(|_| Error::PcztSign("invalid signed artifact".into()))
-        })
+        .and_then(|signed| signed.serialize().map_err(|_| Error::PcztSign("invalid signed artifact".into())))
         .map_err(|_| invalid())
 }
 
@@ -379,19 +335,16 @@ pub fn sign_message_with_transparent(
     let transparent_key = usk_inner.transparent();
 
     let address_index = match address_index {
-        Some(index) => NonHardenedChildIndex::from_index(index)
-            .ok_or_else(|| Error::Generic("Invalid transparent child index".into()))?,
+        Some(index) => NonHardenedChildIndex::from_index(index).ok_or_else(|| Error::Generic("Invalid transparent child index".into()))?,
         None => {
             let ufvk = usk_inner.to_unified_full_viewing_key();
             let uivk = ufvk.to_unified_incoming_viewing_key();
             let (ua, diversifier_idx) = uivk
                 .default_address(UnifiedAddressRequest::AllAvailableKeys)
                 .map_err(|e| Error::Generic(format!("Failed to derive default address: {e:?}")))?;
-            let transparent_j =
-                crate::bindgen::mnemonic::transparent_address_index(&ua, diversifier_idx)
-                    .ok_or_else(|| Error::Generic("Invalid transparent child index".into()))?;
-            NonHardenedChildIndex::from_index(transparent_j)
-                .expect("transparent_address_index returns a valid non-hardened child index")
+            let transparent_j = crate::bindgen::mnemonic::transparent_address_index(&ua, diversifier_idx)
+                .ok_or_else(|| Error::Generic("Invalid transparent child index".into()))?;
+            NonHardenedChildIndex::from_index(transparent_j).expect("transparent_address_index returns a valid non-hardened child index")
         }
     };
 
@@ -478,8 +431,7 @@ pub(crate) mod tests {
     #[test]
     fn delegation_tx1_signing_enforces_account_fingerprint_and_single_ironwood_action() {
         let network = Network::TestNetwork;
-        let usk =
-            UnifiedSpendingKey::from_seed(&network, &[7; 32], zip32::AccountId::ZERO).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&network, &[7; 32], zip32::AccountId::ZERO).unwrap();
         let fingerprint = zip32::fingerprint::SeedFingerprint::from_seed(&[7; 32]).unwrap();
         let ufvk = usk.to_unified_full_viewing_key();
         let fvk = ufvk.orchard().unwrap();
@@ -495,24 +447,10 @@ pub(crate) mod tests {
             orchard::NoteVersion::V3,
         )
         .unwrap();
-        let note = zcash_voting::NoteInfo::from_orchard_note(
-            &note,
-            0,
-            zip32::Scope::External,
-            &ufvk,
-            &network,
-        )
-        .unwrap();
-        let db = zcash_voting::storage::VotingDb::open_browser(
-            "fixture",
-            zcash_voting::Network::Testnet,
-            None,
-        )
-        .unwrap();
+        let note = zcash_voting::NoteInfo::from_orchard_note(&note, 0, zip32::Scope::External, &ufvk, &network).unwrap();
+        let db = zcash_voting::storage::VotingDb::open_browser("fixture", zcash_voting::Network::Testnet, None).unwrap();
         let id = "01".repeat(32);
-        let height = u64::from(u32::from(
-            network.activation_height(NetworkUpgrade::Nu6_3).unwrap(),
-        ));
+        let height = u64::from(u32::from(network.activation_height(NetworkUpgrade::Nu6_3).unwrap()));
         db.init_round(
             zcash_voting::Network::Testnet,
             &zcash_voting::VotingRoundParams {
@@ -526,14 +464,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let hotkey = db.ensure_voting_hotkey(&id).unwrap();
-        let keys = zcash_voting::delegate::DelegationKeys::with_voting_hotkey(
-            fvk.to_bytes().to_vec(),
-            &hotkey,
-            fingerprint.to_bytes(),
-            0,
-            "fixture".into(),
-        )
-        .unwrap();
+        let keys =
+            zcash_voting::delegate::DelegationKeys::with_voting_hotkey(fvk.to_bytes().to_vec(), &hotkey, fingerprint.to_bytes(), 0, "fixture".into()).unwrap();
         db.ensure_bundles(&id, std::slice::from_ref(&note)).unwrap();
         let setup = db
             .build_governance_pczt(
@@ -541,11 +473,7 @@ pub(crate) mod tests {
                 0,
                 &[note],
                 &keys,
-                zcash_voting::delegate::branch_id_for_height(
-                    zcash_voting::Network::Testnet,
-                    height,
-                )
-                .unwrap(),
+                zcash_voting::delegate::branch_id_for_height(zcash_voting::Network::Testnet, height).unwrap(),
             )
             .unwrap();
         let metadata = |account_index| zcash_voting::delegate::DelegationAccountKeys {
@@ -554,25 +482,12 @@ pub(crate) mod tests {
             seed_fingerprint: fingerprint.to_bytes(),
         };
         let pczt = pczt::Pczt::parse(&setup.pczt_bytes).unwrap();
-        assert!(
-            super::sign_delegation_owned(pczt.clone(), usk.clone(), metadata(1), fingerprint, 0)
-                .is_err()
-        );
+        assert!(super::sign_delegation_owned(pczt.clone(), usk.clone(), metadata(1), fingerprint, 0).is_err());
         let wrong = zip32::fingerprint::SeedFingerprint::from_seed(&[8; 32]).unwrap();
-        assert!(
-            super::sign_delegation_owned(pczt.clone(), usk.clone(), metadata(0), wrong, 0).is_err()
-        );
-        assert!(
-            super::sign_delegation_owned(pczt.clone(), usk.clone(), metadata(0), fingerprint, 1)
-                .is_err()
-        );
+        assert!(super::sign_delegation_owned(pczt.clone(), usk.clone(), metadata(0), wrong, 0).is_err());
+        assert!(super::sign_delegation_owned(pczt.clone(), usk.clone(), metadata(0), fingerprint, 1).is_err());
         let bytes = super::sign_delegation_owned(pczt, usk, metadata(0), fingerprint, 0).unwrap();
-        assert_eq!(
-            zcash_voting::delegate::pczt_sighash(&bytes)
-                .unwrap()
-                .to_vec(),
-            setup.pczt_sighash
-        );
+        assert_eq!(zcash_voting::delegate::pczt_sighash(&bytes).unwrap().to_vec(), setup.pczt_sighash);
         assert!(zcash_voting::delegate::spend_auth_signature(&bytes, 0).is_ok());
         let signed = pczt::Pczt::parse(&bytes).unwrap();
         assert!(signed.orchard().actions().is_empty());
@@ -582,13 +497,7 @@ pub(crate) mod tests {
     pub(crate) fn orchard_pczt(
         pool: OrchardPool,
         include_derivation: bool,
-    ) -> (
-        Network,
-        pczt::Pczt,
-        UnifiedSpendingKey,
-        zip32::fingerprint::SeedFingerprint,
-        usize,
-    ) {
+    ) -> (Network, pczt::Pczt, UnifiedSpendingKey, zip32::fingerprint::SeedFingerprint, usize) {
         let network = Network::TestNetwork;
         let seed = [7; 32];
         let account_id = zip32::AccountId::ZERO;
@@ -605,14 +514,7 @@ pub(crate) mod tests {
             OrchardPool::Orchard => orchard::note::NoteVersion::V2,
             OrchardPool::Ironwood => orchard::note::NoteVersion::V3,
         };
-        let note = orchard::Note::from_parts(
-            recipient,
-            orchard::value::NoteValue::from_raw(1_000_000),
-            rho,
-            rseed,
-            note_version,
-        )
-        .unwrap();
+        let note = orchard::Note::from_parts(recipient, orchard::value::NoteValue::from_raw(1_000_000), rho, rseed, note_version).unwrap();
         let zero = orchard::tree::MerkleHashOrchard::from_bytes(&[0; 32]).unwrap();
         let merkle_path = orchard::tree::MerklePath::from_parts(0, [zero; 32]);
         let anchor = merkle_path.root(note.commitment().into());
@@ -631,14 +533,10 @@ pub(crate) mod tests {
         );
         match pool {
             OrchardPool::Orchard => {
-                builder
-                    .add_orchard_spend::<zip317::FeeRule>(orchard_fvk.clone(), note, merkle_path)
-                    .unwrap();
+                builder.add_orchard_spend::<zip317::FeeRule>(orchard_fvk.clone(), note, merkle_path).unwrap();
             }
             OrchardPool::Ironwood => {
-                builder
-                    .add_ironwood_spend::<zip317::FeeRule>(orchard_fvk.clone(), note, merkle_path)
-                    .unwrap();
+                builder.add_ironwood_spend::<zip317::FeeRule>(orchard_fvk.clone(), note, merkle_path).unwrap();
             }
         }
         builder
@@ -657,9 +555,7 @@ pub(crate) mod tests {
             orchard_meta,
             ironwood_meta,
             ..
-        } = builder
-            .build_for_pczt(UnwrapErr(SysRng), &zip317::FeeRule::standard())
-            .unwrap();
+        } = builder.build_for_pczt(UnwrapErr(SysRng), &zip317::FeeRule::standard()).unwrap();
         let spend_index = match pool {
             OrchardPool::Orchard => orchard_meta.spend_action_index(0).unwrap(),
             OrchardPool::Ironwood => ironwood_meta.spend_action_index(0).unwrap(),
@@ -708,73 +604,40 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn signs_ironwood_spends() {
-        let (network, pczt, usk, seed_fingerprint, spend_index) =
-            orchard_pczt(OrchardPool::Ironwood, true);
+        let (network, pczt, usk, seed_fingerprint, spend_index) = orchard_pczt(OrchardPool::Ironwood, true);
 
-        assert!(
-            pczt.ironwood().actions()[spend_index]
-                .spend()
-                .spend_auth_sig()
-                .is_none()
-        );
+        assert!(pczt.ironwood().actions()[spend_index].spend().spend_auth_sig().is_none());
 
-        let signed = pczt_sign_inner(network, pczt, usk, seed_fingerprint)
-            .await
-            .unwrap();
+        let signed = pczt_sign_inner(network, pczt, usk, seed_fingerprint).await.unwrap();
 
-        assert!(
-            signed.ironwood().actions()[spend_index]
-                .spend()
-                .spend_auth_sig()
-                .is_some()
-        );
+        assert!(signed.ironwood().actions()[spend_index].spend().spend_auth_sig().is_some());
     }
 
     #[tokio::test]
     async fn signs_orchard_spend_without_derivation() {
-        let (network, pczt, usk, seed_fingerprint, spend_index) =
-            orchard_pczt(OrchardPool::Orchard, false);
+        let (network, pczt, usk, seed_fingerprint, spend_index) = orchard_pczt(OrchardPool::Orchard, false);
 
-        let signed = pczt_sign_inner(network, pczt, usk, seed_fingerprint)
-            .await
-            .unwrap();
+        let signed = pczt_sign_inner(network, pczt, usk, seed_fingerprint).await.unwrap();
 
-        assert!(
-            signed.orchard().actions()[spend_index]
-                .spend()
-                .spend_auth_sig()
-                .is_some()
-        );
+        assert!(signed.orchard().actions()[spend_index].spend().spend_auth_sig().is_some());
     }
 
     #[tokio::test]
     async fn signs_ironwood_spend_with_mismatched_seed_fingerprint() {
         let (network, pczt, usk, _, spend_index) = orchard_pczt(OrchardPool::Ironwood, true);
-        let mismatched_seed_fingerprint =
-            zip32::fingerprint::SeedFingerprint::from_seed(&[8; 32]).unwrap();
+        let mismatched_seed_fingerprint = zip32::fingerprint::SeedFingerprint::from_seed(&[8; 32]).unwrap();
 
-        let signed = pczt_sign_inner(network, pczt, usk, mismatched_seed_fingerprint)
-            .await
-            .unwrap();
+        let signed = pczt_sign_inner(network, pczt, usk, mismatched_seed_fingerprint).await.unwrap();
 
-        assert!(
-            signed.ironwood().actions()[spend_index]
-                .spend()
-                .spend_auth_sig()
-                .is_some()
-        );
+        assert!(signed.ironwood().actions()[spend_index].spend().spend_auth_sig().is_some());
     }
 
     #[tokio::test]
     async fn rejects_orchard_spend_with_wrong_spending_key() {
-        let (network, pczt, _, seed_fingerprint, spend_index) =
-            orchard_pczt(OrchardPool::Orchard, false);
-        let wrong_usk =
-            UnifiedSpendingKey::from_seed(&network, &[8; 32], zip32::AccountId::ZERO).unwrap();
+        let (network, pczt, _, seed_fingerprint, spend_index) = orchard_pczt(OrchardPool::Orchard, false);
+        let wrong_usk = UnifiedSpendingKey::from_seed(&network, &[8; 32], zip32::AccountId::ZERO).unwrap();
 
-        let err = pczt_sign_inner(network, pczt, wrong_usk, seed_fingerprint)
-            .await
-            .unwrap_err();
+        let err = pczt_sign_inner(network, pczt, wrong_usk, seed_fingerprint).await.unwrap_err();
 
         assert!(matches!(
             err,

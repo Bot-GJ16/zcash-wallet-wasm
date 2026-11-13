@@ -6,10 +6,7 @@ mod tests {
 
     #[test]
     fn stable_error_and_phase_serialization() {
-        assert_eq!(
-            VotingErrorCode::WalletNotSynced.as_str(),
-            "WALLET_NOT_SYNCED"
-        );
+        assert_eq!(VotingErrorCode::WalletNotSynced.as_str(), "WALLET_NOT_SYNCED");
         assert_eq!(
             serde_json::to_string(&VotingErrorCode::RoundUnauthenticated).unwrap(),
             "\"ROUND_UNAUTHENTICATED\""
@@ -23,25 +20,14 @@ mod tests {
             "\"INSUFFICIENT_SNAPSHOT_VALUE\""
         );
         assert_eq!(
-            serde_json::from_str::<BallotDecision>(
-                r#"{"kind":"choice","proposalId":7,"option":1}"#
-            )
-            .unwrap(),
-            BallotDecision::Choice {
-                proposal_id: 7,
-                option: 1
-            }
+            serde_json::from_str::<BallotDecision>(r#"{"kind":"choice","proposalId":7,"option":1}"#).unwrap(),
+            BallotDecision::Choice { proposal_id: 7, option: 1 }
         );
         assert_eq!(
             serde_json::from_str::<BallotDecision>(r#"{"kind":"skip","proposalId":8}"#).unwrap(),
             BallotDecision::Skip { proposal_id: 8 }
         );
-        assert!(
-            serde_json::from_str::<BallotDecision>(
-                r#"{"kind":"choice","proposal_id":7,"option":1}"#
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_str::<BallotDecision>(r#"{"kind":"choice","proposal_id":7,"option":1}"#).is_err());
     }
 }
 use serde::{Deserialize, Serialize};
@@ -130,44 +116,34 @@ struct MainnetVotingSessionEnvelope {
 }
 
 impl VotingSessionEnvelope {
-    pub(crate) fn encode(
-        network: super::network::VotingNetwork,
-        identity: &AuthenticatedRoundIdentity,
-    ) -> Result<String, VotingApiError> {
+    pub(crate) fn encode(network: super::network::VotingNetwork, identity: &AuthenticatedRoundIdentity) -> Result<String, VotingApiError> {
         match network {
             super::network::VotingNetwork::Testnet => serde_json::to_string(&Self {
                 version: 1,
                 authenticated_round: identity.clone(),
             }),
-            super::network::VotingNetwork::Mainnet => {
-                serde_json::to_string(&MainnetVotingSessionEnvelopeRef {
-                    version: 2,
-                    network: network.label(),
-                    environment: network.environment(),
-                    static_config_digest: network.static_digest(),
-                    authenticated_round: identity,
-                })
-            }
+            super::network::VotingNetwork::Mainnet => serde_json::to_string(&MainnetVotingSessionEnvelopeRef {
+                version: 2,
+                network: network.label(),
+                environment: network.environment(),
+                static_config_digest: network.static_digest(),
+                authenticated_round: identity,
+            }),
         }
         .map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))
     }
 
-    pub(crate) fn decode(
-        network: super::network::VotingNetwork,
-        json: &str,
-    ) -> Result<AuthenticatedRoundIdentity, VotingApiError> {
+    pub(crate) fn decode(network: super::network::VotingNetwork, json: &str) -> Result<AuthenticatedRoundIdentity, VotingApiError> {
         match network {
             super::network::VotingNetwork::Testnet => {
-                let envelope: Self = serde_json::from_str(json)
-                    .map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))?;
+                let envelope: Self = serde_json::from_str(json).map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))?;
                 if envelope.version != 1 {
                     return Err(VotingApiError::new(VotingErrorCode::RecoveryConflict));
                 }
                 Ok(envelope.authenticated_round)
             }
             super::network::VotingNetwork::Mainnet => {
-                let envelope: MainnetVotingSessionEnvelope = serde_json::from_str(json)
-                    .map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))?;
+                let envelope: MainnetVotingSessionEnvelope = serde_json::from_str(json).map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))?;
                 if envelope.version != 2
                     || envelope.network != network.label()
                     || envelope.environment != network.environment()
@@ -226,12 +202,7 @@ pub struct VotingActionResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    tag = "kind",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind", deny_unknown_fields)]
 pub enum BallotDecision {
     Choice { proposal_id: u32, option: u32 },
     Skip { proposal_id: u32 },
@@ -338,11 +309,7 @@ impl TrustedRound {
     pub(crate) fn helper_urls(&self) -> Vec<String> {
         match self.network {
             super::network::VotingNetwork::Mainnet => self.vote_server_urls.clone(),
-            super::network::VotingNetwork::Testnet => self
-                .helpers
-                .iter()
-                .map(|helper| helper.url.clone())
-                .collect(),
+            super::network::VotingNetwork::Testnet => self.helpers.iter().map(|helper| helper.url.clone()).collect(),
         }
     }
 
@@ -362,10 +329,7 @@ impl TrustedRound {
         }
     }
 
-    pub(crate) fn compare_identity(
-        &self,
-        saved: &AuthenticatedRoundIdentity,
-    ) -> Result<(), VotingApiError> {
+    pub(crate) fn compare_identity(&self, saved: &AuthenticatedRoundIdentity) -> Result<(), VotingApiError> {
         if &self.identity() == saved {
             Ok(())
         } else {

@@ -1,7 +1,4 @@
-use super::constants::{
-    PROD_STATIC_CONFIG_DIGEST, PROD_STATIC_CONFIG_SOURCE, STAGE_STATIC_CONFIG_DIGEST,
-    STAGE_STATIC_CONFIG_SOURCE,
-};
+use super::constants::{PROD_STATIC_CONFIG_DIGEST, PROD_STATIC_CONFIG_SOURCE, STAGE_STATIC_CONFIG_DIGEST, STAGE_STATIC_CONFIG_SOURCE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VotingNetwork {
@@ -77,10 +74,7 @@ mod tests {
         assert_eq!(main.network(), zcash_voting::Network::Mainnet);
         assert_eq!(main.label(), "mainnet");
         assert_eq!(main.environment(), "prod");
-        assert_eq!(
-            main.static_digest(),
-            "28fc9b631091ae8bc2f8635d8930489238ce144174cbd15a03efb0530b301ebe"
-        );
+        assert_eq!(main.static_digest(), "28fc9b631091ae8bc2f8635d8930489238ce144174cbd15a03efb0530b301ebe");
         assert_eq!(main.tree_state_network(), "main");
         assert_eq!(
             main.static_source(),
@@ -99,10 +93,7 @@ mod tests {
         assert_eq!(test.network(), zcash_voting::Network::Testnet);
         assert_eq!(test.label(), "testnet");
         assert_eq!(test.environment(), "stage");
-        assert_eq!(
-            test.static_digest(),
-            "17484ebabab92225205a02a962add09f1659c9798c2e2e325bd8eac56ab3bf8f"
-        );
+        assert_eq!(test.static_digest(), "17484ebabab92225205a02a962add09f1659c9798c2e2e325bd8eac56ab3bf8f");
         assert_eq!(test.tree_state_network(), "test");
         assert_eq!(
             test.static_source(),

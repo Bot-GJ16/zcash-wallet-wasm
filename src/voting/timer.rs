@@ -55,11 +55,8 @@ impl zcash_voting::helper::client::local::Timer for HelperTimer {
                 }
                 impl Drop for Timeout {
                     fn drop(&mut self) {
-                        if let Ok(clear_timeout) =
-                            js_sys::Reflect::get(&self.global, &"clearTimeout".into())
-                        {
-                            if let Ok(clear_timeout) = clear_timeout.dyn_into::<js_sys::Function>()
-                            {
+                        if let Ok(clear_timeout) = js_sys::Reflect::get(&self.global, &"clearTimeout".into()) {
+                            if let Ok(clear_timeout) = clear_timeout.dyn_into::<js_sys::Function>() {
                                 let _ = clear_timeout.call1(&self.global, &self.id.into());
                             }
                         }
@@ -79,11 +76,7 @@ impl zcash_voting::helper::client::local::Timer for HelperTimer {
                         let _ = sender.send(());
                     }
                 });
-                let Ok(id) = set_timeout.call2(
-                    &global,
-                    callback.as_ref(),
-                    &(delay.as_millis().min(i32::MAX as u128) as i32).into(),
-                ) else {
+                let Ok(id) = set_timeout.call2(&global, callback.as_ref(), &(delay.as_millis().min(i32::MAX as u128) as i32).into()) else {
                     return;
                 };
                 let Some(id) = id.as_f64() else { return };

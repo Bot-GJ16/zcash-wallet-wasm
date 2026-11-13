@@ -48,9 +48,7 @@ mod tests {
         assert_eq!(sequential, parallel);
         assert!(
             RayonProofExecutor
-                .prove((), |_| Err::<(), _>(VotingError::ProofFailed {
-                    message: "fixture".into()
-                }))
+                .prove((), |_| Err::<(), _>(VotingError::ProofFailed { message: "fixture".into() }))
                 .await
                 .is_err()
         );

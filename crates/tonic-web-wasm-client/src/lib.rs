@@ -78,10 +78,7 @@ fn is_explicit_successful_empty_response<B>(response: &http::Response<B>) -> boo
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_grpc_web_content_type)
-        && response
-            .headers()
-            .get("grpc-status")
-            .is_some_and(|value| value.as_bytes() == b"0")
+        && response.headers().get("grpc-status").is_some_and(|value| value.as_bytes() == b"0")
         && response
             .headers()
             .get(http::header::CONTENT_LENGTH)
@@ -92,10 +89,7 @@ fn is_grpc_web_content_type(value: &str) -> bool {
     value.split(';').map(str::trim).any(|media_type| {
         matches!(
             media_type,
-            "application/grpc-web"
-                | "application/grpc-web+proto"
-                | "application/grpc-web-text"
-                | "application/grpc-web-text+proto"
+            "application/grpc-web" | "application/grpc-web+proto" | "application/grpc-web-text" | "application/grpc-web-text+proto"
         )
     })
 }
@@ -112,10 +106,7 @@ impl HttpBody for ResponseBody {
     type Data = Bytes;
     type Error = Error;
 
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
 
         if this.completed {
@@ -127,13 +118,7 @@ impl HttpBody for ResponseBody {
                 this.emitted_frame = true;
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(error)))
-                if should_complete_empty_response(
-                    this.allow_empty_response,
-                    this.emitted_frame,
-                    &error,
-                ) =>
-            {
+            Poll::Ready(Some(Err(error))) if should_complete_empty_response(this.allow_empty_response, this.emitted_frame, &error) => {
                 this.completed = true;
                 Poll::Ready(None)
             }
@@ -147,19 +132,11 @@ impl HttpBody for ResponseBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        if self.completed {
-            SizeHint::with_exact(0)
-        } else {
-            self.inner.size_hint()
-        }
+        if self.completed { SizeHint::with_exact(0) } else { self.inner.size_hint() }
     }
 }
 
-fn should_complete_empty_response(
-    allow_empty_response: bool,
-    emitted_frame: bool,
-    error: &Error,
-) -> bool {
+fn should_complete_empty_response(allow_empty_response: bool, emitted_frame: bool, error: &Error) -> bool {
     allow_empty_response && !emitted_frame && matches!(error, Error::MalformedResponse)
 }
 
@@ -167,12 +144,7 @@ fn should_complete_empty_response(
 mod tests {
     use super::*;
 
-    fn response(
-        status: http::StatusCode,
-        content_type: Option<&str>,
-        grpc_status: Option<&str>,
-        content_length: Option<&str>,
-    ) -> http::Response<()> {
+    fn response(status: http::StatusCode, content_type: Option<&str>, grpc_status: Option<&str>, content_length: Option<&str>) -> http::Response<()> {
         let mut response = http::Response::builder().status(status);
 
         if let Some(content_type) = content_type {
@@ -190,12 +162,7 @@ mod tests {
 
     #[test]
     fn accepts_zjs_successful_empty_response() {
-        let response = response(
-            http::StatusCode::OK,
-            Some("application/grpc-web+proto"),
-            Some("0"),
-            Some("0"),
-        );
+        let response = response(http::StatusCode::OK, Some("application/grpc-web+proto"), Some("0"), Some("0"));
 
         assert!(is_explicit_successful_empty_response(&response));
     }
@@ -203,48 +170,13 @@ mod tests {
     #[test]
     fn rejects_responses_without_every_empty_success_signal() {
         let cases = [
-            response(
-                http::StatusCode::BAD_GATEWAY,
-                Some("application/grpc-web+proto"),
-                Some("0"),
-                Some("0"),
-            ),
-            response(
-                http::StatusCode::OK,
-                Some("application/octet-stream"),
-                Some("0"),
-                Some("0"),
-            ),
-            response(
-                http::StatusCode::OK,
-                Some("application/grpc-web-invalid"),
-                Some("0"),
-                Some("0"),
-            ),
-            response(
-                http::StatusCode::OK,
-                Some("application/grpc-web+proto"),
-                None,
-                Some("0"),
-            ),
-            response(
-                http::StatusCode::OK,
-                Some("application/grpc-web+proto"),
-                Some("13"),
-                Some("0"),
-            ),
-            response(
-                http::StatusCode::OK,
-                Some("application/grpc-web+proto"),
-                Some("0"),
-                None,
-            ),
-            response(
-                http::StatusCode::OK,
-                Some("application/grpc-web+proto"),
-                Some("0"),
-                Some("1"),
-            ),
+            response(http::StatusCode::BAD_GATEWAY, Some("application/grpc-web+proto"), Some("0"), Some("0")),
+            response(http::StatusCode::OK, Some("application/octet-stream"), Some("0"), Some("0")),
+            response(http::StatusCode::OK, Some("application/grpc-web-invalid"), Some("0"), Some("0")),
+            response(http::StatusCode::OK, Some("application/grpc-web+proto"), None, Some("0")),
+            response(http::StatusCode::OK, Some("application/grpc-web+proto"), Some("13"), Some("0")),
+            response(http::StatusCode::OK, Some("application/grpc-web+proto"), Some("0"), None),
+            response(http::StatusCode::OK, Some("application/grpc-web+proto"), Some("0"), Some("1")),
         ];
 
         for response in cases {
@@ -254,25 +186,9 @@ mod tests {
 
     #[test]
     fn only_suppresses_the_empty_body_parse_error_before_any_frame() {
-        assert!(should_complete_empty_response(
-            true,
-            false,
-            &Error::MalformedResponse,
-        ));
-        assert!(!should_complete_empty_response(
-            false,
-            false,
-            &Error::MalformedResponse,
-        ));
-        assert!(!should_complete_empty_response(
-            true,
-            true,
-            &Error::MalformedResponse,
-        ));
-        assert!(!should_complete_empty_response(
-            true,
-            false,
-            &Error::HeaderParsingError,
-        ));
+        assert!(should_complete_empty_response(true, false, &Error::MalformedResponse,));
+        assert!(!should_complete_empty_response(false, false, &Error::MalformedResponse,));
+        assert!(!should_complete_empty_response(true, true, &Error::MalformedResponse,));
+        assert!(!should_complete_empty_response(true, false, &Error::HeaderParsingError,));
     }
 }

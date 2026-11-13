@@ -18,11 +18,7 @@ fn setup_tracing() {
         use tracing_subscriber::fmt::format::Pretty;
         use tracing_web::{MakeWebConsoleWriter, performance_layer};
 
-        let default_level = if cfg!(debug_assertions) {
-            LevelFilter::INFO
-        } else {
-            LevelFilter::WARN
-        };
+        let default_level = if cfg!(debug_assertions) { LevelFilter::INFO } else { LevelFilter::WARN };
 
         let filter_layer = EnvFilter::default().add_directive(default_level.into());
 
@@ -39,10 +35,7 @@ fn setup_tracing() {
 
         let perf_layer = performance_layer().with_details_from_fields(Pretty::default());
 
-        tracing_subscriber::registry()
-            .with(filter_layer)
-            .with(fmt_layer)
-            .with(perf_layer)
+        tracing_subscriber::registry().with(filter_layer).with(fmt_layer).with(perf_layer)
     };
 
     subscriber.init();

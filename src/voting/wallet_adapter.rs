@@ -64,12 +64,8 @@ fn validate_locked(
         .get_account(account_id)
         .map_err(|_| WalletInputError::Wallet("could not read voting account".into()))?
         .ok_or(WalletInputError::AccountUnknown)?;
-    if account.source().key_derivation().is_none()
-        || account.ufvk().and_then(|key| key.orchard()).is_none()
-    {
-        return Err(WalletInputError::Wallet(
-            "voting account derivation or viewing key is unavailable".into(),
-        ));
+    if account.source().key_derivation().is_none() || account.ufvk().and_then(|key| key.orchard()).is_none() {
+        return Err(WalletInputError::Wallet("voting account derivation or viewing key is unavailable".into()));
     }
     let scanned = db
         .block_fully_scanned()
@@ -85,16 +81,10 @@ fn validate_locked(
     Ok(height)
 }
 
-fn convert_notes(
-    notes: &[VotingSnapshotNote],
-    network: Network,
-) -> Result<Vec<NoteInfo>, WalletInputError> {
+fn convert_notes(notes: &[VotingSnapshotNote], network: Network) -> Result<Vec<NoteInfo>, WalletInputError> {
     notes
         .iter()
-        .map(|note| {
-            NoteInfo::from_orchard_note(&note.note, note.position, note.scope, &note.ufvk, &network)
-                .map_err(WalletInputError::Voting)
-        })
+        .map(|note| NoteInfo::from_orchard_note(&note.note, note.position, note.scope, &note.ufvk, &network).map_err(WalletInputError::Voting))
         .collect()
 }
 
@@ -107,9 +97,8 @@ pub(crate) async fn gather_eligibility_inputs(
     let snapshot = {
         let db = wallet.db.read().await;
         let height = validate_locked(&db, wallet.network, account_id, network, snapshot_height)?;
-        db.voting_snapshot_notes(account_id, height).map_err(|_| {
-            WalletInputError::Wallet("could not select voting snapshot notes".into())
-        })?
+        db.voting_snapshot_notes(account_id, height)
+            .map_err(|_| WalletInputError::Wallet("could not select voting snapshot notes".into()))?
     };
     Ok(EligibilityWalletInputs {
         scanned_height: u64::from(u32::from(snapshot.fully_scanned_height)),
@@ -122,22 +111,17 @@ pub(crate) async fn gather_wallet_inputs(
     account_id: AccountId,
     request: WalletInputRequest<'_>,
 ) -> Result<BrowserWalletInputs, WalletInputError> {
-    let state = TreeState::decode(request.anchor_tree_state_bytes.as_slice())
-        .map_err(|_| WalletInputError::Wallet("invalid snapshot TreeState".into()))?;
+    let state = TreeState::decode(request.anchor_tree_state_bytes.as_slice()).map_err(|_| WalletInputError::Wallet("invalid snapshot TreeState".into()))?;
     let voting_network = match request.network {
         Network::Testnet => super::network::VotingNetwork::Testnet,
         Network::Mainnet => super::network::VotingNetwork::Mainnet,
         Network::Regtest => return Err(WalletInputError::NetworkMismatch),
     };
-    if state.network != voting_network.tree_state_network()
-        || request.hotkey.network() != request.network
-    {
+    if state.network != voting_network.tree_state_network() || request.hotkey.network() != request.network {
         return Err(WalletInputError::NetworkMismatch);
     }
     if state.height != request.snapshot_height {
-        return Err(WalletInputError::Wallet(
-            "TreeState height does not match snapshot".into(),
-        ));
+        return Err(WalletInputError::Wallet("TreeState height does not match snapshot".into()));
     }
     let frontier = state
         .ironwood_tree()
@@ -147,13 +131,7 @@ pub(crate) async fn gather_wallet_inputs(
         .ok_or_else(|| WalletInputError::Wallet("missing Ironwood snapshot frontier".into()))?;
     let (snapshot, account_fvk) = {
         let db = wallet.db.read().await;
-        let height = validate_locked(
-            &db,
-            wallet.network,
-            account_id,
-            request.network,
-            request.snapshot_height,
-        )?;
+        let height = validate_locked(&db, wallet.network, account_id, request.network, request.snapshot_height)?;
         let account = db
             .get_account(account_id)
             .map_err(|_| WalletInputError::Wallet("could not read voting account".into()))?
@@ -165,9 +143,7 @@ pub(crate) async fn gather_wallet_inputs(
             .to_bytes();
         let snapshot = db
             .voting_snapshot(account_id, height, frontier)
-            .map_err(|_| {
-                WalletInputError::Wallet("could not validate historical voting witnesses".into())
-            })?;
+            .map_err(|_| WalletInputError::Wallet("could not validate historical voting witnesses".into()))?;
         (snapshot, fvk)
     };
     let notes = convert_notes(&snapshot.notes, request.network)?;
@@ -181,34 +157,27 @@ pub(crate) async fn gather_wallet_inputs(
             auth_path: path.into_iter().map(|node| node.to_vec()).collect(),
         })
         .collect();
-    let delegation = zcash_voting::gather_delegation_wallet_inputs_from_parts(
-        zcash_voting::GatherDelegationWalletInputs {
-            network: request.network,
-            scanned_height: u64::from(u32::from(snapshot.fully_scanned_height)),
-            snapshot_height: request.snapshot_height,
-            anchor_tree_state_bytes: request.anchor_tree_state_bytes,
-            round_note_infos: notes,
-            account_keys: zcash_voting::delegate::DelegationAccountKeys {
-                account_index: snapshot.account_index.into(),
-                seed_fingerprint: snapshot.seed_fingerprint.to_bytes(),
-                orchard_fvk_bytes: account_fvk,
-            },
-            voting_hotkey: request.hotkey,
-            resolved_round_name: request.resolved_round_name,
+    let delegation = zcash_voting::gather_delegation_wallet_inputs_from_parts(zcash_voting::GatherDelegationWalletInputs {
+        network: request.network,
+        scanned_height: u64::from(u32::from(snapshot.fully_scanned_height)),
+        snapshot_height: request.snapshot_height,
+        anchor_tree_state_bytes: request.anchor_tree_state_bytes,
+        round_note_infos: notes,
+        account_keys: zcash_voting::delegate::DelegationAccountKeys {
+            account_index: snapshot.account_index.into(),
+            seed_fingerprint: snapshot.seed_fingerprint.to_bytes(),
+            orchard_fvk_bytes: account_fvk,
         },
-    )?;
-    Ok(BrowserWalletInputs {
-        delegation,
-        witnesses,
-    })
+        voting_hotkey: request.hotkey,
+        resolved_round_name: request.resolved_round_name,
+    })?;
+    Ok(BrowserWalletInputs { delegation, witnesses })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcash_client_backend::data_api::{
-        AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation,
-    };
+    use zcash_client_backend::data_api::{AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation};
     use zcash_primitives::block::BlockHash;
 
     fn tree_state(network: &str, height: u64) -> TreeState {
@@ -225,51 +194,24 @@ mod tests {
         }
     }
 
-    fn wallet(
-        network: crate::Network,
-        seed: u8,
-        state: Option<&TreeState>,
-    ) -> (MemoryWallet<Client>, AccountId) {
+    fn wallet(network: crate::Network, seed: u8, state: Option<&TreeState>) -> (MemoryWallet<Client>, AccountId) {
         let mut db = MemoryWalletDb::new(network, 100);
         let birthday = AccountBirthday::from_parts(
             state.map_or_else(
-                || {
-                    zcash_client_backend::data_api::chain::ChainState::empty(
-                        BlockHeight::from_u32(3_000_000),
-                        BlockHash([0; 32]),
-                    )
-                },
+                || zcash_client_backend::data_api::chain::ChainState::empty(BlockHeight::from_u32(3_000_000), BlockHash([0; 32])),
                 |state| state.clone().to_chain_state().unwrap(),
             ),
             None,
         );
-        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-            &network,
-            &[seed; 32],
-            zip32::AccountId::ZERO,
-        )
-        .unwrap()
-        .to_unified_full_viewing_key();
-        let derivation = Zip32Derivation::new(
-            zip32::fingerprint::SeedFingerprint::from_seed(&[seed; 32]).unwrap(),
-            zip32::AccountId::ZERO,
-        );
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &[seed; 32], zip32::AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let derivation = Zip32Derivation::new(zip32::fingerprint::SeedFingerprint::from_seed(&[seed; 32]).unwrap(), zip32::AccountId::ZERO);
         let id = db
-            .import_account_ufvk(
-                "fixture",
-                &ufvk,
-                &birthday,
-                AccountPurpose::Spending {
-                    derivation: Some(derivation),
-                },
-                None,
-            )
+            .import_account_ufvk("fixture", &ufvk, &birthday, AccountPurpose::Spending { derivation: Some(derivation) }, None)
             .unwrap()
             .id();
-        (
-            crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap(),
-            id,
-        )
+        (crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap(), id)
     }
 
     #[tokio::test]
@@ -348,8 +290,7 @@ mod tests {
     async fn eligibility_rejects_network_account_and_unscanned_wallet_without_mutation() {
         let network = crate::Network::TestNetwork;
         let db = MemoryWalletDb::new(network, 100);
-        let wallet =
-            crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap();
+        let wallet = crate::Wallet::new(db, Client::new("https://example.invalid".into()), network).unwrap();
         assert!(matches!(
             gather_eligibility_inputs(&wallet, 1.into(), Network::Mainnet, 1).await,
             Err(WalletInputError::NetworkMismatch)
@@ -365,34 +306,16 @@ mod tests {
         let id = {
             let mut db = wallet.db.write().await;
             let birthday = AccountBirthday::from_parts(
-                zcash_client_backend::data_api::chain::ChainState::empty(
-                    BlockHeight::from_u32(3_000_000),
-                    BlockHash([0; 32]),
-                ),
+                zcash_client_backend::data_api::chain::ChainState::empty(BlockHeight::from_u32(3_000_000), BlockHash([0; 32])),
                 None,
             );
-            let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-                &network,
-                &[17; 32],
-                zip32::AccountId::ZERO,
-            )
-            .unwrap()
-            .to_unified_full_viewing_key();
-            let derivation = Zip32Derivation::new(
-                zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32]).unwrap(),
-                zip32::AccountId::ZERO,
-            );
-            db.import_account_ufvk(
-                "fixture",
-                &ufvk,
-                &birthday,
-                AccountPurpose::Spending {
-                    derivation: Some(derivation),
-                },
-                None,
-            )
-            .unwrap()
-            .id()
+            let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &[17; 32], zip32::AccountId::ZERO)
+                .unwrap()
+                .to_unified_full_viewing_key();
+            let derivation = Zip32Derivation::new(zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32]).unwrap(), zip32::AccountId::ZERO);
+            db.import_account_ufvk("fixture", &ufvk, &birthday, AccountPurpose::Spending { derivation: Some(derivation) }, None)
+                .unwrap()
+                .id()
         };
         let before = wallet.db_to_bytes().await.unwrap();
         assert!(matches!(

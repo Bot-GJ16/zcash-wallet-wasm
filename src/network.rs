@@ -39,12 +39,8 @@ impl Parameters for Network {
 
     fn activation_height(&self, nu: consensus::NetworkUpgrade) -> Option<consensus::BlockHeight> {
         match self {
-            Network::MainNetwork => {
-                zcash_protocol::consensus::Network::MainNetwork.activation_height(nu)
-            }
-            Network::TestNetwork => {
-                zcash_protocol::consensus::Network::TestNetwork.activation_height(nu)
-            }
+            Network::MainNetwork => zcash_protocol::consensus::Network::MainNetwork.activation_height(nu),
+            Network::TestNetwork => zcash_protocol::consensus::Network::TestNetwork.activation_height(nu),
         }
     }
 }

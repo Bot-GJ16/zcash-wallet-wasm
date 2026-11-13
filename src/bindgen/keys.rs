@@ -70,11 +70,7 @@ impl From<sapling::ProofGenerationKey> for ProofGenerationKey {
 pub struct UnifiedSpendingKey {
     inner: zcash_keys::keys::UnifiedSpendingKey,
     #[cfg(feature = "voting")]
-    voting_derivation: (
-        Network,
-        AccountId,
-        Option<zip32::fingerprint::SeedFingerprint>,
-    ),
+    voting_derivation: (Network, AccountId, Option<zip32::fingerprint::SeedFingerprint>),
 }
 
 #[wasm_bindgen]
@@ -88,19 +84,11 @@ impl UnifiedSpendingKey {
     /// * `hd_index` - [ZIP32](https://zips.z.cash/zip-0032) hierarchical deterministic index of the account
     ///
     #[wasm_bindgen(constructor)]
-    pub fn new(
-        network: &str,
-        mut seed: Box<[u8]>,
-        hd_index: u32,
-    ) -> Result<UnifiedSpendingKey, Error> {
+    pub fn new(network: &str, mut seed: Box<[u8]>, hd_index: u32) -> Result<UnifiedSpendingKey, Error> {
         let network = Network::from_str(network)?;
         let account_id = AccountId::try_from(hd_index)?;
         #[cfg(feature = "voting")]
-        let voting_derivation = (
-            network,
-            account_id,
-            zip32::fingerprint::SeedFingerprint::from_seed(&seed),
-        );
+        let voting_derivation = (network, account_id, zip32::fingerprint::SeedFingerprint::from_seed(&seed));
         let result = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &seed, account_id)
             .map(|inner| Self {
                 inner,
@@ -232,15 +220,11 @@ impl UnifiedSpendingKey {
 mod voting_tests {
     #[test]
     fn delegation_key_wrapper_retains_constructor_derivation_without_seed() {
-        let key =
-            super::UnifiedSpendingKey::new("test", vec![17; 32].into_boxed_slice(), 1).unwrap();
+        let key = super::UnifiedSpendingKey::new("test", vec![17; 32].into_boxed_slice(), 1).unwrap();
         let (_, network, index, fingerprint) = key.into_voting_parts();
         assert!(matches!(network, crate::Network::TestNetwork));
         assert_eq!(u32::from(index), 1);
-        assert_eq!(
-            fingerprint,
-            zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32])
-        );
+        assert_eq!(fingerprint, zip32::fingerprint::SeedFingerprint::from_seed(&[17; 32]));
     }
 }
 
@@ -258,17 +242,14 @@ pub struct UnifiedFullViewingKey {
 impl UnifiedFullViewingKey {
     pub fn encode(&self, network: &str) -> Result<String, Error> {
         let network = Network::from_str(network)?;
-        self.inner
-            .encode(&network)
-            .map_err(|error| Error::KeyDecoding(error.to_string()))
+        self.inner.encode(&network).map_err(|error| Error::KeyDecoding(error.to_string()))
     }
 
     #[wasm_bindgen(constructor)]
     pub fn new(network: &str, encoding: &str) -> Result<UnifiedFullViewingKey, Error> {
         let network = Network::from_str(network)?;
         Ok(Self {
-            inner: zcash_keys::keys::UnifiedFullViewingKey::decode(&network, encoding)
-                .map_err(|error| Error::KeyDecoding(error.to_string()))?,
+            inner: zcash_keys::keys::UnifiedFullViewingKey::decode(&network, encoding).map_err(|error| Error::KeyDecoding(error.to_string()))?,
         })
     }
 }

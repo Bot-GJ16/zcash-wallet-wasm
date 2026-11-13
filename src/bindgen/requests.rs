@@ -16,9 +16,7 @@ impl TransactionRequest {
     #[wasm_bindgen(constructor)]
     pub fn new(payments: Vec<PaymentRequest>) -> Result<TransactionRequest, Error> {
         let payments = payments.into_iter().map(|p| p.0).collect();
-        Ok(TransactionRequest(zip321::TransactionRequest::new(
-            payments,
-        )?))
+        Ok(TransactionRequest(zip321::TransactionRequest::new(payments)?))
     }
 
     pub fn empty() -> TransactionRequest {
@@ -26,11 +24,7 @@ impl TransactionRequest {
     }
 
     pub fn payment_requests(&self) -> Vec<PaymentRequest> {
-        self.0
-            .payments()
-            .values()
-            .map(|p| PaymentRequest(p.clone()))
-            .collect()
+        self.0.payments().values().map(|p| PaymentRequest(p.clone())).collect()
     }
 
     pub fn total(&self) -> Result<u64, Error> {
@@ -69,17 +63,14 @@ impl PaymentRequest {
         };
         let other_params = serde_wasm_bindgen::from_value(other_params)?;
 
-        let payment = zip321::Payment::new(address, amount, memo, label, message, other_params)
-            .map_err(|e| Error::Zip321(e.with_index(0)))?;
+        let payment = zip321::Payment::new(address, amount, memo, label, message, other_params).map_err(|e| Error::Zip321(e.with_index(0)))?;
         Ok(PaymentRequest(payment))
     }
 
     pub fn simple_payment(recipient_address: &str, amount: u64) -> Result<PaymentRequest, Error> {
         let address = ZcashAddress::try_from_encoded(recipient_address)?;
         let amount = Zatoshis::from_u64(amount)?;
-        Ok(PaymentRequest(zip321::Payment::without_memo(
-            address, amount,
-        )))
+        Ok(PaymentRequest(zip321::Payment::without_memo(address, amount)))
     }
 
     pub fn recipient_address(&self) -> String {

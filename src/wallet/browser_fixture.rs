@@ -14,7 +14,5 @@ pub fn request_timing() -> bool {
         && !transaction_request_is_due(Some(future))
         && clock_time
             .duration_since(SystemTime::UNIX_EPOCH)
-            .is_ok_and(|elapsed| {
-                (elapsed.as_secs_f64() * 1000.0 - js_sys::Date::now()).abs() < 60_000.0
-            })
+            .is_ok_and(|elapsed| (elapsed.as_secs_f64() * 1000.0 - js_sys::Date::now()).abs() < 60_000.0)
 }

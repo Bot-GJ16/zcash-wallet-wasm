@@ -39,10 +39,7 @@ struct RecordingTransport {
 
 impl HttpTransport for RecordingTransport {
     fn execute(&self, request: OwnedHttpRequest) -> TransportFuture {
-        if request.url.ends_with("/status")
-            || request.url.contains("/share-status/")
-            || request.url.ends_with("/shares")
-        {
+        if request.url.ends_with("/status") || request.url.contains("/share-status/") || request.url.ends_with("/shares") {
             let status = if request.url.ends_with("/shares") {
                 "queued"
             } else if request.url.ends_with("/status") {
@@ -62,12 +59,7 @@ impl HttpTransport for RecordingTransport {
         let post = request.method == "POST";
         // Fetch may dispatch when its future is constructed: inspect the last
         // acknowledged host checkpoint at this boundary, not the live database.
-        let db = VotingDb::open_browser(
-            &self.wallet_id,
-            self.network,
-            Some(&self.durable.lock().unwrap()),
-        )
-        .unwrap();
+        let db = VotingDb::open_browser(&self.wallet_id, self.network, Some(&self.durable.lock().unwrap())).unwrap();
         let attempt = db.vote_submission(ID, 0, 1).unwrap().unwrap();
         assert!(attempt.canonical.json_bytes() == self.canonical.json_bytes());
         if post {
@@ -80,16 +72,11 @@ impl HttpTransport for RecordingTransport {
             }));
         } else {
             assert_eq!(request.method, "GET");
-            assert!(request.url.ends_with(&format!(
-                "/shielded-vote/v1/tx/{}",
-                self.canonical.tx_hash()
-            )));
+            assert!(request.url.ends_with(&format!("/shielded-vote/v1/tx/{}", self.canonical.tx_hash())));
         }
         self.requests.lock().unwrap().push(request);
         if post && self.stop == Stop::UnknownPost {
-            return Box::pin(std::future::ready(Err(
-                zcash_voting::platform::TransportError::Ambiguous,
-            )));
+            return Box::pin(std::future::ready(Err(zcash_voting::platform::TransportError::Ambiguous)));
         }
         if !post && self.stop == Stop::UnknownPost {
             return Box::pin(std::future::ready(Ok(OwnedHttpResponse {
@@ -102,8 +89,7 @@ impl HttpTransport for RecordingTransport {
             return Box::pin(pending());
         }
         let body = if post {
-            serde_json::to_vec(&serde_json::json!({"tx_hash": self.canonical.tx_hash(), "code": 0}))
-                .unwrap()
+            serde_json::to_vec(&serde_json::json!({"tx_hash": self.canonical.tx_hash(), "code": 0})).unwrap()
         } else {
             self.confirmation.clone()
         };
@@ -128,10 +114,7 @@ impl BallotFixture {
         Self::new_for(super::super::network::VotingNetwork::Testnet, batch).await
     }
 
-    async fn session_and_round(
-        network: super::super::network::VotingNetwork,
-        batch: bool,
-    ) -> (VotingSessionInner, TrustedRound) {
+    async fn session_and_round(network: super::super::network::VotingNetwork, batch: bool) -> (VotingSessionInner, TrustedRound) {
         let (session, mut round) = super::tests::session_for(network).await;
         round.helpers = (1..=2)
             .map(|index| HelperEndpoint {
@@ -141,11 +124,7 @@ impl BallotFixture {
             })
             .collect();
         if network == super::super::network::VotingNetwork::Mainnet {
-            round.vote_server_urls = round
-                .helpers
-                .iter()
-                .map(|helper| helper.url.clone())
-                .collect();
+            round.vote_server_urls = round.helpers.iter().map(|helper| helper.url.clone()).collect();
         }
         round.params.snapshot_height = delegation_fixture::height_for(network.network());
         round.summary.snapshot_height = round.params.snapshot_height;
@@ -154,44 +133,25 @@ impl BallotFixture {
             proposal.proposal_id = 2;
             round.proposals.push(proposal);
         }
-        session
-            .trusted_rounds
-            .borrow_mut()
-            .insert(ID.into(), round.clone());
+        session.trusted_rounds.borrow_mut().insert(ID.into(), round.clone());
         (session, round)
     }
 
     async fn new_for(network: super::super::network::VotingNetwork, batch: bool) -> Self {
         let (session, round) = Self::session_and_round(network, batch).await;
         let envelope = VotingSessionEnvelope::encode(network, &round.identity()).unwrap();
-        session
-            .db
-            .init_round(network.network(), &round.params, Some(&envelope))
-            .unwrap();
-        let delegation =
-            delegation_fixture::prepare_for_stored_network(&session.db, &round.params, 17);
-        session
-            .db
-            .prepare_delegation_submission(ID, 0, &delegation)
-            .unwrap();
+        session.db.init_round(network.network(), &round.params, Some(&envelope)).unwrap();
+        let delegation = delegation_fixture::prepare_for_stored_network(&session.db, &round.params, 17);
+        session.db.prepare_delegation_submission(ID, 0, &delegation).unwrap();
         session.db.mark_delegation_dispatching(ID, 0).unwrap();
         session
             .db
-            .confirm_journaled_delegation(
-                ID,
-                0,
-                delegation.tx_hash(),
-                &[delegation_fixture::event(ID, "41")],
-            )
+            .confirm_journaled_delegation(ID, 0, delegation.tx_hash(), &[delegation_fixture::event(ID, "41")])
             .unwrap();
         Self::from_confirmed_delegation(session, round, batch)
     }
 
-    fn from_confirmed_delegation(
-        session: VotingSessionInner,
-        round: TrustedRound,
-        batch: bool,
-    ) -> Self {
+    fn from_confirmed_delegation(session: VotingSessionInner, round: TrustedRound, batch: bool) -> Self {
         let drafts = round
             .proposals
             .iter()
@@ -213,10 +173,7 @@ impl BallotFixture {
                 ("final_van_leaf_index", "50".into()),
                 ("vote_commitment_leaf_indices", "51,52".into()),
                 ("proposal_ids", "1,2".into()),
-                (
-                    "van_nullifiers",
-                    format!("{},{}", hex::encode([1; 32]), hex::encode([2; 32])),
-                ),
+                ("van_nullifiers", format!("{},{}", hex::encode([1; 32]), hex::encode([2; 32]))),
             ] {
                 attributes.push(serde_json::json!({"key":key,"value":value}));
             }
@@ -231,12 +188,7 @@ impl BallotFixture {
         .unwrap();
         // Generate the expected canonical bytes in a separate database. The
         // submitted session starts with confirmed delegation and no vote rows.
-        let expected = VotingDb::open_browser(
-            &session.wallet_id,
-            round.network.network(),
-            Some(&session.db.serialize_bytes().unwrap()),
-        )
-        .unwrap();
+        let expected = VotingDb::open_browser(&session.wallet_id, round.network.network(), Some(&session.db.serialize_bytes().unwrap())).unwrap();
         let canonical = Self::store(&expected, &recoveries);
         Self {
             session,
@@ -252,28 +204,15 @@ impl BallotFixture {
             vote::insert_recovery_fixture(db, recovery).unwrap();
         }
         if recoveries.len() == 1 {
-            CanonicalVoteSubmission::from_singleton(&vote::submission(db, ID, 0, 1).unwrap())
-                .unwrap()
+            CanonicalVoteSubmission::from_singleton(&vote::submission(db, ID, 0, 1).unwrap()).unwrap()
         } else {
-            CanonicalVoteSubmission::from_batch(
-                &vote::recover_atomic_vote_batch(db, ID, 0, 1).unwrap(),
-            )
-            .unwrap()
+            CanonicalVoteSubmission::from_batch(&vote::recover_atomic_vote_batch(db, ID, 0, 1).unwrap()).unwrap()
         }
     }
 
     fn reopen(&self, bytes: &[u8]) -> VotingSessionInner {
-        let session = VotingSessionInner::open(
-            self.session.wallet.clone(),
-            self.session.account_id,
-            Some(bytes),
-            Persistence::default(),
-        )
-        .unwrap();
-        session
-            .trusted_rounds
-            .borrow_mut()
-            .insert(ID.into(), self.round.clone());
+        let session = VotingSessionInner::open(self.session.wallet.clone(), self.session.account_id, Some(bytes), Persistence::default()).unwrap();
+        session.trusted_rounds.borrow_mut().insert(ID.into(), self.round.clone());
         session
     }
 
@@ -306,82 +245,18 @@ impl BallotFixture {
 async fn interruption_matrix(batch: bool) {
     let fixture = BallotFixture::new(batch).await;
     let initial = fixture.session.db.serialize_bytes().unwrap();
-    let submit = if batch {
-        "submit_vote_batch"
-    } else {
-        "submit_vote"
-    };
-    let poll_vote = if batch {
-        "poll_vote_batch"
-    } else {
-        "poll_vote"
-    };
+    let submit = if batch { "submit_vote_batch" } else { "submit_vote" };
+    let poll_vote = if batch { "poll_vote_batch" } else { "poll_vote" };
     for (stop, expected_next, sent, resumed) in [
-        (
-            Stop::Checkpoint {
-                number: 2,
-                saved: true,
-            },
-            submit,
-            0,
-            vec!["POST", "GET"],
-        ),
-        (
-            Stop::Checkpoint {
-                number: 3,
-                saved: false,
-            },
-            submit,
-            0,
-            vec!["POST", "GET"],
-        ),
-        (
-            Stop::Checkpoint {
-                number: 3,
-                saved: true,
-            },
-            poll_vote,
-            0,
-            vec!["GET"],
-        ),
+        (Stop::Checkpoint { number: 2, saved: true }, submit, 0, vec!["POST", "GET"]),
+        (Stop::Checkpoint { number: 3, saved: false }, submit, 0, vec!["POST", "GET"]),
+        (Stop::Checkpoint { number: 3, saved: true }, poll_vote, 0, vec!["GET"]),
         (Stop::Post, poll_vote, 1, vec!["GET"]),
-        (
-            Stop::Checkpoint {
-                number: 4,
-                saved: false,
-            },
-            poll_vote,
-            1,
-            vec!["GET"],
-        ),
-        (
-            Stop::Checkpoint {
-                number: 4,
-                saved: true,
-            },
-            poll_vote,
-            1,
-            vec!["GET"],
-        ),
+        (Stop::Checkpoint { number: 4, saved: false }, poll_vote, 1, vec!["GET"]),
+        (Stop::Checkpoint { number: 4, saved: true }, poll_vote, 1, vec!["GET"]),
         (Stop::ConfirmationResponse, poll_vote, 2, vec!["GET"]),
-        (
-            Stop::Checkpoint {
-                number: 5,
-                saved: false,
-            },
-            poll_vote,
-            2,
-            vec!["GET"],
-        ),
-        (
-            Stop::Checkpoint {
-                number: 5,
-                saved: true,
-            },
-            "submit_shares",
-            2,
-            vec![],
-        ),
+        (Stop::Checkpoint { number: 5, saved: false }, poll_vote, 2, vec!["GET"]),
+        (Stop::Checkpoint { number: 5, saved: true }, "submit_shares", 2, vec![]),
         (Stop::None, "confirm_share", 2, vec![]),
     ] {
         let session = fixture.reopen(&initial);
@@ -392,10 +267,7 @@ async fn interruption_matrix(batch: bool) {
         let decisions = fixture
             .roster()
             .into_iter()
-            .map(|proposal_id| BallotDecision::Choice {
-                proposal_id,
-                option: 0,
-            })
+            .map(|proposal_id| BallotDecision::Choice { proposal_id, option: 0 })
             .collect();
         let mut future = Box::pin(session.submit_ballot_with(
             ID,
@@ -405,15 +277,8 @@ async fn interruption_matrix(batch: bool) {
             |_, bundle, drafts: Vec<DraftVote>| {
                 builds.set(builds.get() + 1);
                 assert_eq!(bundle, 0);
-                assert_eq!(
-                    drafts.iter().map(|d| d.proposal_id).collect::<Vec<_>>(),
-                    fixture.roster()
-                );
-                assert!(
-                    drafts
-                        .iter()
-                        .all(|d| d.choice == 0 && d.num_options == 2 && !d.single_share)
-                );
+                assert_eq!(drafts.iter().map(|d| d.proposal_id).collect::<Vec<_>>(), fixture.roster());
+                assert!(drafts.iter().all(|d| d.choice == 0 && d.num_options == 2 && !d.single_share));
                 std::future::ready(Ok(BallotFixture::store(&session.db, &fixture.recoveries)))
             },
             || async {
@@ -426,21 +291,11 @@ async fn interruption_matrix(batch: bool) {
                     .checkpoint(
                         || Ok(session.db.serialize_bytes().unwrap()),
                         |bytes, _| async move {
-                            if stop
-                                == (Stop::Checkpoint {
-                                    number,
-                                    saved: false,
-                                })
-                            {
+                            if stop == (Stop::Checkpoint { number, saved: false }) {
                                 pending::<()>().await;
                             }
                             *durable.lock().unwrap() = bytes;
-                            if stop
-                                == (Stop::Checkpoint {
-                                    number,
-                                    saved: true,
-                                })
-                            {
+                            if stop == (Stop::Checkpoint { number, saved: true }) {
                                 pending::<()>().await;
                             }
                             Ok(())
@@ -451,10 +306,7 @@ async fn interruption_matrix(batch: bool) {
             || Ok(1500),
         ));
         if stop == Stop::None {
-            assert_eq!(
-                future.as_mut().await.unwrap().phase,
-                VotingRoundPhase::VoteConfirmed
-            );
+            assert_eq!(future.as_mut().await.unwrap().phase, VotingRoundPhase::VoteConfirmed);
         } else {
             assert!(poll!(&mut future).is_pending(), "{stop:?}");
         }
@@ -466,11 +318,7 @@ async fn interruption_matrix(batch: bool) {
         let reopened = fixture.reopen(&durable.lock().unwrap());
         fixture.assert_canonical(&reopened);
         let plan = resume_plan(&reopened.db, ID, &fixture.roster()).unwrap();
-        assert_eq!(
-            browser_step_kind(&reopened.db, ID, &plan.next_steps[0]).unwrap(),
-            expected_next,
-            "{stop:?}"
-        );
+        assert_eq!(browser_step_kind(&reopened.db, ID, &plan.next_steps[0]).unwrap(), expected_next, "{stop:?}");
         let transport = fixture.transport(durable.clone(), Stop::None);
         let result = reopened
             .submit_ballot_with(
@@ -489,26 +337,13 @@ async fn interruption_matrix(batch: bool) {
             .unwrap();
         assert_eq!(result.phase, VotingRoundPhase::VoteConfirmed);
         assert_eq!(
-            transport
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.method.as_str())
-                .collect::<Vec<_>>(),
+            transport.requests.lock().unwrap().iter().map(|r| r.method.as_str()).collect::<Vec<_>>(),
             resumed,
             "{stop:?}"
         );
         fixture.assert_canonical(&reopened);
         assert_eq!(
-            browser_step_kind(
-                &reopened.db,
-                ID,
-                &resume_plan(&reopened.db, ID, &fixture.roster())
-                    .unwrap()
-                    .next_steps[0],
-            )
-            .unwrap(),
+            browser_step_kind(&reopened.db, ID, &resume_plan(&reopened.db, ID, &fixture.roster()).unwrap().next_steps[0],).unwrap(),
             "confirm_share"
         );
     }
@@ -534,10 +369,7 @@ async fn legacy_vote_hash_without_a_journal_is_polled_without_reposting() {
     );
     let session = fixture.reopen(&old_bytes);
     let plan = resume_plan(&session.db, ID, &fixture.roster()).unwrap();
-    assert!(matches!(
-        plan.next_steps.first(),
-        Some(NextStep::AdvanceVote { .. })
-    ));
+    assert!(matches!(plan.next_steps.first(), Some(NextStep::AdvanceVote { .. })));
     let durable = Arc::new(Mutex::new(old_bytes));
     let transport = fixture.transport(durable.clone(), Stop::None);
     let result = session
@@ -555,10 +387,7 @@ async fn legacy_vote_hash_without_a_journal_is_polled_without_reposting() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        result.phase,
-        VotingRoundPhase::VotePending | VotingRoundPhase::VoteConfirmed
-    ));
+    assert!(matches!(result.phase, VotingRoundPhase::VotePending | VotingRoundPhase::VoteConfirmed));
     assert_eq!(
         transport
             .requests
@@ -589,17 +418,12 @@ async fn helper_recovery_completes_the_durable_ballot_lifecycle() {
                     fixture
                         .roster()
                         .into_iter()
-                        .map(|proposal_id| BallotDecision::Choice {
-                            proposal_id,
-                            option: 0,
-                        })
+                        .map(|proposal_id| BallotDecision::Choice { proposal_id, option: 0 })
                         .collect(),
                 ),
                 &transport,
                 || std::future::ready(Ok(fixture.round.clone())),
-                |_, _, _| {
-                    std::future::ready(Ok(BallotFixture::store(&session.db, &fixture.recoveries)))
-                },
+                |_, _, _| std::future::ready(Ok(BallotFixture::store(&session.db, &fixture.recoveries))),
                 || async {
                     *durable.lock().unwrap() = session.db.serialize_bytes().unwrap();
                     Ok(())
@@ -627,35 +451,27 @@ async fn restored_singleton_and_batch_confirmation_without_evidence_fail_before_
         let fixture = BallotFixture::new(batch).await;
         let db = &fixture.session.db;
         for proposal in fixture.roster() {
-            db.set_ballot_intent(ID, proposal, zcash_voting::session::Decision::Choice(0), 2)
-                .unwrap();
+            db.set_ballot_intent(ID, proposal, zcash_voting::session::Decision::Choice(0), 2).unwrap();
         }
         BallotFixture::store(db, &fixture.recoveries);
-        db.prepare_vote_submission(ID, 0, &fixture.canonical)
-            .unwrap();
+        db.prepare_vote_submission(ID, 0, &fixture.canonical).unwrap();
         db.mark_vote_dispatching(ID, 0, 1).unwrap();
         let dispatched = db.serialize_bytes().unwrap();
         for outcome in ["dispatching", "accepted"] {
-            for members in if batch {
-                vec!["proposal_id=1", "proposal_id=2", "1=1"]
-            } else {
-                vec!["1=1"]
-            } {
-                let bytes = delegation_fixture::corrupt(&dispatched, &format!(
-                    "UPDATE vote_attempts SET outcome='{outcome}';
+            for members in if batch { vec!["proposal_id=1", "proposal_id=2", "1=1"] } else { vec!["1=1"] } {
+                let bytes = delegation_fixture::corrupt(
+                    &dispatched,
+                    &format!(
+                        "UPDATE vote_attempts SET outcome='{outcome}';
                      UPDATE votes SET vc_tree_position=50+proposal_id,
                        commitment_bundle_json=json_set(commitment_bundle_json,'$.vc_tree_position',50+proposal_id)
                      WHERE {members};"
-                ));
+                    ),
+                );
                 // Exercise the driver's own integrity gate even for partial
                 // batches that the public session constructor also rejects.
                 let mut restored = fixture.reopen(&dispatched);
-                restored.db = VotingDb::open_browser(
-                    &fixture.session.wallet_id,
-                    zcash_voting::Network::Testnet,
-                    Some(&bytes),
-                )
-                .unwrap();
+                restored.db = VotingDb::open_browser(&fixture.session.wallet_id, zcash_voting::Network::Testnet, Some(&bytes)).unwrap();
                 let before = restored.db.serialize_bytes().unwrap();
                 let effects = Cell::new(0);
                 let transport = fixture.transport(Arc::new(Mutex::new(bytes)), Stop::None);
@@ -695,15 +511,12 @@ async fn driver_rejects_malformed_tree_positions_without_checkpointing_and_accep
         let fixture = BallotFixture::new(batch).await;
         let db = &fixture.session.db;
         for proposal in fixture.roster() {
-            db.set_ballot_intent(ID, proposal, zcash_voting::session::Decision::Choice(0), 2)
-                .unwrap();
+            db.set_ballot_intent(ID, proposal, zcash_voting::session::Decision::Choice(0), 2).unwrap();
         }
         BallotFixture::store(db, &fixture.recoveries);
-        db.prepare_vote_submission(ID, 0, &fixture.canonical)
-            .unwrap();
+        db.prepare_vote_submission(ID, 0, &fixture.canonical).unwrap();
         db.mark_vote_dispatching(ID, 0, 1).unwrap();
-        db.record_vote_outcome(ID, 0, 1, VoteSubmissionOutcome::Accepted)
-            .unwrap();
+        db.record_vote_outcome(ID, 0, 1, VoteSubmissionOutcome::Accepted).unwrap();
         let accepted = db.serialize_bytes().unwrap();
         let cases = if batch {
             vec![
@@ -731,8 +544,7 @@ async fn driver_rejects_malformed_tree_positions_without_checkpointing_and_accep
             let before = restored.db.serialize_bytes().unwrap();
             let durable = Arc::new(Mutex::new(accepted.clone()));
             let mut transport = fixture.transport(durable.clone(), Stop::None);
-            let mut response: serde_json::Value =
-                serde_json::from_slice(&transport.confirmation).unwrap();
+            let mut response: serde_json::Value = serde_json::from_slice(&transport.confirmation).unwrap();
             for attribute in response["events"][0]["attributes"].as_array_mut().unwrap() {
                 match attribute["key"].as_str().unwrap() {
                     "leaf_index" => attribute["value"] = format!("{van},{positions}").into(),
@@ -763,12 +575,8 @@ async fn driver_rejects_malformed_tree_positions_without_checkpointing_and_accep
                 assert_eq!(result.unwrap().phase, VotingRoundPhase::VoteConfirmed);
                 assert!(checkpoints.get() > 0);
                 fixture.assert_canonical(&restored);
-                let events: Vec<zcash_voting::confirmation::TxEvent> =
-                    serde_json::from_value(response["events"].clone()).unwrap();
-                restored
-                    .db
-                    .confirm_journaled_vote(ID, 0, 1, fixture.canonical.tx_hash(), &events)
-                    .unwrap();
+                let events: Vec<zcash_voting::confirmation::TxEvent> = serde_json::from_value(response["events"].clone()).unwrap();
+                restored.db.confirm_journaled_vote(ID, 0, 1, fixture.canonical.tx_hash(), &events).unwrap();
                 fixture.assert_canonical(&fixture.reopen(&restored.db.serialize_bytes().unwrap()));
             } else {
                 assert_eq!(result.unwrap_err().code, VotingErrorCode::RecoveryConflict);
@@ -791,15 +599,10 @@ async fn dispatch_checkpoint_crossing_expiry_never_constructs_a_vote_post() {
     let result = session
         .submit_ballot_with(
             ID,
-            Some(vec![BallotDecision::Choice {
-                proposal_id: 1,
-                option: 0,
-            }]),
+            Some(vec![BallotDecision::Choice { proposal_id: 1, option: 0 }]),
             &transport,
             || std::future::ready(Ok(fixture.round.clone())),
-            |_, _, _| {
-                std::future::ready(Ok(BallotFixture::store(&session.db, &fixture.recoveries)))
-            },
+            |_, _, _| std::future::ready(Ok(BallotFixture::store(&session.db, &fixture.recoveries))),
             || async {
                 checkpoints.set(checkpoints.get() + 1);
                 *durable.lock().unwrap() = session.db.serialize_bytes().unwrap();
@@ -817,10 +620,7 @@ async fn dispatch_checkpoint_crossing_expiry_never_constructs_a_vote_post() {
     let reopened = fixture.reopen(&durable.lock().unwrap());
     let attempt = reopened.db.vote_submission(ID, 0, 1).unwrap().unwrap();
     assert_eq!(attempt.outcome, VoteSubmissionOutcome::Dispatching);
-    assert_eq!(
-        reopened.round_status_at(ID, ends_at).unwrap().phase,
-        VotingRoundPhase::Expired
-    );
+    assert_eq!(reopened.round_status_at(ID, ends_at).unwrap().phase, VotingRoundPhase::Expired);
     let result = reopened
         .submit_ballot_with(
             ID,

@@ -60,8 +60,7 @@ impl CompactBlockCdnConfig {
         if max_chunk_bytes == 0 {
             return Err("compact block CDN maxChunkBytes must be positive".to_owned());
         }
-        let max_concurrent_chunk_requests =
-            max_concurrent_chunk_requests.unwrap_or(DEFAULT_MAX_CONCURRENT_CHUNK_REQUESTS);
+        let max_concurrent_chunk_requests = max_concurrent_chunk_requests.unwrap_or(DEFAULT_MAX_CONCURRENT_CHUNK_REQUESTS);
         if !(1..=MAX_CONCURRENT_CHUNK_REQUESTS).contains(&max_concurrent_chunk_requests) {
             return Err(format!(
                 "compact block CDN maxConcurrentChunkRequests must be between 1 and {MAX_CONCURRENT_CHUNK_REQUESTS}"
@@ -210,11 +209,7 @@ impl CdnFallbackBlockSource {
         <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
     {
         let (start, end_exclusive) = range_bounds(&range)?;
-        if self.config.is_none()
-            || self.disabled
-            || !range.pool_types.is_empty()
-            || start >= end_exclusive
-        {
+        if self.config.is_none() || self.disabled || !range.pool_types.is_empty() || start >= end_exclusive {
             return fetch_lightwalletd(client, range).await;
         }
 
@@ -226,35 +221,24 @@ impl CdnFallbackBlockSource {
             return fetch_lightwalletd(client, range).await;
         }
 
-        let result = self
-            .fetch_mixed(client, start, end_exclusive)
-            .await
-            .and_then(|blocks| {
-                validate_sequence(&blocks, start, end_exclusive, expected_prev_hash)?;
-                Ok(blocks)
-            });
+        let result = self.fetch_mixed(client, start, end_exclusive).await.and_then(|blocks| {
+            validate_sequence(&blocks, start, end_exclusive, expected_prev_hash)?;
+            Ok(blocks)
+        });
 
         match result {
             Ok(blocks) => Ok(blocks),
             Err(error) => {
-                tracing::warn!(
-                    "Compact block CDN batch rejected; retrying from lightwalletd: {error}"
-                );
+                tracing::warn!("Compact block CDN batch rejected; retrying from lightwalletd: {error}");
                 self.record_failure();
                 let blocks = fetch_lightwalletd(client, range).await?;
-                validate_sequence(&blocks, start, end_exclusive, expected_prev_hash)
-                    .map_err(|error| tonic::Status::data_loss(error.to_string()))?;
+                validate_sequence(&blocks, start, end_exclusive, expected_prev_hash).map_err(|error| tonic::Status::data_loss(error.to_string()))?;
                 Ok(blocks)
             }
         }
     }
 
-    async fn fetch_mixed<ChT>(
-        &mut self,
-        client: &mut CompactTxStreamerClient<ChT>,
-        start: u64,
-        end_exclusive: u64,
-    ) -> Result<Vec<CompactBlock>, CdnError>
+    async fn fetch_mixed<ChT>(&mut self, client: &mut CompactTxStreamerClient<ChT>, start: u64, end_exclusive: u64) -> Result<Vec<CompactBlock>, CdnError>
     where
         ChT: GrpcService<TonicBody>,
         ChT::Error: Into<StdError>,
@@ -262,34 +246,17 @@ impl CdnFallbackBlockSource {
         <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
     {
         let (first_height, published_end, chunk_size) = {
-            let manifest = self
-                .manifest
-                .as_ref()
-                .ok_or_else(|| CdnError::Invalid("manifest was not loaded".to_owned()))?;
-            (
-                manifest.first_height,
-                manifest.published_through.saturating_add(1),
-                manifest.chunk_size,
-            )
+            let manifest = self.manifest.as_ref().ok_or_else(|| CdnError::Invalid("manifest was not loaded".to_owned()))?;
+            (manifest.first_height, manifest.published_through.saturating_add(1), manifest.chunk_size)
         };
 
-        let segments = plan_source_segments(
-            start,
-            end_exclusive,
-            first_height,
-            published_end,
-            chunk_size,
-        )?;
-        let capacity = usize::try_from(end_exclusive - start)
-            .map_err(|_| CdnError::Invalid("requested range is too large".to_owned()))?;
+        let segments = plan_source_segments(start, end_exclusive, first_height, published_end, chunk_size)?;
+        let capacity = usize::try_from(end_exclusive - start).map_err(|_| CdnError::Invalid("requested range is too large".to_owned()))?;
         let mut blocks = Vec::with_capacity(capacity);
         let mut segment_index = 0;
         while segment_index < segments.len() {
             match segments[segment_index] {
-                SourceSegment::Lightwalletd {
-                    start,
-                    end_exclusive,
-                } => {
+                SourceSegment::Lightwalletd { start, end_exclusive } => {
                     blocks.extend(
                         fetch_lightwalletd_bounds(client, start, end_exclusive)
                             .await
@@ -298,8 +265,7 @@ impl CdnFallbackBlockSource {
                     segment_index += 1;
                 }
                 SourceSegment::Cdn { .. } if self.disabled => {
-                    let (start, end_exclusive, consumed) =
-                        contiguous_cdn_range(&segments[segment_index..]);
+                    let (start, end_exclusive, consumed) = contiguous_cdn_range(&segments[segment_index..]);
                     blocks.extend(
                         fetch_lightwalletd_bounds(client, start, end_exclusive)
                             .await
@@ -308,11 +274,7 @@ impl CdnFallbackBlockSource {
                     segment_index += consumed;
                 }
                 SourceSegment::Cdn { .. } => {
-                    let concurrency = self
-                        .config
-                        .as_ref()
-                        .expect("checked by caller")
-                        .max_concurrent_chunk_requests;
+                    let concurrency = self.config.as_ref().expect("checked by caller").max_concurrent_chunk_requests;
                     let tentative_end = (segment_index + concurrency).min(segments.len());
                     let group_end = segments[segment_index..tentative_end]
                         .iter()
@@ -342,41 +304,22 @@ impl CdnFallbackBlockSource {
                     let config = self.config.as_ref().expect("checked by caller").clone();
                     let network = self.network;
                     let expected_genesis_hash = self.expected_genesis_hash()?;
-                    let results = join_all(prepared.into_iter().map(
-                        |(start, end_exclusive, chunk_start, chunk_end_exclusive, prepared)| {
-                            let config = &config;
-                            let expected_genesis_hash = &expected_genesis_hash;
-                            async move {
-                                let result = match prepared {
-                                    Ok(chunk_ref) => {
-                                        fetch_prepared_chunk(
-                                            config,
-                                            network,
-                                            expected_genesis_hash,
-                                            &chunk_ref,
-                                        )
-                                        .await
-                                    }
-                                    Err(error) => Err(error),
-                                };
-                                (
-                                    start,
-                                    end_exclusive,
-                                    chunk_start,
-                                    chunk_end_exclusive,
-                                    result,
-                                )
-                            }
-                        },
-                    ))
+                    let results = join_all(prepared.into_iter().map(|(start, end_exclusive, chunk_start, chunk_end_exclusive, prepared)| {
+                        let config = &config;
+                        let expected_genesis_hash = &expected_genesis_hash;
+                        async move {
+                            let result = match prepared {
+                                Ok(chunk_ref) => fetch_prepared_chunk(config, network, expected_genesis_hash, &chunk_ref).await,
+                                Err(error) => Err(error),
+                            };
+                            (start, end_exclusive, chunk_start, chunk_end_exclusive, result)
+                        }
+                    }))
                     .await;
 
-                    for (start, end_exclusive, chunk_start, chunk_end_exclusive, result) in results
-                    {
+                    for (start, end_exclusive, chunk_start, chunk_end_exclusive, result) in results {
                         match result {
-                            Ok(chunk) => blocks.extend(chunk.blocks.into_iter().filter(|block| {
-                                block.height >= start && block.height < end_exclusive
-                            })),
+                            Ok(chunk) => blocks.extend(chunk.blocks.into_iter().filter(|block| block.height >= start && block.height < end_exclusive)),
                             Err(error) => {
                                 tracing::warn!(
                                     "Compact block CDN chunk [{chunk_start}, \
@@ -387,9 +330,7 @@ impl CdnFallbackBlockSource {
                                 blocks.extend(
                                     fetch_lightwalletd_bounds(client, start, end_exclusive)
                                         .await
-                                        .map_err(|grpc_error| {
-                                            CdnError::Http(grpc_error.to_string())
-                                        })?,
+                                        .map_err(|grpc_error| CdnError::Http(grpc_error.to_string()))?,
                                 );
                             }
                         }
@@ -404,46 +345,28 @@ impl CdnFallbackBlockSource {
 
     async fn load_manifest(&mut self) -> Result<(), CdnError> {
         let config = self.config.as_ref().expect("checked by caller");
-        let url = format!(
-            "{}/{}/{}/manifest.json",
-            config.base_url, self.network, PROFILE
-        );
+        let url = format!("{}/{}/{}/manifest.json", config.base_url, self.network, PROFILE);
         let bytes = fetch_bytes(&url, config.request_timeout, MAX_MANIFEST_BYTES).await?;
-        let manifest: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|error| CdnError::Invalid(format!("manifest JSON: {error}")))?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| CdnError::Invalid(format!("manifest JSON: {error}")))?;
         validate_manifest(&manifest, self.network)?;
         self.manifest = Some(manifest);
         Ok(())
     }
 
     fn expected_genesis_hash(&self) -> Result<Vec<u8>, CdnError> {
-        let manifest = self
-            .manifest
-            .as_ref()
-            .ok_or_else(|| CdnError::Invalid("manifest was not loaded".to_owned()))?;
-        hex::decode(&manifest.genesis_hash)
-            .map_err(|_| CdnError::Invalid("invalid manifest genesis hash".to_owned()))
+        let manifest = self.manifest.as_ref().ok_or_else(|| CdnError::Invalid("manifest was not loaded".to_owned()))?;
+        hex::decode(&manifest.genesis_hash).map_err(|_| CdnError::Invalid("invalid manifest genesis hash".to_owned()))
     }
 
-    async fn prepare_chunk(
-        &mut self,
-        chunk_start: u64,
-        chunk_end: u64,
-    ) -> Result<ChunkRef, CdnError> {
+    async fn prepare_chunk(&mut self, chunk_start: u64, chunk_end: u64) -> Result<ChunkRef, CdnError> {
         let index_path = self
             .manifest
             .as_ref()
             .ok_or_else(|| CdnError::Invalid("manifest was not loaded".to_owned()))?
             .indexes
             .iter()
-            .find(|index| {
-                index.start_height <= chunk_start && index.end_height_exclusive >= chunk_end
-            })
-            .ok_or_else(|| {
-                CdnError::Invalid(format!(
-                    "no index covers chunk [{chunk_start}, {chunk_end})"
-                ))
-            })?
+            .find(|index| index.start_height <= chunk_start && index.end_height_exclusive >= chunk_end)
+            .ok_or_else(|| CdnError::Invalid(format!("no index covers chunk [{chunk_start}, {chunk_end})")))?
             .path
             .clone();
 
@@ -455,14 +378,13 @@ impl CdnFallbackBlockSource {
         self.indexes
             .get(&index_path)
             .and_then(|index| {
-                index.chunks.iter().find(|chunk| {
-                    chunk.start_height == chunk_start && chunk.end_height_exclusive == chunk_end
-                })
+                index
+                    .chunks
+                    .iter()
+                    .find(|chunk| chunk.start_height == chunk_start && chunk.end_height_exclusive == chunk_end)
             })
             .cloned()
-            .ok_or_else(|| {
-                CdnError::Invalid(format!("index has no chunk [{chunk_start}, {chunk_end})"))
-            })
+            .ok_or_else(|| CdnError::Invalid(format!("index has no chunk [{chunk_start}, {chunk_end})")))
     }
 
     async fn load_index(&self, path: &str) -> Result<ChunkIndex, CdnError> {
@@ -475,8 +397,7 @@ impl CdnFallbackBlockSource {
         let url = join_object_url(&config.base_url, self.network, path)?;
         let bytes = fetch_bytes(&url, config.request_timeout, MAX_INDEX_BYTES).await?;
         verify_sha256(&bytes, &index_ref.sha256, "index")?;
-        let index: ChunkIndex = serde_json::from_slice(&bytes)
-            .map_err(|error| CdnError::Invalid(format!("index JSON: {error}")))?;
+        let index: ChunkIndex = serde_json::from_slice(&bytes).map_err(|error| CdnError::Invalid(format!("index JSON: {error}")))?;
         validate_index(&index, index_ref, self.network)?;
         Ok(index)
     }
@@ -490,13 +411,7 @@ impl CdnFallbackBlockSource {
     }
 }
 
-fn plan_source_segments(
-    start: u64,
-    end_exclusive: u64,
-    first_height: u64,
-    published_end: u64,
-    chunk_size: u64,
-) -> Result<Vec<SourceSegment>, CdnError> {
+fn plan_source_segments(start: u64, end_exclusive: u64, first_height: u64, published_end: u64, chunk_size: u64) -> Result<Vec<SourceSegment>, CdnError> {
     if chunk_size == 0 {
         return Err(CdnError::Invalid("manifest chunk size is zero".to_owned()));
     }
@@ -512,10 +427,7 @@ fn plan_source_segments(
             });
             cursor = segment_end;
         } else if cursor >= published_end {
-            segments.push(SourceSegment::Lightwalletd {
-                start: cursor,
-                end_exclusive,
-            });
+            segments.push(SourceSegment::Lightwalletd { start: cursor, end_exclusive });
             break;
         } else {
             let chunk_start = (cursor / chunk_size) * chunk_size;
@@ -536,12 +448,7 @@ fn plan_source_segments(
 }
 
 fn contiguous_cdn_range(segments: &[SourceSegment]) -> (u64, u64, usize) {
-    let SourceSegment::Cdn {
-        start,
-        mut end_exclusive,
-        ..
-    } = segments[0]
-    else {
+    let SourceSegment::Cdn { start, mut end_exclusive, .. } = segments[0] else {
         unreachable!("range must start with a CDN segment");
     };
     let mut consumed = 1;
@@ -585,8 +492,7 @@ async fn fetch_prepared_chunk(
         )));
     }
     verify_sha256(&bytes, &chunk_ref.sha256, "chunk")?;
-    let chunk = CompactBlockChunk::decode(bytes.as_slice())
-        .map_err(|error| CdnError::Invalid(format!("chunk protobuf: {error}")))?;
+    let chunk = CompactBlockChunk::decode(bytes.as_slice()).map_err(|error| CdnError::Invalid(format!("chunk protobuf: {error}")))?;
     validate_chunk(&chunk, chunk_ref, network, expected_genesis_hash)?;
     Ok(chunk)
 }
@@ -619,9 +525,7 @@ fn range_bounds(range: &service::BlockRange) -> Result<(u64, u64), tonic::Status
         .as_ref()
         .ok_or_else(|| tonic::Status::invalid_argument("block range end is missing"))?;
     if !start.hash.is_empty() || !end.hash.is_empty() {
-        return Err(tonic::Status::invalid_argument(
-            "compact block source only supports height ranges",
-        ));
+        return Err(tonic::Status::invalid_argument("compact block source only supports height ranges"));
     }
     let end_exclusive = end
         .height
@@ -630,29 +534,17 @@ fn range_bounds(range: &service::BlockRange) -> Result<(u64, u64), tonic::Status
     Ok((start.height, end_exclusive))
 }
 
-async fn fetch_lightwalletd<ChT>(
-    client: &mut CompactTxStreamerClient<ChT>,
-    range: service::BlockRange,
-) -> Result<Vec<CompactBlock>, tonic::Status>
+async fn fetch_lightwalletd<ChT>(client: &mut CompactTxStreamerClient<ChT>, range: service::BlockRange) -> Result<Vec<CompactBlock>, tonic::Status>
 where
     ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
 {
-    client
-        .get_block_range(range)
-        .await?
-        .into_inner()
-        .try_collect()
-        .await
+    client.get_block_range(range).await?.into_inner().try_collect().await
 }
 
-async fn fetch_lightwalletd_bounds<ChT>(
-    client: &mut CompactTxStreamerClient<ChT>,
-    start: u64,
-    end_exclusive: u64,
-) -> Result<Vec<CompactBlock>, tonic::Status>
+async fn fetch_lightwalletd_bounds<ChT>(client: &mut CompactTxStreamerClient<ChT>, start: u64, end_exclusive: u64) -> Result<Vec<CompactBlock>, tonic::Status>
 where
     ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
@@ -662,10 +554,7 @@ where
     fetch_lightwalletd(
         client,
         service::BlockRange {
-            start: Some(service::BlockId {
-                height: start,
-                hash: vec![],
-            }),
+            start: Some(service::BlockId { height: start, hash: vec![] }),
             end: Some(service::BlockId {
                 height: end_exclusive - 1,
                 hash: vec![],
@@ -678,70 +567,46 @@ where
 
 fn validate_manifest(manifest: &Manifest, network: &str) -> Result<(), CdnError> {
     if manifest.format_version != FORMAT_VERSION {
-        return Err(CdnError::Unsupported(format!(
-            "manifest format version {}",
-            manifest.format_version
-        )));
+        return Err(CdnError::Unsupported(format!("manifest format version {}", manifest.format_version)));
     }
     if manifest.network != network {
-        return Err(CdnError::Invalid(format!(
-            "manifest network {} does not match {network}",
-            manifest.network
-        )));
+        return Err(CdnError::Invalid(format!("manifest network {} does not match {network}", manifest.network)));
     }
     if manifest.profile != PROFILE || !manifest.pool_types.is_empty() {
-        return Err(CdnError::Unsupported(
-            "manifest does not provide the shielded-default profile".to_owned(),
-        ));
+        return Err(CdnError::Unsupported("manifest does not provide the shielded-default profile".to_owned()));
     }
     validate_hash_text(&manifest.genesis_hash, "manifest genesis")?;
     if manifest.chunk_size == 0 {
         return Err(CdnError::Invalid("manifest chunk size is zero".to_owned()));
     }
     if manifest.first_height > manifest.published_through {
-        return Err(CdnError::Invalid(
-            "manifest published range is empty".to_owned(),
-        ));
+        return Err(CdnError::Invalid("manifest published range is empty".to_owned()));
     }
     let published_end = manifest
         .published_through
         .checked_add(1)
         .ok_or_else(|| CdnError::Invalid("manifest published range overflows".to_owned()))?;
-    if !manifest.first_height.is_multiple_of(manifest.chunk_size)
-        || !published_end.is_multiple_of(manifest.chunk_size)
-    {
-        return Err(CdnError::Invalid(
-            "manifest published range is not chunk-aligned".to_owned(),
-        ));
+    if !manifest.first_height.is_multiple_of(manifest.chunk_size) || !published_end.is_multiple_of(manifest.chunk_size) {
+        return Err(CdnError::Invalid("manifest published range is not chunk-aligned".to_owned()));
     }
     for index in &manifest.indexes {
         validate_object_path(&index.path)?;
         validate_sha256_text(&index.sha256, "index")?;
         if index.start_height >= index.end_height_exclusive {
-            return Err(CdnError::Invalid(
-                "manifest contains an empty index".to_owned(),
-            ));
+            return Err(CdnError::Invalid("manifest contains an empty index".to_owned()));
         }
-        if index.start_height < manifest.first_height || index.end_height_exclusive > published_end
-        {
-            return Err(CdnError::Invalid(
-                "manifest index lies outside the published range".to_owned(),
-            ));
+        if index.start_height < manifest.first_height || index.end_height_exclusive > published_end {
+            return Err(CdnError::Invalid("manifest index lies outside the published range".to_owned()));
         }
     }
     Ok(())
 }
 
 fn validate_index(index: &ChunkIndex, index_ref: &IndexRef, network: &str) -> Result<(), CdnError> {
-    if index.format_version != FORMAT_VERSION
-        || index.network != network
-        || index.profile != PROFILE
-    {
+    if index.format_version != FORMAT_VERSION || index.network != network || index.profile != PROFILE {
         return Err(CdnError::Invalid("index metadata mismatch".to_owned()));
     }
-    if index.start_height != index_ref.start_height
-        || index.end_height_exclusive != index_ref.end_height_exclusive
-    {
+    if index.start_height != index_ref.start_height || index.end_height_exclusive != index_ref.end_height_exclusive {
         return Err(CdnError::Invalid("index range mismatch".to_owned()));
     }
     for chunk in &index.chunks {
@@ -753,50 +618,25 @@ fn validate_index(index: &ChunkIndex, index_ref: &IndexRef, network: &str) -> Re
             || chunk.start_height < index.start_height
             || chunk.end_height_exclusive > index.end_height_exclusive
         {
-            return Err(CdnError::Invalid(
-                "index contains an invalid chunk range".to_owned(),
-            ));
+            return Err(CdnError::Invalid("index contains an invalid chunk range".to_owned()));
         }
     }
     Ok(())
 }
 
-fn validate_chunk(
-    chunk: &CompactBlockChunk,
-    chunk_ref: &ChunkRef,
-    network: &str,
-    expected_genesis_hash: &[u8],
-) -> Result<(), CdnError> {
-    if chunk.format_version != FORMAT_VERSION
-        || chunk.network != network
-        || chunk.profile != PROFILE
-    {
+fn validate_chunk(chunk: &CompactBlockChunk, chunk_ref: &ChunkRef, network: &str, expected_genesis_hash: &[u8]) -> Result<(), CdnError> {
+    if chunk.format_version != FORMAT_VERSION || chunk.network != network || chunk.profile != PROFILE {
         return Err(CdnError::Invalid("chunk metadata mismatch".to_owned()));
     }
     if chunk.genesis_hash != expected_genesis_hash {
-        return Err(CdnError::Invalid(
-            "chunk genesis hash does not match manifest".to_owned(),
-        ));
+        return Err(CdnError::Invalid("chunk genesis hash does not match manifest".to_owned()));
     }
-    if chunk.start_height != chunk_ref.start_height
-        || chunk.end_height_exclusive != chunk_ref.end_height_exclusive
-    {
+    if chunk.start_height != chunk_ref.start_height || chunk.end_height_exclusive != chunk_ref.end_height_exclusive {
         return Err(CdnError::Invalid("chunk range mismatch".to_owned()));
     }
-    validate_sequence(
-        &chunk.blocks,
-        chunk.start_height,
-        chunk.end_height_exclusive,
-        None,
-    )?;
-    let first = chunk
-        .blocks
-        .first()
-        .ok_or_else(|| CdnError::Invalid("chunk has no blocks".to_owned()))?;
-    let last = chunk
-        .blocks
-        .last()
-        .ok_or_else(|| CdnError::Invalid("chunk has no blocks".to_owned()))?;
+    validate_sequence(&chunk.blocks, chunk.start_height, chunk.end_height_exclusive, None)?;
+    let first = chunk.blocks.first().ok_or_else(|| CdnError::Invalid("chunk has no blocks".to_owned()))?;
+    let last = chunk.blocks.last().ok_or_else(|| CdnError::Invalid("chunk has no blocks".to_owned()))?;
     if chunk.first_block_hash != first.hash
         || chunk.last_block_hash != last.hash
         || hex::encode(&chunk.first_block_hash) != chunk_ref.first_block_hash.to_lowercase()
@@ -807,34 +647,21 @@ fn validate_chunk(
     Ok(())
 }
 
-fn validate_sequence(
-    blocks: &[CompactBlock],
-    start: u64,
-    end_exclusive: u64,
-    expected_prev_hash: Option<BlockHash>,
-) -> Result<(), CdnError> {
+fn validate_sequence(blocks: &[CompactBlock], start: u64, end_exclusive: u64, expected_prev_hash: Option<BlockHash>) -> Result<(), CdnError> {
     let expected_len = end_exclusive
         .checked_sub(start)
         .ok_or_else(|| CdnError::Invalid("descending block range".to_owned()))?;
     if blocks.len() as u64 != expected_len {
-        return Err(CdnError::Invalid(format!(
-            "expected {expected_len} blocks, received {}",
-            blocks.len()
-        )));
+        return Err(CdnError::Invalid(format!("expected {expected_len} blocks, received {}", blocks.len())));
     }
 
     for (offset, block) in blocks.iter().enumerate() {
         let expected_height = start + offset as u64;
         if block.height != expected_height {
-            return Err(CdnError::Invalid(format!(
-                "expected height {expected_height}, received {}",
-                block.height
-            )));
+            return Err(CdnError::Invalid(format!("expected height {expected_height}, received {}", block.height)));
         }
         if block.hash.len() != 32 || block.prev_hash.len() != 32 {
-            return Err(CdnError::Invalid(format!(
-                "block {expected_height} has an invalid hash length"
-            )));
+            return Err(CdnError::Invalid(format!("block {expected_height} has an invalid hash length")));
         }
         if offset == 0 {
             if let Some(expected) = expected_prev_hash
@@ -845,9 +672,7 @@ fn validate_sequence(
                 )));
             }
         } else if block.prev_hash != blocks[offset - 1].hash {
-            return Err(CdnError::Invalid(format!(
-                "block {expected_height} has a discontinuous previous hash"
-            )));
+            return Err(CdnError::Invalid(format!("block {expected_height} has a discontinuous previous hash")));
         }
     }
     Ok(())
@@ -917,8 +742,7 @@ async fn fetch_bytes(url: &str, timeout: Duration, max_bytes: usize) -> Result<V
     let status = Reflect::get(&response, &JsValue::from_str("status"))
         .map_err(|error| CdnError::Http(format!("status lookup failed: {error:?}")))?
         .as_f64()
-        .ok_or_else(|| CdnError::Http("response status is not numeric".to_owned()))?
-        as u16;
+        .ok_or_else(|| CdnError::Http("response status is not numeric".to_owned()))? as u16;
     if status != 200 {
         return Err(CdnError::Http(format!("GET {url} returned {status}")));
     }
@@ -947,14 +771,8 @@ async fn fetch_bytes(url: &str, timeout: Duration, max_bytes: usize) -> Result<V
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn fetch_bytes(
-    _url: &str,
-    _timeout: Duration,
-    _max_bytes: usize,
-) -> Result<Vec<u8>, CdnError> {
-    Err(CdnError::Unsupported(
-        "CDN HTTP fetch is only available in WASM builds".to_owned(),
-    ))
+async fn fetch_bytes(_url: &str, _timeout: Duration, _max_bytes: usize) -> Result<Vec<u8>, CdnError> {
+    Err(CdnError::Unsupported("CDN HTTP fetch is only available in WASM builds".to_owned()))
 }
 
 #[cfg(test)]
@@ -1030,23 +848,12 @@ mod tests {
 
     #[test]
     fn validates_chunk_request_concurrency() {
-        let config = CompactBlockCdnConfig::new(
-            "https://cdn.example/compact-blocks/v1".to_owned(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let config = CompactBlockCdnConfig::new("https://cdn.example/compact-blocks/v1".to_owned(), None, None, None).unwrap();
         assert_eq!(config.max_concurrent_chunk_requests, 4);
 
         for invalid in [0, 9] {
-            let error = CompactBlockCdnConfig::new(
-                "https://cdn.example/compact-blocks/v1".to_owned(),
-                None,
-                None,
-                Some(invalid),
-            )
-            .expect_err("out-of-range concurrency must fail");
+            let error = CompactBlockCdnConfig::new("https://cdn.example/compact-blocks/v1".to_owned(), None, None, Some(invalid))
+                .expect_err("out-of-range concurrency must fail");
             assert!(error.contains("between 1 and 8"));
         }
     }
@@ -1054,27 +861,20 @@ mod tests {
     #[test]
     fn rejects_wrong_tree_state_boundary() {
         let blocks = vec![block(10, 2, 1), block(11, 3, 2)];
-        let error = validate_sequence(&blocks, 10, 12, Some(BlockHash([9; 32])))
-            .expect_err("boundary mismatch must fail");
+        let error = validate_sequence(&blocks, 10, 12, Some(BlockHash([9; 32]))).expect_err("boundary mismatch must fail");
         assert!(error.to_string().contains("tree state"));
     }
 
     #[test]
     fn rejects_internal_hash_discontinuity() {
         let blocks = vec![block(10, 2, 1), block(11, 3, 7)];
-        let error =
-            validate_sequence(&blocks, 10, 12, None).expect_err("hash discontinuity must fail");
+        let error = validate_sequence(&blocks, 10, 12, None).expect_err("hash discontinuity must fail");
         assert!(error.to_string().contains("discontinuous"));
     }
 
     #[test]
     fn rejects_unsafe_object_paths() {
-        for path in [
-            "/chunk.pb",
-            "../chunk.pb",
-            "chunks/../chunk.pb",
-            "chunk.pb?x=1",
-        ] {
+        for path in ["/chunk.pb", "../chunk.pb", "chunks/../chunk.pb", "chunk.pb?x=1"] {
             assert!(validate_object_path(path).is_err(), "accepted {path}");
         }
         assert!(validate_object_path("chunks/1000-2000-deadbeef.pb").is_ok());
@@ -1140,8 +940,7 @@ mod tests {
             last_block_hash: hex::encode([3; 32]),
         };
 
-        let error = validate_chunk(&chunk, &chunk_ref, "test", &[9; 32])
-            .expect_err("genesis mismatch must fail");
+        let error = validate_chunk(&chunk, &chunk_ref, "test", &[9; 32]).expect_err("genesis mismatch must fail");
         assert!(error.to_string().contains("genesis"));
     }
 

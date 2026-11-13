@@ -11,11 +11,7 @@ impl zcash_voting::pir::Transport for BrowserFetchTransport {
     }
 }
 
-fn pir_request(
-    method: &str,
-    url: &str,
-    body: Vec<u8>,
-) -> zcash_voting::pir::TransportFuture<'static> {
+fn pir_request(method: &str, url: &str, body: Vec<u8>) -> zcash_voting::pir::TransportFuture<'static> {
     let response = BrowserFetchTransport.execute(OwnedHttpRequest {
         method: method.into(),
         url: url.into(),
@@ -64,14 +60,9 @@ pub async fn voting_test_pir(url: String, query: bool) -> Result<bool, wasm_bind
         100,
     )
     .await
-    .map_err(|_| {
-        super::types::VotingApiError::new(super::types::VotingErrorCode::PirSnapshotMismatch)
-    })?;
+    .map_err(|_| super::types::VotingApiError::new(super::types::VotingErrorCode::PirSnapshotMismatch))?;
     if query {
-        Ok(client
-            .fetch_proof(zcash_voting::backend::pasta_curves::pallas::Base::from(1))
-            .await
-            .is_err())
+        Ok(client.fetch_proof(zcash_voting::backend::pasta_curves::pallas::Base::from(1)).await.is_err())
     } else {
         Ok(true)
     }
@@ -79,12 +70,8 @@ pub async fn voting_test_pir(url: String, query: bool) -> Result<bool, wasm_bind
 
 #[cfg(debug_assertions)]
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = votingTestPirFallback)]
-pub async fn voting_test_pir_fallback(
-    urls: Vec<String>,
-    handshake_only: bool,
-) -> Result<bool, wasm_bindgen::JsValue> {
-    let mismatch =
-        |_| super::types::VotingApiError::new(super::types::VotingErrorCode::PirSnapshotMismatch);
+pub async fn voting_test_pir_fallback(urls: Vec<String>, handshake_only: bool) -> Result<bool, wasm_bindgen::JsValue> {
+    let mismatch = |_| super::types::VotingApiError::new(super::types::VotingErrorCode::PirSnapshotMismatch);
     let mut client = zcash_voting::pir::OrderedSnapshotPir::connect(
         zcash_voting::wire::PirLayout {
             pir_depth: 19,
@@ -101,10 +88,7 @@ pub async fn voting_test_pir_fallback(
     .await
     .map_err(mismatch)?;
     if !handshake_only {
-        client
-            .fetch_proofs(&[1.into(), 2.into()])
-            .await
-            .map_err(mismatch)?;
+        client.fetch_proofs(&[1.into(), 2.into()]).await.map_err(mismatch)?;
     }
     Ok(true)
 }
@@ -114,9 +98,7 @@ pub async fn voting_test_pir_fallback(
 pub async fn voting_test_proof_executor() -> Result<bool, wasm_bindgen::JsValue> {
     use zcash_voting::proof_executor::{ProofExecutor, SequentialProofExecutor};
     let sequential = SequentialProofExecutor
-        .prove(vec![1u64, 2, 3], |values| {
-            Ok(values.into_iter().sum::<u64>())
-        })
+        .prove(vec![1u64, 2, 3], |values| Ok(values.into_iter().sum::<u64>()))
         .await;
     #[cfg(feature = "wasm-parallel")]
     let parallel = super::proof_executor::RayonProofExecutor

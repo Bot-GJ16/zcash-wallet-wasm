@@ -18,11 +18,7 @@ pub enum Error {
     #[error("Javascript error")]
     Js(JsValue),
     #[error("DomException {name} ({code}): {message}")]
-    DomException {
-        name: String,
-        message: String,
-        code: u16,
-    },
+    DomException { name: String, message: String, code: u16 },
     #[error("Address generation error")]
     AddressGeneration(#[from] zcash_keys::keys::AddressGenerationError),
     #[error("Error attempting to decode address: {0}")]
@@ -61,9 +57,7 @@ pub enum Error {
     #[error("Wallet chain state changed during history query; retry synchronization")]
     HistoryQueryStale,
 
-    #[error(
-        "Attempted to create a transaction with a memo to an unsupported recipient. Only shielded addresses are supported."
-    )]
+    #[error("Attempted to create a transaction with a memo to an unsupported recipient. Only shielded addresses are supported.")]
     UnsupportedMemoRecipient,
     #[error("Error decoding memo: {0}")]
     MemoDecoding(#[from] zcash_protocol::memo::Error),
@@ -91,11 +85,7 @@ pub enum Error {
     #[error(
         "WALLET_SPENDABILITY_INCONSISTENT: account {account_id} has {note_count} confirmed note(s) with incomplete spendability metadata totaling {value_zats} zatoshis"
     )]
-    SpendabilityMetadataIncomplete {
-        account_id: u32,
-        note_count: usize,
-        value_zats: u64,
-    },
+    SpendabilityMetadataIncomplete { account_id: u32, note_count: usize, value_zats: u64 },
     #[error("{0}")]
     InsufficientTransferFunds(String),
     #[error("Failed to prove Pczt: {0}")]
@@ -122,11 +112,7 @@ impl From<Error> for JsValue {
         let error = js_sys::Error::new(&e.to_string());
         if let Error::TransactionSubmissionUnknown { txid, .. } = &e {
             error.set_name("TransactionSubmissionUnknown");
-            let _ = js_sys::Reflect::set(
-                error.as_ref(),
-                &JsValue::from_str("txId"),
-                &JsValue::from_str(txid),
-            );
+            let _ = js_sys::Reflect::set(error.as_ref(), &JsValue::from_str("txId"), &JsValue::from_str(txid));
         }
         error.into()
     }

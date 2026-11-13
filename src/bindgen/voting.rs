@@ -43,8 +43,7 @@ pub struct WebVotingSession {
 }
 
 fn value(value: &impl serde::Serialize) -> Result<JsValue, JsValue> {
-    serde_wasm_bindgen::to_value(value)
-        .map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict).into())
+    serde_wasm_bindgen::to_value(value).map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict).into())
 }
 
 #[wasm_bindgen]
@@ -54,8 +53,7 @@ impl WebVotingSession {
         wallet: &WebWallet,
         account_id: u32,
         voting_db_bytes: Option<Box<[u8]>>,
-        #[wasm_bindgen(unchecked_param_type = "VotingCheckpoint")]
-        persist_checkpoint: js_sys::Function,
+        #[wasm_bindgen(unchecked_param_type = "VotingCheckpoint")] persist_checkpoint: js_sys::Function,
     ) -> Result<WebVotingSession, JsValue> {
         Ok(Self {
             inner: Rc::new(VotingSessionInner::open(
@@ -74,10 +72,7 @@ impl WebVotingSession {
 
     #[wasm_bindgen(js_name = exportState)]
     pub fn export_state(&self) -> Result<Box<[u8]>, JsValue> {
-        self.inner
-            .export_state()
-            .map(Vec::into_boxed_slice)
-            .map_err(Into::into)
+        self.inner.export_state().map(Vec::into_boxed_slice).map_err(Into::into)
     }
 
     #[wasm_bindgen(js_name = discoverRounds)]
@@ -86,10 +81,7 @@ impl WebVotingSession {
         value(
             &self
                 .inner
-                .discover_with(config::discover_rounds(
-                    &self.inner.transport,
-                    self.inner.network,
-                ))
+                .discover_with(config::discover_rounds(&self.inner.transport, self.inner.network))
                 .await?,
         )
     }
@@ -129,12 +121,7 @@ impl WebVotingSession {
         if u32::from(index) != account.account_index || key_fingerprint != Some(fingerprint) {
             return Err(VotingApiError::new(VotingErrorCode::RecoveryConflict).into());
         }
-        value(
-            &self
-                .inner
-                .submit_delegation(&round_id, usk, fingerprint)
-                .await?,
-        )
+        value(&self.inner.submit_delegation(&round_id, usk, fingerprint).await?)
     }
 
     #[wasm_bindgen(js_name = submitBallot)]
@@ -145,8 +132,7 @@ impl WebVotingSession {
         #[wasm_bindgen(unchecked_param_type = "BallotDecision[]")] decisions: JsValue,
     ) -> Result<JsValue, JsValue> {
         let decisions: Vec<crate::voting::types::BallotDecision> =
-            serde_wasm_bindgen::from_value(decisions)
-                .map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))?;
+            serde_wasm_bindgen::from_value(decisions).map_err(|_| VotingApiError::new(VotingErrorCode::RecoveryConflict))?;
         value(&self.inner.submit_ballot(&round_id, Some(decisions)).await?)
     }
 
@@ -161,11 +147,7 @@ impl WebVotingSession {
         value(
             &self
                 .inner
-                .round_proposals_with(
-                    &round_id,
-                    config::discover_rounds(&self.inner.transport, self.inner.network),
-                    now_secs,
-                )
+                .round_proposals_with(&round_id, config::discover_rounds(&self.inner.transport, self.inner.network), now_secs)
                 .await?,
         )
     }
@@ -174,9 +156,7 @@ impl WebVotingSession {
     #[wasm_bindgen(js_name = clearRound)]
     pub async fn clear_round(&self, round_id: String) -> Result<(), JsValue> {
         self.inner
-            .clear_round_with(&round_id, || {
-                self.inner.persistence.checkpoint(&self.inner.db)
-            })
+            .clear_round_with(&round_id, || self.inner.persistence.checkpoint(&self.inner.db))
             .await
             .map_err(Into::into)
     }

@@ -121,10 +121,7 @@ pub(crate) struct IronwoodBundle {
     pub anchor: Vec<u8>,
 }
 
-pub(crate) fn signing_payload(
-    pczt: &Pczt,
-    fallback_account_index: Option<u32>,
-) -> Result<SigningPayload, String> {
+pub(crate) fn signing_payload(pczt: &Pczt, fallback_account_index: Option<u32>) -> Result<SigningPayload, String> {
     let global = parse_global(pczt)?;
     let mut transparent_inputs = Vec::new();
     let mut transparent_outputs = Vec::new();
@@ -132,22 +129,16 @@ pub(crate) fn signing_payload(
     let mut ironwood_bundle = None;
     let mut has_sapling = false;
 
-    let branch = BranchId::try_from(global.consensus_branch_id).map_err(|_| {
-        format!(
-            "Unrecognized consensus branch ID {:#010x}",
-            global.consensus_branch_id
-        )
-    })?;
+    let branch =
+        BranchId::try_from(global.consensus_branch_id).map_err(|_| format!("Unrecognized consensus branch ID {:#010x}", global.consensus_branch_id))?;
 
     let verifier = Verifier::new(pczt.clone())
         .with_transparent::<String, _>(|bundle| {
             for input in bundle.inputs() {
-                transparent_inputs
-                    .push(convert_transparent_input(input).map_err(TransparentError::Custom)?);
+                transparent_inputs.push(convert_transparent_input(input).map_err(TransparentError::Custom)?);
             }
             for output in bundle.outputs() {
-                transparent_outputs
-                    .push(convert_transparent_output(output).map_err(TransparentError::Custom)?);
+                transparent_outputs.push(convert_transparent_output(output).map_err(TransparentError::Custom)?);
             }
             Ok(())
         })
@@ -165,14 +156,8 @@ pub(crate) fn signing_payload(
 
     let verifier = verifier
         .with_orchard::<String, _>(|bundle| {
-            orchard_bundle = convert_orchard_bundle(
-                bundle,
-                branch,
-                ValuePool::Orchard,
-                global.coin_type,
-                fallback_account_index,
-            )
-            .map_err(OrchardError::Custom)?;
+            orchard_bundle =
+                convert_orchard_bundle(bundle, branch, ValuePool::Orchard, global.coin_type, fallback_account_index).map_err(OrchardError::Custom)?;
             Ok(())
         })
         .map_err(|error| map_orchard_error("Orchard", error))?;
@@ -180,22 +165,13 @@ pub(crate) fn signing_payload(
     if global.tx_version >= V6_TX_VERSION {
         verifier
             .with_ironwood::<String, _>(|bundle| {
-                ironwood_bundle = convert_ironwood_bundle(
-                    bundle,
-                    branch,
-                    global.coin_type,
-                    fallback_account_index,
-                )
-                .map_err(OrchardError::Custom)?;
+                ironwood_bundle = convert_ironwood_bundle(bundle, branch, global.coin_type, fallback_account_index).map_err(OrchardError::Custom)?;
                 Ok(())
             })
             .map_err(|error| map_orchard_error("Ironwood", error))?;
     }
 
-    let orchard_signature_indices = orchard_bundle
-        .as_ref()
-        .map(|bundle| real_spend_indices(&bundle.actions))
-        .unwrap_or_default();
+    let orchard_signature_indices = orchard_bundle.as_ref().map(|bundle| real_spend_indices(&bundle.actions)).unwrap_or_default();
     let ironwood_signature_indices = ironwood_bundle
         .as_ref()
         .map(|bundle| {
@@ -222,8 +198,7 @@ pub(crate) fn signing_payload(
 }
 
 fn parse_global(pczt: &Pczt) -> Result<Global, String> {
-    let value = serde_json::to_value(pczt.global())
-        .map_err(|error| format!("Failed to inspect PCZT global fields: {error}"))?;
+    let value = serde_json::to_value(pczt.global()).map_err(|error| format!("Failed to inspect PCZT global fields: {error}"))?;
     let number = |name: &str| {
         value
             .get(name)
@@ -247,23 +222,16 @@ fn parse_global(pczt: &Pczt) -> Result<Global, String> {
         consensus_branch_id: *pczt.global().consensus_branch_id(),
         fallback_lock_time,
         expiry_height: *pczt.global().expiry_height(),
-        coin_type: number("coin_type")?
-            .try_into()
-            .map_err(|_| "PCZT coin_type exceeds u32".to_string())?,
-        tx_modifiable: number("tx_modifiable")?
-            .try_into()
-            .map_err(|_| "PCZT tx_modifiable exceeds u8".to_string())?,
+        coin_type: number("coin_type")?.try_into().map_err(|_| "PCZT coin_type exceeds u32".to_string())?,
+        tx_modifiable: number("tx_modifiable")?.try_into().map_err(|_| "PCZT tx_modifiable exceeds u8".to_string())?,
     })
 }
 
 fn convert_transparent_input(input: &transparent::pczt::Input) -> Result<TransparentInput, String> {
-    let derivation = single_derivation(input.bip32_derivation())?
-        .ok_or_else(|| "Transparent input requires one derivation".to_string())?;
+    let derivation = single_derivation(input.bip32_derivation())?.ok_or_else(|| "Transparent input requires one derivation".to_string())?;
     let sighash_type = input.sighash_type().encode();
     if sighash_type != 1 {
-        return Err(format!(
-            "Ledger requires SIGHASH_ALL, received {sighash_type}"
-        ));
+        return Err(format!("Ledger requires SIGHASH_ALL, received {sighash_type}"));
     }
     Ok(TransparentInput {
         prevout_txid: input.prevout_txid().as_ref().to_vec(),
@@ -276,9 +244,7 @@ fn convert_transparent_input(input: &transparent::pczt::Input) -> Result<Transpa
     })
 }
 
-fn convert_transparent_output(
-    output: &transparent::pczt::Output,
-) -> Result<TransparentOutput, String> {
+fn convert_transparent_output(output: &transparent::pczt::Output) -> Result<TransparentOutput, String> {
     Ok(TransparentOutput {
         value: output.value().into_u64(),
         script_pub_key: output.script_pubkey().to_bytes(),
@@ -286,24 +252,18 @@ fn convert_transparent_output(
     })
 }
 
-fn single_derivation(
-    map: &BTreeMap<[u8; 33], Bip32Derivation>,
-) -> Result<Option<Derivation>, String> {
+fn single_derivation(map: &BTreeMap<[u8; 33], Bip32Derivation>) -> Result<Option<Derivation>, String> {
     match map.len() {
         0 => Ok(None),
         1 => {
             let (pubkey, derivation) = map.iter().next().unwrap();
             Ok(Some(Derivation {
-                signing_path: format_path(
-                    derivation.derivation_path().iter().copied().map(u32::from),
-                ),
+                signing_path: format_path(derivation.derivation_path().iter().copied().map(u32::from)),
                 pubkey: pubkey.to_vec(),
                 seed_fingerprint: derivation.seed_fingerprint().to_vec(),
             }))
         }
-        count => Err(format!(
-            "Ledger supports at most one transparent derivation, found {count}"
-        )),
+        count => Err(format!("Ledger supports at most one transparent derivation, found {count}")),
     }
 }
 
@@ -317,16 +277,14 @@ fn convert_orchard_bundle(
     if bundle.actions().is_empty() {
         return Ok(None);
     }
-    let version = bundle_version_for_branch(branch, pool)
-        .ok_or_else(|| format!("No {pool:?} bundle version for {branch:?}"))?;
+    let version = bundle_version_for_branch(branch, pool).ok_or_else(|| format!("No {pool:?} bundle version for {branch:?}"))?;
     let actions = bundle
         .actions()
         .iter()
         .map(|action| convert_orchard_action(action, coin_type, fallback_account_index))
         .collect::<Result<_, _>>()?;
     let (magnitude, sign) = bundle.value_sum().magnitude_sign();
-    let magnitude = i64::try_from(magnitude)
-        .map_err(|_| "Orchard value balance exceeds Ledger's signed 64-bit range".to_string())?;
+    let magnitude = i64::try_from(magnitude).map_err(|_| "Orchard value balance exceeds Ledger's signed 64-bit range".to_string())?;
     Ok(Some(OrchardBundle {
         actions,
         flags: bundle
@@ -361,18 +319,10 @@ fn convert_ironwood_bundle(
         }));
     }
 
-    let Some(converted) = convert_orchard_bundle(
-        bundle,
-        branch,
-        ValuePool::Ironwood,
-        coin_type,
-        fallback_account_index,
-    )?
-    else {
+    let Some(converted) = convert_orchard_bundle(bundle, branch, ValuePool::Ironwood, coin_type, fallback_account_index)? else {
         return Ok(None);
     };
-    let version = bundle_version_for_branch(branch, ValuePool::Ironwood)
-        .ok_or_else(|| format!("No Ironwood bundle version for {branch:?}"))?;
+    let version = bundle_version_for_branch(branch, ValuePool::Ironwood).ok_or_else(|| format!("No Ironwood bundle version for {branch:?}"))?;
     let note_plaintext_version = note_plaintext_version(version);
     Ok(Some(IronwoodBundle {
         actions: converted
@@ -389,11 +339,7 @@ fn convert_ironwood_bundle(
     }))
 }
 
-fn convert_orchard_action(
-    action: &orchard::pczt::Action,
-    coin_type: u32,
-    fallback_account_index: Option<u32>,
-) -> Result<OrchardAction, String> {
+fn convert_orchard_action(action: &orchard::pczt::Action, coin_type: u32, fallback_account_index: Option<u32>) -> Result<OrchardAction, String> {
     let spend = action.spend();
     let output = action.output();
     let spend_value = spend
@@ -403,18 +349,11 @@ fn convert_orchard_action(
     let derivation = spend.zip32_derivation().as_ref();
     let (signing_path, seed_fingerprint) = match derivation {
         Some(derivation) => (
-            format_path(
-                derivation
-                    .derivation_path()
-                    .iter()
-                    .map(|component| component.index()),
-            ),
+            format_path(derivation.derivation_path().iter().map(|component| component.index())),
             derivation.seed_fingerprint().to_vec(),
         ),
         None if spend_value == 0 => {
-            let account_index = fallback_account_index.ok_or_else(|| {
-                "Dummy Orchard spend requires the hardware account index".to_string()
-            })?;
+            let account_index = fallback_account_index.ok_or_else(|| "Dummy Orchard spend requires the hardware account index".to_string())?;
             dummy_signing_derivation(coin_type, account_index)?
         }
         None => return Err("Orchard spend is missing its derivation".to_string()),
@@ -476,22 +415,12 @@ fn real_spend_indices(actions: &[OrchardAction]) -> Vec<usize> {
         .collect()
 }
 
-fn dummy_signing_derivation(
-    coin_type: u32,
-    account_index: u32,
-) -> Result<(String, Vec<u8>), String> {
+fn dummy_signing_derivation(coin_type: u32, account_index: u32) -> Result<(String, Vec<u8>), String> {
     if account_index >= 1 << 31 {
         return Err("Hardware account index must be below 2^31".to_string());
     }
     Ok((
-        format_path(
-            [
-                32 | (1 << 31),
-                coin_type | (1 << 31),
-                account_index | (1 << 31),
-            ]
-            .into_iter(),
-        ),
+        format_path([32 | (1 << 31), coin_type | (1 << 31), account_index | (1 << 31)].into_iter()),
         vec![0; 32],
     ))
 }
@@ -545,10 +474,7 @@ mod tests {
 
     #[test]
     fn formats_hardened_paths_for_ledger() {
-        assert_eq!(
-            format_path([0x8000_002c, 0x8000_0085, 0x8000_0000, 0, 7].into_iter()),
-            "44'/133'/0'/0/7"
-        );
+        assert_eq!(format_path([0x8000_002c, 0x8000_0085, 0x8000_0000, 0, 7].into_iter()), "44'/133'/0'/0/7");
     }
 
     #[test]
@@ -561,10 +487,7 @@ mod tests {
 
     #[test]
     fn includes_an_empty_ironwood_bundle_for_v6_transactions() {
-        let pczt = Creator::new(BranchId::Nu6_3.into(), 1, 133, None, None)
-            .unwrap()
-            .build()
-            .unwrap();
+        let pczt = Creator::new(BranchId::Nu6_3.into(), 1, 133, None, None).unwrap().build().unwrap();
 
         let payload = signing_payload(&pczt, Some(0)).unwrap();
         let ironwood = payload.transaction.ironwood_bundle.unwrap();
